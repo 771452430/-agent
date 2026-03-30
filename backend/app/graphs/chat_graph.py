@@ -1,10 +1,11 @@
 """LangGraph 会话图。
 
-这个图只有几个节点，但每个节点都对应一个明确的学习概念：
-- inspect_request: 为什么 graph 需要先路由；
-- retrieve_context: RAG 链路如何接进 graph；
-- execute_tools: 工具/Skill 的调用如何回写状态；
-- finalize_response: Prompt + Structured Output 如何整合成最终答案。
+如果你想理解“为什么这里要用 LangGraph，而不是普通函数串起来”，
+这个文件就是答案：
+- inspect_request 负责路由；
+- retrieve_context 负责 RAG 分支；
+- execute_tools 负责 Skill / Tool 调用；
+- finalize_response 负责收口成结构化输出。
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from langgraph.graph.message import add_messages
 
 from ..rag.pipeline import RAGPipeline
 from ..registry import SkillRegistry
-from ..schemas import ChatMessage, Citation, FinalResponse, ModelConfig, ToolEvent
+from ..schemas import ChatMessage, Citation, FinalResponse, ModelConfig, ScopeType, ToolEvent
 from ..services.llm_service import LLMService
 
 
@@ -34,7 +35,11 @@ class ChatGraphState(TypedDict, total=False):
     user_input: str
     model_config: ModelConfig
     enabled_skills: list[str]
+    forced_route: Literal["chat", "tool", "rag"] | None
     route: Literal["chat", "tool", "rag"]
+    scope_type: ScopeType
+    scope_id: str | None
+    system_prompt: str | None
     tool_outputs: dict[str, Any]
     tool_events: list[ToolEvent]
     citations: list[Citation]
@@ -44,7 +49,7 @@ class ChatGraphState(TypedDict, total=False):
 
 
 class LearningChatGraph:
-    """封装 graph 构建与节点逻辑。"""
+    """封装 graph 结构与每个节点的教学型实现。"""
 
     def __init__(self, skill_registry: SkillRegistry, rag_pipeline: RAGPipeline, llm_service: LLMService) -> None:
         self.skill_registry = skill_registry
@@ -61,45 +66,38 @@ class LearningChatGraph:
         builder.add_edge(START, "inspect_request")
         builder.add_conditional_edges(
             "inspect_request",
-            self._route_after_inspect,
-            {
-                "rag": "retrieve_context",
-                "tool": "execute_tools",
-                "chat": "finalize_response",
-            },
+            lambda state: state.get("route", "chat"),
+            {"rag": "retrieve_context", "tool": "execute_tools", "chat": "finalize_response"},
         )
         builder.add_edge("retrieve_context", "finalize_response")
         builder.add_edge("execute_tools", "finalize_response")
         builder.add_edge("finalize_response", END)
         return builder.compile()
 
-    def _route_after_inspect(self, state: ChatGraphState) -> str:
-        return state.get("route", "chat")
-
     def inspect_request(self, state: ChatGraphState) -> dict[str, Any]:
+        """决定当前请求应该走 chat / tool / rag 哪条分支。"""
+        forced_route = state.get("forced_route")
+        if forced_route:
+            return {"route": forced_route, "stream_events": [{"event": "route", "data": {"route": forced_route}}]}
+
         text = state["user_input"].lower()
         route = "chat"
-        if self.rag_pipeline.knowledge_store.has_documents() and any(
-            token in text for token in ("知识库", "文档", "附件", "资料", "根据", "参考")
-        ):
+        if self.rag_pipeline.knowledge_store.has_documents(
+            scope_type=state.get("scope_type", "global"),
+            scope_id=state.get("scope_id"),
+        ) and any(token in text for token in ("知识库", "文档", "附件", "资料", "根据", "参考")):
             route = "rag"
         elif any(token in text for token in ("报销", "费用", "税", "金额", "总结", "提炼")):
             route = "tool"
-        return {
-            "route": route,
-            "stream_events": [
-                {
-                    "event": "route",
-                    "data": {
-                        "route": route,
-                        "reason": "根据关键词和知识库可用性做轻量路由，便于学习 graph 中的条件分支。",
-                    },
-                }
-            ],
-        }
+        return {"route": route, "stream_events": [{"event": "route", "data": {"route": route}}]}
 
     def retrieve_context(self, state: ChatGraphState) -> dict[str, Any]:
-        result = self.rag_pipeline.run(state["user_input"])
+        """RAG 节点：把 scope-aware 检索结果写回 graph state。"""
+        result = self.rag_pipeline.run(
+            query=state["user_input"],
+            scope_type=state.get("scope_type", "global"),
+            scope_id=state.get("scope_id"),
+        )
         return {
             "citations": result.citations,
             "retrieval_context": result.retrieval_context,
@@ -108,6 +106,8 @@ class LearningChatGraph:
                     "event": "retrieval",
                     "data": {
                         "query": result.query,
+                        "scope_type": result.scope_type,
+                        "scope_id": result.scope_id,
                         "citations": [item.model_dump() for item in result.citations],
                         "context_preview": result.retrieval_context[:240],
                     },
@@ -127,6 +127,7 @@ class LearningChatGraph:
         return days, daily
 
     def execute_tools(self, state: ChatGraphState) -> dict[str, Any]:
+        """工具节点：根据关键词调用已启用 Skill 对应的 Tool。"""
         enabled_skills = state.get("enabled_skills", [])
         text = state["user_input"]
         lowered = text.lower()
@@ -135,17 +136,18 @@ class LearningChatGraph:
         stream_events: list[dict[str, Any]] = []
 
         def run_tool(tool_name: str, payload: dict[str, Any]) -> Any:
+            # 这里把 Tool 调用包装成统一的 started/completed/failed 事件，
+            # 前端就能把工具轨迹可视化，而不只是看到最后答案。
             tool_def = self.skill_registry.get_tool(tool_name)
             if tool_def is None or not self.skill_registry.is_tool_enabled(tool_name, enabled_skills):
                 return None
-            started_at = _utc_now()
             started = ToolEvent(
                 id=str(uuid4()),
                 tool_name=tool_name,
                 status="started",
                 input=payload,
                 output={},
-                started_at=started_at,
+                started_at=_utc_now(),
             )
             stream_events.append({"event": "tool_start", "data": started.model_dump(mode="json")})
             try:
@@ -195,13 +197,10 @@ class LearningChatGraph:
             if summary is not None:
                 tool_outputs["summarize_notes"] = summary
 
-        return {
-            "tool_outputs": tool_outputs,
-            "tool_events": tool_events,
-            "stream_events": stream_events,
-        }
+        return {"tool_outputs": tool_outputs, "tool_events": tool_events, "stream_events": stream_events}
 
     def finalize_response(self, state: ChatGraphState) -> dict[str, Any]:
+        """最终收口节点：把工具结果、引用和上下文交给 LLMService。"""
         final_output = self.llm_service.generate_response(
             query=state["user_input"],
             messages=state.get("history_messages", []),
@@ -209,13 +208,6 @@ class LearningChatGraph:
             citations=state.get("citations", []),
             retrieval_context=state.get("retrieval_context", ""),
             model_config=state["model_config"],
+            system_prompt=state.get("system_prompt"),
         )
-        return {
-            "final_output": final_output,
-            "stream_events": [
-                {
-                    "event": "final",
-                    "data": final_output.model_dump(mode="json"),
-                }
-            ],
-        }
+        return {"final_output": final_output, "stream_events": [{"event": "final", "data": final_output.model_dump(mode="json")}]} 

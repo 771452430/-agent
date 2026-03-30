@@ -13,6 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class AppSettings:
     """集中定义项目运行期配置。"""
@@ -30,7 +37,23 @@ class AppSettings:
     default_temperature: float = 0.2
     default_max_tokens: int = 1024
     cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
+    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     langsmith_project: str | None = os.getenv("LANGSMITH_PROJECT")
+    watcher_scheduler_interval_seconds: int = int(os.getenv("WATCHER_SCHEDULER_INTERVAL_SECONDS", "15"))
+    support_issue_scheduler_interval_seconds: int = int(
+        os.getenv(
+            "SUPPORT_ISSUE_SCHEDULER_INTERVAL_SECONDS",
+            os.getenv("WATCHER_SCHEDULER_INTERVAL_SECONDS", "15"),
+        )
+    )
+    watcher_assignment_api_url: str | None = os.getenv("WATCHER_ASSIGNMENT_API_URL")
+    watcher_assignment_api_token: str | None = os.getenv("WATCHER_ASSIGNMENT_API_TOKEN")
+    watcher_smtp_host: str | None = os.getenv("WATCHER_SMTP_HOST")
+    watcher_smtp_port: int = int(os.getenv("WATCHER_SMTP_PORT", "587"))
+    watcher_smtp_username: str | None = os.getenv("WATCHER_SMTP_USERNAME")
+    watcher_smtp_password: str | None = os.getenv("WATCHER_SMTP_PASSWORD")
+    watcher_smtp_use_tls: bool = _env_bool("WATCHER_SMTP_USE_TLS", True)
+    watcher_smtp_use_ssl: bool = _env_bool("WATCHER_SMTP_USE_SSL", False)
 
     def ensure_directories(self) -> None:
         """启动时准备本地数据目录。"""

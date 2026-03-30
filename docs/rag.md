@@ -5,37 +5,42 @@
 1. 上传文档
 2. 解析文本
 3. 切分 chunk
-4. 存 SQLite
-5. 构造可检索索引
+4. chunk 和 metadata 存 SQLite
+5. chunk 同步写入 Chroma 向量索引
 6. 查询时执行：
    - query rewrite
-   - retrieve
+   - lexical retrieve
+   - vector retrieve
+   - RRF fusion
    - format context
 7. final response 返回 citations
 
-## 当前为什么默认用“学习模式”
+## 当前为什么采用 Hybrid RAG
 
-真实向量检索依赖 embedding / vector store 生态，安装和环境要求更高。
+纯 lexical 检索足够稳定，但对“语义相近、词不完全一致”的问题不够友好；
+纯向量检索又可能漏掉文件名、路径、关键词这些强信号。
 
-为了让你先把流程学明白，当前实现默认满足两点：
+所以这一版默认采用 Hybrid RAG，同时继续满足两点：
 
 - 没有额外模型依赖时也能跑
 - 检索结果仍然是可解释、可查看的
 
-所以默认采用：
+当前默认实现是：
 
 - SQLite 保存文档与 chunk
-- 本地词法匹配做基础检索
-- 若安装 Chroma 相关依赖，则会初始化对应 vector backend
+- 本地 `HashingVectorizer` 生成稳定 embedding
+- `Chroma` 保存向量
+- lexical + vector 双召回后做 RRF 融合
 
 ## 你下一步可以怎么练
 
-### 练习 1：把 lexical search 换成真实 embedding 检索
+### 练习 1：把本地 embedding 换成真实 embedding 模型
 
 重点看：
 
-- `KnowledgeStore._create_vector_store`
-- `KnowledgeStore.search`
+- `EmbeddingService`
+- `KnowledgeStore._vector_search`
+- `KnowledgeStore._fuse_search_results`
 
 ### 练习 2：把 query rewrite 做得更聪明
 
