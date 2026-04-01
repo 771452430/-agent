@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 知识树组件。
+ *
+ * 它递归展示节点层级，并把“当前选中哪个节点”的状态通过回调交回父组件。
+ */
 import type { KnowledgeTreeNode } from "../lib/types";
 
 export function KnowledgeTree(props: {

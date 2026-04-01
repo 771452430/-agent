@@ -1,5 +1,11 @@
 "use client";
 
+/**
+ * Skill Catalog 页面。
+ *
+ * 这个页面更像“能力说明书”，用于展示系统内置了哪些 Skill、
+ * 它们属于哪类能力，以及推荐的学习关注点。
+ */
 import Link from "next/link";
 import { useEffect, useState } from "react";
 

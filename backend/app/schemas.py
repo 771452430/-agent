@@ -22,6 +22,10 @@ ModelMode = Literal["learning", "provider"]
 ProviderProtocol = Literal["openai_compatible", "anthropic_compatible", "ollama_native", "mock_local"]
 ProviderModelSource = Literal["manual", "discovered"]
 
+# -----------------------------
+# 模型 / Provider / 邮箱 / 飞书
+# -----------------------------
+
 
 class ModelConfig(BaseModel):
     """统一的模型配置。"""
@@ -187,6 +191,43 @@ class UpdateFeishuSettingsRequest(BaseModel):
     app_secret: str | None = None
 
 
+class GitLabImportSettings(BaseModel):
+    """返回给前端的 GitLab 导入设置。"""
+
+    configured: bool = False
+    has_token: bool = False
+    token_masked: str | None = None
+    token_source: Literal["database", "environment", "none"] = "none"
+    allowed_hosts: list[str] = Field(default_factory=list)
+
+
+class GitLabImportStoredSettings(BaseModel):
+    """数据库中保存的 GitLab 导入设置。"""
+
+    token: str | None = None
+    allowed_hosts: list[str] | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class GitLabImportRuntimeSettings(BaseModel):
+    """服务内部使用的 GitLab 导入运行时配置。"""
+
+    token: str | None = None
+    allowed_hosts: list[str] = Field(default_factory=list)
+    token_source: Literal["database", "environment", "none"] = "none"
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateGitLabImportSettingsRequest(BaseModel):
+    """更新 GitLab 导入设置。"""
+
+    token: str | None = None
+    clear_token: bool = False
+    allowed_hosts: list[str] | None = None
+
+
 class FeishuBitableValidationRequest(BaseModel):
     """验证飞书多维表格地址。"""
 
@@ -313,6 +354,10 @@ class FeishuBitableWriteValidationResponse(BaseModel):
     updated_fields_preview: dict[str, Any] = Field(default_factory=dict)
 
 
+# -----------------------------
+# Chat / Skill / 知识库 / 检索
+# -----------------------------
+
 class Citation(BaseModel):
     """RAG 命中的引用片段。"""
 
@@ -363,7 +408,7 @@ class SkillDescriptor(BaseModel):
     id: str
     name: str
     description: str
-    category: Literal["core", "tool", "knowledge"]
+    category: Literal["core", "tool", "knowledge", "integration"]
     tools: list[str]
     enabled_by_default: bool = True
     requires_rag: bool = False
@@ -445,6 +490,33 @@ class DirectoryUploadRequest(BaseModel):
     files: list[DirectoryUploadItem]
 
 
+class GitLabTreeImportRequest(BaseModel):
+    """GitLab 文档树导入请求。"""
+
+    tree_url: str = Field(min_length=1)
+    parent_node_id: str | None = None
+
+
+class KnowledgeImportIssue(BaseModel):
+    """批量导入中的单个异常项。"""
+
+    path: str
+    reason: str
+
+
+class GitLabTreeImportResponse(BaseModel):
+    """GitLab 文档树批量导入结果。"""
+
+    source_url: str
+    created_count: int = 0
+    updated_count: int = 0
+    skipped_count: int = 0
+    failed_count: int = 0
+    skipped_paths: list[str] = Field(default_factory=list)
+    failed_items: list[KnowledgeImportIssue] = Field(default_factory=list)
+    documents: list[KnowledgeDocument] = Field(default_factory=list)
+
+
 class UploadDocumentRequest(BaseModel):
     """兼容旧版：上传到根节点或指定节点。"""
 
@@ -489,6 +561,10 @@ class RelatedDocumentLink(BaseModel):
     document_name: str
     external_url: str
 
+
+# -----------------------------
+# 会话线程与配置型 Agent
+# -----------------------------
 
 class ThreadSummary(BaseModel):
     """左侧会话列表用的摘要。"""
@@ -602,6 +678,9 @@ WatcherMatchSource = Literal["rule", "llm", "unmatched"]
 WatcherAssignmentStatus = Literal["pending", "success", "failed", "skipped", "unmatched"]
 WatcherRequestMethod = Literal["GET", "POST"]
 
+# -----------------------------
+# 巡检 Agent 相关模型
+# -----------------------------
 
 class OwnerRule(BaseModel):
     """负责人规则。
@@ -832,6 +911,9 @@ SupportIssueCaseCandidateStatus = Literal["pending_review", "approved"]
 SupportIssueCaseReviewAction = Literal["save_edit", "approve_and_publish"]
 SupportIssueDigestRunStatus = Literal["success", "failed"]
 
+# -----------------------------
+# 支持问题 Agent 相关模型
+# -----------------------------
 
 class SupportIssueFeedbackSnapshot(BaseModel):
     """单行处理时刻抓取到的人工反馈快照。"""

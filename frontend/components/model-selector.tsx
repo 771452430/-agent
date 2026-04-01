@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 模型选择器。
+ *
+ * 它把 provider、model、temperature、max tokens 的选择逻辑收口成一个可复用组件。
+ */
 import { useMemo } from "react";
 
 import { useModelSettings } from "./model-settings-provider";
@@ -79,10 +84,10 @@ export function ModelSelector(props: ModelSelectorProps) {
         <div className="grid grid-cols-2 gap-3">
           <button
             className={
-              "rounded-2xl border px-4 py-3 text-left transition " +
+              "apple-segmented rounded-[22px] px-4 py-3 text-left transition " +
               (value.mode === "learning"
-                ? "border-amber-300/60 bg-amber-300/10 text-amber-100"
-                : "border-slate-700 bg-slate-950 text-slate-300")
+                ? "apple-segmented-active text-amber-50"
+                : "text-slate-300")
             }
             onClick={() => setMode("learning")}
             type="button"
@@ -92,10 +97,10 @@ export function ModelSelector(props: ModelSelectorProps) {
           </button>
           <button
             className={
-              "rounded-2xl border px-4 py-3 text-left transition " +
+              "apple-segmented rounded-[22px] px-4 py-3 text-left transition " +
               (value.mode === "provider"
-                ? "border-sky-400/60 bg-sky-400/10 text-sky-100"
-                : "border-slate-700 bg-slate-950 text-slate-300")
+                ? "apple-segmented-active text-sky-50"
+                : "text-slate-300")
             }
             onClick={() => setMode("provider")}
             type="button"
@@ -107,61 +112,64 @@ export function ModelSelector(props: ModelSelectorProps) {
       </div>
 
       {value.mode === "learning" && (
-        <div className="rounded-2xl border border-amber-400/25 bg-amber-400/10 px-3 py-3 text-xs leading-6 text-amber-100">
+        <div className="apple-status-warning rounded-[22px] px-3 py-3 text-xs leading-6">
           当前使用 Learning Mode：会展示 LangGraph / Tool / RAG 的完整链路，但不会调用外部模型接口。
         </div>
       )}
 
       {value.mode === "provider" && (
         <>
-      <label className="grid gap-1 text-sm">
-        <span className="text-slate-400">Provider</span>
-        <select
-          className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
-          value={value.provider}
-          onChange={(event) => handleProviderChange(event.target.value)}
-          disabled={isLoading}
-        >
-          {currentProvider == null && value.provider !== "" && (
-            <option value={value.provider}>{value.provider}（已失效）</option>
-          )}
-          {providerOptions.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.name}
-              {!item.enabled ? "（已禁用）" : ""}
-            </option>
-          ))}
-        </select>
-      </label>
+          <label className="grid gap-1.5 text-sm">
+            <span className="text-slate-400">Provider</span>
+            <select
+              className="apple-select rounded-[18px] px-3 py-2.5"
+              value={value.provider}
+              onChange={(event) => handleProviderChange(event.target.value)}
+              disabled={isLoading}
+            >
+              {currentProvider == null && value.provider !== "" && (
+                <option value={value.provider}>{value.provider}（已失效）</option>
+              )}
+              {providerOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                  {!item.enabled ? "（已禁用）" : ""}
+                </option>
+              ))}
+            </select>
+          </label>
 
-      <label className="grid gap-1 text-sm">
-        <span className="text-slate-400">Model</span>
-        <select
-          className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
-          value={value.model}
-          onChange={(event) => onChange({ ...value, model: event.target.value })}
-          disabled={isLoading || provider == null}
-        >
-          {modelOptions.map((item) => (
-            <option key={item.id} value={item.id}>
-              {item.label}
-            </option>
-          ))}
-        </select>
-      </label>
+          <label className="grid gap-1.5 text-sm">
+            <span className="text-slate-400">Model</span>
+            <select
+              className="apple-select rounded-[18px] px-3 py-2.5"
+              value={value.model}
+              onChange={(event) => onChange({ ...value, model: event.target.value })}
+              disabled={isLoading || provider == null}
+            >
+              {modelOptions.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.label}
+                </option>
+              ))}
+            </select>
+          </label>
         </>
       )}
 
       {validation.isRunnable ? (
-        <div className="rounded-2xl border border-emerald-400/25 bg-emerald-400/10 px-3 py-3 text-xs leading-6 text-emerald-200">
+        <div className="apple-status-success rounded-[22px] px-3 py-3 text-xs leading-6">
           {value.mode === "learning"
             ? "当前运行模式可用：Learning Mode"
             : `当前模型配置可用：${validation.provider?.name} / ${validation.model?.label}`}
         </div>
       ) : (
-        <div className="rounded-2xl border border-rose-400/25 bg-rose-400/10 px-3 py-3 text-xs leading-6 text-rose-200">
+        <div className="apple-status-danger rounded-[22px] px-3 py-3 text-xs leading-6">
           <div>{validation.message}</div>
-          <button className="mt-2 text-amber-200 underline decoration-dotted underline-offset-4" onClick={() => openModelSettings(value.provider)}>
+          <button
+            className="mt-2 text-sky-200 underline decoration-dotted underline-offset-4"
+            onClick={() => openModelSettings(value.provider)}
+          >
             去模型设置修正
           </button>
         </div>

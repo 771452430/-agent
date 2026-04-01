@@ -45,6 +45,7 @@ from .vector_store import ChunkVectorRecord, KnowledgeVectorStore, VectorSearchH
 
 ROOT_NODE_ID = "root"
 ROOT_NODE_NAME = "全部知识"
+SUPPORTED_DOCUMENT_TYPES = {"txt", "md", "pdf", "doc", "docx", "xlsx"}
 
 
 def _utc_now() -> datetime:
@@ -123,6 +124,11 @@ class KnowledgeStore:
     """统一管理知识树、文档入库和检索。"""
 
     def __init__(self, sqlite_path: Path, chroma_dir: Path) -> None:
+        # 初始化顺序很重要：
+        # 1. 先准备数据库表和旧数据兼容；
+        # 2. 再修复历史文档格式；
+        # 3. 最后尝试接上向量库。
+        # 这样即使向量库不可用，最基础的 lexical 检索仍然可以工作。
         self.sqlite_path = sqlite_path
         self.chroma_dir = chroma_dir
         self.embedding_service = EmbeddingService()
@@ -137,10 +143,14 @@ class KnowledgeStore:
         """初始化 Chroma，并把已有 chunk 尽量同步进去。"""
 
         try:
+            # 向量库初始化成功后，系统进入 hybrid 检索模式：
+            # lexical 负责关键词命中，vector 负责语义补充。
             self.vector_store = KnowledgeVectorStore(self.chroma_dir)
             self._retrieval_backend = "hybrid"
             self._sync_vector_index()
         except Exception:
+            # 这里故意降级而不是直接抛错，
+            # 因为学习模式下“能继续用 lexical 检索”比“整个系统启动失败”更重要。
             self.vector_store = None
             self._retrieval_backend = "lexical"
 
@@ -159,6 +169,8 @@ class KnowledgeStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            # 这里既负责首启建表，也承担“旧版本升级补列”的责任。
+            # 因为项目是教学 demo，直接在启动时做轻量迁移，阅读和维护都更直观。
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS knowledge_tree_nodes (
@@ -612,6 +624,59 @@ class KnowledgeStore:
             if row["external_url"] is not None and str(row["external_url"]).strip() != ""
         }
 
+    def is_supported_document(self, filename: str) -> bool:
+        file_type = Path(filename).suffix.lower().lstrip(".")
+        return file_type in SUPPORTED_DOCUMENT_TYPES
+
+    def find_document_by_relative_path(self, node_id: str, relative_path: str) -> KnowledgeDocument | None:
+        fallback_name = PurePosixPath(relative_path).name or "untitled.txt"
+        normalized_relative_path = self._normalize_relative_path(relative_path, fallback_name)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM knowledge_documents
+                WHERE node_id = ? AND relative_path = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (node_id, normalized_relative_path),
+            ).fetchone()
+        return self._row_to_document(row) if row is not None else None
+
+    def upsert_document(
+        self,
+        *,
+        parent_node_id: str | None,
+        relative_path: str,
+        file_bytes: bytes,
+        external_url: str | None = None,
+    ) -> tuple[KnowledgeDocument, bool]:
+        fallback_name = PurePosixPath(relative_path).name or "untitled.txt"
+        normalized_relative_path = self._normalize_relative_path(relative_path, fallback_name)
+        path_parts = list(PurePosixPath(normalized_relative_path).parts)
+        if len(path_parts) == 0:
+            raise ValueError("relative_path 不能为空")
+
+        current_node = self._require_node_row(parent_node_id)
+        for folder_name in path_parts[:-1]:
+            current_node = self._get_or_create_child_node(current_node["id"], folder_name)
+
+        file_name = path_parts[-1]
+        existing = self.find_document_by_relative_path(current_node["id"], normalized_relative_path)
+        updated = existing is not None
+        if existing is not None:
+            self.delete_document(existing.id)
+
+        document = self.ingest_document(
+            filename=file_name,
+            file_bytes=file_bytes,
+            node_id=current_node["id"],
+            relative_path=normalized_relative_path,
+        )
+        if external_url is not None:
+            document = self.update_document_metadata(document.id, external_url=external_url)
+        return document, updated
+
     def create_node(self, name: str, parent_id: str | None = None) -> KnowledgeTreeNode:
         clean_name = name.strip()
         if not clean_name:
@@ -1053,6 +1118,8 @@ class KnowledgeStore:
         先根据 scope_type / scope_id 算出允许命中的 node 集合，
         再在这些节点下分别做 lexical / vector 召回，并最终融合排序。
         """
+        # 两路召回都会放大到 `limit` 的数倍，原因是：
+        # 先各自多拿一些候选，再做融合排序，通常比“每路只拿很少几个”更稳。
         lexical_hits = self._lexical_search(
             query,
             limit=max(limit * 3, 12),
@@ -1161,6 +1228,7 @@ class KnowledgeStore:
     ) -> list[Citation]:
         """用 RRF 融合 lexical 和 vector 两个召回列表。"""
 
+        # `merged` 以 chunk_id 为键，表示“同一个片段无论被哪一路命中，最终都汇总到一起打分”。
         merged: dict[str, ScoredCitation] = {}
 
         for rank, (lexical_score, row) in enumerate(lexical_hits, start=1):

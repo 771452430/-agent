@@ -60,6 +60,10 @@ class WatcherService:
         settings: AppSettings,
         mail_service: MailService,
     ) -> None:
+        # WatcherService 是“巡检业务总装配层”：
+        # - Store 负责保存配置和运行历史；
+        # - LLMService 负责解析 bug、补全负责人建议；
+        # - Graph 负责把整条巡检链路按步骤串起来。
         self.watcher_store = watcher_store
         self.llm_service = llm_service
         self.settings = settings
@@ -114,6 +118,8 @@ class WatcherService:
         return self.watcher_store.list_due_watchers()
 
     def test_fetch(self, request: WatcherFetchTestRequest) -> WatcherFetchTestResponse:
+        # 这个接口只验证“能不能抓到面板内容”，不会真的写运行记录、
+        # 也不会调用分配接口或发邮件，适合用户先排查抓取配置。
         result = self._execute_dashboard_request(
             dashboard_url=request.dashboard_url,
             request_method=request.request_method,
@@ -148,6 +154,8 @@ class WatcherService:
         scheduled_run: bool = False,
     ) -> WatcherRun:
         watcher = self.get_watcher(watcher_id)
+        # 先构造一份最小可运行的图状态；
+        # 后续每个节点都会在这份状态上逐步补充 parsed_bugs、assignment_results 等字段。
         initial_state: WatcherGraphState = {
             "watcher": watcher,
             "run_started_at": _utc_now(),
@@ -164,6 +172,8 @@ class WatcherService:
         }
 
         try:
+            # LangGraph 负责真正的巡检流程推进；
+            # service 这一层则负责准备输入、接住输出，以及兜底异常处理。
             final_state = self.graph.graph.invoke(initial_state)
             persisted_run = final_state.get("persisted_run")
             if isinstance(persisted_run, WatcherRun):
@@ -174,6 +184,7 @@ class WatcherService:
         except HTTPException:
             raise
         except Exception as exc:
+            # 即使中途异常，也要落一条 failed run，方便前端和调度器看到真实失败原因。
             failed_run = WatcherRun(
                 id=str(uuid4()),
                 agent_id=watcher.id,
@@ -239,6 +250,8 @@ class WatcherService:
         return subject, body, html_body
 
     def _handle_scheduled_run_result(self, watcher: WatcherAgentConfig, run: WatcherRun) -> WatcherRun:
+        # 定时运行和手动运行的差别主要在这里：
+        # 定时运行需要额外套一层“连续失败自动停用”的保护策略，防止错误无限重复。
         policy = self.watcher_store.apply_scheduled_run_policy(
             watcher.id,
             run,
@@ -302,6 +315,8 @@ class WatcherService:
         request_headers: dict[str, str],
         request_body_json: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        # 这里是巡检抓取阶段最底层的 HTTP 执行器。
+        # 无论请求来自“测试抓取”还是“正式运行”，最终都会走到这里。
         headers = self._build_request_headers(request_headers)
         request_data: bytes | None = None
         if request_method == "POST":
@@ -338,6 +353,8 @@ class WatcherService:
             except Exception as exc:
                 ok = False
                 message = str(exc)
+                # 对超时/握手类网络问题做一次轻量重试，
+                # 既能提升偶发网络抖动下的成功率，又不会把请求无限拖长。
                 should_retry = attempt < max_attempts and (
                     "timed out" in message.lower()
                     or "handshake" in message.lower()

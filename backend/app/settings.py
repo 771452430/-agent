@@ -20,6 +20,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    values = tuple(item.strip() for item in raw.split(",") if item.strip() != "")
+    return values or default
+
+
 @dataclass(frozen=True)
 class AppSettings:
     """集中定义项目运行期配置。"""
@@ -54,6 +62,8 @@ class AppSettings:
     watcher_smtp_password: str | None = os.getenv("WATCHER_SMTP_PASSWORD")
     watcher_smtp_use_tls: bool = _env_bool("WATCHER_SMTP_USE_TLS", True)
     watcher_smtp_use_ssl: bool = _env_bool("WATCHER_SMTP_USE_SSL", False)
+    gitlab_import_token: str | None = os.getenv("GITLAB_IMPORT_TOKEN")
+    gitlab_import_allowed_hosts: tuple[str, ...] = _env_csv("GITLAB_IMPORT_ALLOWED_HOSTS", ("git.yyrd.com",))
 
     def ensure_directories(self) -> None:
         """启动时准备本地数据目录。"""

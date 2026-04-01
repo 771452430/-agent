@@ -1,4 +1,13 @@
-"""支持问题 Agent 的业务服务。"""
+"""支持问题 Agent 的业务服务。
+
+这个服务把“读飞书问题表 -> 做 scoped RAG -> 回写答案/状态 -> 同步反馈事实”
+组织成一条完整业务链路。
+
+阅读建议：
+1. 先看 `run_agent()` 主流程；
+2. 再回头理解字段匹配、案例复用、回写格式这些辅助函数；
+3. 最后再看 feedback / digest / case candidate 等增强能力。
+"""
 
 from __future__ import annotations
 
@@ -61,7 +70,8 @@ DONE_PROGRESS_VALUE = "AI分析完成"
 MANUAL_REVIEW_PROGRESS_VALUE = "待人工确认"
 NO_HIT_PROGRESS_VALUE = "无命中"
 FAILED_PROGRESS_VALUE = "失败待重试"
-NO_HIT_MESSAGE = "未检索到相关知识，请人工补充处理。"
+NO_HIT_MESSAGE = "未检索到相关知识，已标记待人工确认，请人工补充处理。"
+NO_HIT_MESSAGE_KEYWORD = "未检索到相关知识"
 LOW_CONFIDENCE_THRESHOLD = 0.65
 MAX_SIMILAR_CASES = 2
 FEEDBACK_ACCEPTED = "直接采纳"
@@ -99,6 +109,11 @@ class SupportIssueService:
         feishu_service: FeishuService,
         mail_service: MailService,
     ) -> None:
+        # SupportIssueService 是支持问题业务的总编排层：
+        # - Store 管配置、运行记录、反馈事实、案例候选；
+        # - FeishuService 负责和飞书表格交互；
+        # - RetrievalService / RAGPipeline 负责 scoped 检索；
+        # - LLMService 负责模型能力与结构化判断。
         self.support_issue_store = support_issue_store
         self.knowledge_store = knowledge_store
         self.llm_service = llm_service
@@ -115,6 +130,8 @@ class SupportIssueService:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     def _normalize_scope(self, scope_type: str, scope_id: str | None) -> tuple[str, str | None]:
+        # 支持问题 Agent 的“none”会被提升成“global”，
+        # 因为它的默认心智更接近“全局知识库”，而不是完全禁用检索。
         if scope_type == "tree_recursive":
             return scope_type, scope_id or ROOT_NODE_ID
         if scope_type == "none":
@@ -159,6 +176,8 @@ class SupportIssueService:
         return progress_text in PENDING_PROGRESS_VALUES
 
     def _compose_query(self, *, question: str, fields: dict[str, Any]) -> str:
+        # 飞书表里经常不止“问题”一列，还有补充说明、现象、备注等辅助信息。
+        # 这里把这些字段拼成一条更适合检索和生成的完整 query。
         supplements: list[str] = []
         for field_name in DEFAULT_SUPPORT_FIELD_NAMES:
             text = self._stringify_field_value(fields.get(field_name))
@@ -176,6 +195,9 @@ class SupportIssueService:
         return "问题：\n" + question + "\n\n补充信息：\n" + "\n".join(f"- {item}" for item in supplements)
 
     def _classify_question(self, query: str) -> str:
+        # 这是一个轻量规则分类器：
+        # 先按关键词把问题归到 SQL / 配置 / 环境 / FAQ 等大类，
+        # 再据此选择更贴近场景的 system prompt。
         lowered = query.lower()
         if any(token in lowered for token in ("select ", "update ", "insert ", "delete ", "sql", "数据库", "表 ")):
             return "SQL排查"
@@ -356,6 +378,10 @@ class SupportIssueService:
             "link": first_item["url"],
             "text": first_item["document_name"] or first_item["url"],
         }
+
+    def _is_no_hit_feedback_fact(self, fact: SupportIssueFeedbackFact) -> bool:
+        ai_solution = fact.ai_solution.strip()
+        return fact.retrieval_hit_count == 0 and NO_HIT_MESSAGE_KEYWORD in ai_solution
 
     def _coerce_field_value_for_write(self, field: FeishuBitableFieldInfo | None, value: Any) -> Any:
         if field is None:
@@ -1985,8 +2011,14 @@ class SupportIssueService:
         ]
 
         generated_count = sum(1 for fact in facts_in_period if fact.progress_value == DONE_PROGRESS_VALUE)
-        manual_review_count = sum(1 for fact in facts_in_period if fact.progress_value == MANUAL_REVIEW_PROGRESS_VALUE)
-        no_hit_count = sum(1 for fact in facts_in_period if fact.progress_value == NO_HIT_PROGRESS_VALUE)
+        no_hit_facts = [fact for fact in facts_in_period if self._is_no_hit_feedback_fact(fact)]
+        no_hit_record_ids = {fact.record_id for fact in no_hit_facts}
+        manual_review_count = sum(
+            1
+            for fact in facts_in_period
+            if fact.progress_value == MANUAL_REVIEW_PROGRESS_VALUE and fact.record_id not in no_hit_record_ids
+        )
+        no_hit_count = len(no_hit_facts)
         failed_count = sum(1 for fact in facts_in_period if fact.progress_value == FAILED_PROGRESS_VALUE)
         total_processed_count = generated_count + manual_review_count + no_hit_count + failed_count
 
@@ -2009,8 +2041,8 @@ class SupportIssueService:
 
         no_hit_topic_counter = Counter(
             self._question_topic(fact.question)
-            for fact in facts_in_period
-            if fact.progress_value == NO_HIT_PROGRESS_VALUE and fact.question.strip() != ""
+            for fact in no_hit_facts
+            if fact.question.strip() != ""
         )
         top_no_hit_topics = [topic for topic, _count in no_hit_topic_counter.most_common(5)]
 
@@ -2360,7 +2392,7 @@ class SupportIssueService:
                             (link_field, self._empty_link_field_value(url_like_field=link_is_url_like)),
                             (confidence_field, 0.0),
                             (hit_count_field, 0),
-                            (progress_field, NO_HIT_PROGRESS_VALUE),
+                            (progress_field, MANUAL_REVIEW_PROGRESS_VALUE),
                         ),
                     )
                     no_hit_count += 1
@@ -2371,11 +2403,11 @@ class SupportIssueService:
                             status="no_hit",
                             solution=NO_HIT_MESSAGE,
                             related_link=None,
-                            message="未检索到可用知识，已回写无命中状态。",
+                            message="未检索到可用知识，已标记待人工确认。",
                             retrieval_hit_count=0,
                             confidence_score=0.0,
                             judge_status="no_hit",
-                            judge_reason="未命中知识。",
+                            judge_reason="未命中知识，已转人工确认。",
                             question_category=category,
                             similar_case_count=len(similar_cases),
                             feedback_snapshot=feedback_snapshot,
@@ -2481,6 +2513,8 @@ class SupportIssueService:
                 )
 
         processed_count = len(candidate_rows)
+        # 这里把整批行级结果汇总成一次 run 的总体状态：
+        # 全失败 -> failed；部分失败 -> partial_success；其余 -> success。
         if failed_count > 0 and generated_count == 0 and manual_review_count == 0 and no_hit_count == 0:
             run_status = "failed"
         elif failed_count > 0:

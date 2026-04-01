@@ -1,0 +1,4 @@
+interface:
+  display_name: "用友工作通知"
+  short_description: "获取 access_token、鉴权签名并推送用友幂等工作通知"
+  default_prompt: "Use $yonyou-work-notify to first collect appKey, appSecret, and yhtUserId, then send a Yonyou idempotent work notification."

@@ -51,6 +51,37 @@ Tools:
 - Citation
 - 知识型能力和普通工具能力的区别
 
+### 4. `yonyou_work_notify`
+
+Tools:
+
+- `send_yonyou_work_notify`
+
+用途：
+
+- 获取用友自建应用 `access_token`
+- 计算 `HmacSHA256` 鉴权签名
+- 调用幂等工作通知接口发送消息
+
+入参来源：
+
+- 优先使用工具显式传入的 `app_key` / `app_secret` / `auth_base_url`
+- 若未显式传入，则回退到环境变量：
+  - `YONYOU_APP_KEY`
+  - `YONYOU_APP_SECRET`
+  - `YONYOU_AUTH_BASE_URL`
+
+何时启用：
+
+- 需要让 Agent 直接调用用友工作通知接口时启用
+- 默认不启用，避免聊天或检索场景误触发外部消息发送
+
+学习点：
+
+- 外部 API 集成
+- HMAC 签名
+- 幂等消息发送
+
 ## 如何新增一个 Skill
 
 1. 写一个或多个 Tool

@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 支持问题案例候选工作区。
+ *
+ * 这个页面负责审核、编辑和发布由支持问题 Agent 自动沉淀出来的候选案例。
+ */
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";

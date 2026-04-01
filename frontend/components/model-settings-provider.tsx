@@ -1,20 +1,29 @@
 "use client";
 
+/**
+ * 模型设置上下文提供者。
+ *
+ * 它把 provider 列表、模型可用性校验、邮箱设置、飞书设置和设置弹窗状态
+ * 统一放进一个 React Context 中，方便全站任何页面直接复用。
+ */
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 
 import {
   getFeishuSettings,
+  getGitLabImportSettings,
   getMailSettings,
   listProviders,
   testMailSettings,
   testProvider,
   updateFeishuSettings,
+  updateGitLabImportSettings,
   updateMailSettings,
   updateProvider
 } from "../lib/api";
 import type {
   FeishuSettings,
+  GitLabImportSettings,
   MailSettings,
   MailTestRequest,
   MailTestResponse,
@@ -43,37 +52,53 @@ type ModelSettingsContextValue = {
   feishuSettings: FeishuSettings | null;
   isFeishuSettingsLoading: boolean;
   feishuError: string;
+  gitlabImportSettings: GitLabImportSettings | null;
+  isGitLabImportSettingsLoading: boolean;
+  gitlabImportError: string;
   isModelSettingsOpen: boolean;
   isMailSettingsOpen: boolean;
   isFeishuSettingsOpen: boolean;
+  isGitLabImportSettingsOpen: boolean;
   selectedProviderId: string;
   refreshProviders: () => Promise<void>;
   refreshMailSettings: () => Promise<void>;
   refreshFeishuSettings: () => Promise<void>;
+  refreshGitLabImportSettings: () => Promise<void>;
   openModelSettings: (providerId?: string) => void;
   openMailSettings: () => void;
   openFeishuSettings: () => void;
+  openGitLabImportSettings: () => void;
   closeModelSettings: () => void;
   closeMailSettings: () => void;
   closeFeishuSettings: () => void;
+  closeGitLabImportSettings: () => void;
   setSelectedProviderId: (providerId: string) => void;
   saveProvider: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderConfig>;
   runProviderTest: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderTestResponse>;
   saveMailSettings: (input: UpdateMailSettingsRequest) => Promise<MailSettings>;
   runMailTest: (input: MailTestRequest) => Promise<MailTestResponse>;
   saveFeishuSettings: (input: { app_id?: string; app_secret?: string }) => Promise<FeishuSettings>;
+  saveGitLabImportSettings: (input: {
+    token?: string;
+    clear_token?: boolean;
+    allowed_hosts?: string[];
+  }) => Promise<GitLabImportSettings>;
   validateModelConfig: (config: ModelConfig) => ModelConfigValidation;
   getProvider: (providerId: string) => ProviderConfig | undefined;
   getEnabledProviders: () => ProviderConfig[];
 };
 
+/** Context 负责把模型设置相关状态分发到整棵组件树。 */
 const ModelSettingsContext = createContext<ModelSettingsContextValue | null>(null);
 
+/** 让 provider 在界面上的排列顺序稳定，避免每次刷新顺序乱跳。 */
 function sortProviders(providers: ProviderConfig[]) {
   return providers.slice().sort((left, right) => left.name.localeCompare(right.name, "zh-CN"));
 }
 
 export function ModelSettingsProvider(props: { children: ReactNode }) {
+  // 这一组 state 描述“设置中心自身”的运行状态：
+  // 当前有哪些 provider、是否还在加载、最近的错误是什么、哪些弹窗已打开。
   const [providers, setProviders] = useState<ProviderConfig[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
@@ -83,12 +108,18 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   const [feishuSettings, setFeishuSettings] = useState<FeishuSettings | null>(null);
   const [isFeishuSettingsLoading, setIsFeishuSettingsLoading] = useState(true);
   const [feishuError, setFeishuError] = useState("");
+  const [gitlabImportSettings, setGitlabImportSettings] = useState<GitLabImportSettings | null>(null);
+  const [isGitLabImportSettingsLoading, setIsGitLabImportSettingsLoading] = useState(true);
+  const [gitlabImportError, setGitlabImportError] = useState("");
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isMailSettingsOpen, setIsMailSettingsOpen] = useState(false);
   const [isFeishuSettingsOpen, setIsFeishuSettingsOpen] = useState(false);
+  const [isGitLabImportSettingsOpen, setIsGitLabImportSettingsOpen] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState("");
 
   async function refreshProviders() {
+    // 刷新 provider 后需要顺便校正当前选中的 providerId，
+    // 否则如果旧 provider 被删除或禁用，右侧面板就会失去目标。
     setError("");
     const nextProviders = sortProviders(await listProviders());
     setProviders(nextProviders);
@@ -110,7 +141,14 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setFeishuSettings(await getFeishuSettings());
   }
 
+  async function refreshGitLabImportSettings() {
+    setGitlabImportError("");
+    setGitlabImportSettings(await getGitLabImportSettings());
+  }
+
   useEffect(() => {
+    // 首次挂载时并行拉取三类全局配置：
+    // provider、邮箱、飞书。这样设置面板一打开就有完整上下文。
     refreshProviders()
       .catch((cause) => setError(String(cause)))
       .finally(() => setIsLoading(false));
@@ -120,9 +158,14 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     refreshFeishuSettings()
       .catch((cause) => setFeishuError(String(cause)))
       .finally(() => setIsFeishuSettingsLoading(false));
+    refreshGitLabImportSettings()
+      .catch((cause) => setGitlabImportError(String(cause)))
+      .finally(() => setIsGitLabImportSettingsLoading(false));
   }, []);
 
   const providersById = useMemo(() => {
+    // 后面会频繁按 id 查询 provider，因此先转成 Map，
+    // 可以让读取逻辑更直接，也避免反复遍历数组。
     return new Map(providers.map((provider) => [provider.id, provider]));
   }, [providers]);
 
@@ -133,6 +176,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   function openModelSettings(providerId?: string) {
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
     if (providerId != null && providerId !== "") {
       setSelectedProviderId(providerId);
     } else if (selectedProviderId === "" && providers.length > 0) {
@@ -144,13 +188,22 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   function openMailSettings() {
     setIsModelSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
     setIsMailSettingsOpen(true);
   }
 
   function openFeishuSettings() {
     setIsModelSettingsOpen(false);
     setIsMailSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
     setIsFeishuSettingsOpen(true);
+  }
+
+  function openGitLabImportSettings() {
+    setIsModelSettingsOpen(false);
+    setIsMailSettingsOpen(false);
+    setIsFeishuSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(true);
   }
 
   function closeModelSettings() {
@@ -165,7 +218,12 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsFeishuSettingsOpen(false);
   }
 
+  function closeGitLabImportSettings() {
+    setIsGitLabImportSettingsOpen(false);
+  }
+
   async function saveProvider(providerId: string, input: UpdateProviderRequest) {
+    // 保存后既刷新远端真值，也即时替换本地缓存，确保界面马上反映结果。
     const saved = await updateProvider(providerId, input);
     await refreshProviders();
     replaceProvider(saved);
@@ -192,6 +250,16 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     return saved;
   }
 
+  async function saveGitLabImportSettings(input: {
+    token?: string;
+    clear_token?: boolean;
+    allowed_hosts?: string[];
+  }) {
+    const saved = await updateGitLabImportSettings(input);
+    setGitlabImportSettings(saved);
+    return saved;
+  }
+
   function getProvider(providerId: string) {
     return providersById.get(providerId);
   }
@@ -201,6 +269,8 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   }
 
   function validateModelConfig(config: ModelConfig): ModelConfigValidation {
+    // 这是页面真正发请求前的最后一道前端校验：
+    // provider 是否存在、是否启用、模型名是否还在当前 provider 下可选。
     if (isLoading) {
       return { isRunnable: false, message: "模型配置加载中，请稍候。" };
     }
@@ -253,25 +323,33 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
         feishuSettings,
         isFeishuSettingsLoading,
         feishuError,
+        gitlabImportSettings,
+        isGitLabImportSettingsLoading,
+        gitlabImportError,
         isModelSettingsOpen,
         isMailSettingsOpen,
         isFeishuSettingsOpen,
+        isGitLabImportSettingsOpen,
         selectedProviderId,
         refreshProviders,
         refreshMailSettings,
         refreshFeishuSettings,
+        refreshGitLabImportSettings,
         openModelSettings,
         openMailSettings,
         openFeishuSettings,
+        openGitLabImportSettings,
         closeModelSettings,
         closeMailSettings,
         closeFeishuSettings,
+        closeGitLabImportSettings,
         setSelectedProviderId,
         saveProvider,
         runProviderTest,
         saveMailSettings,
         runMailTest,
         saveFeishuSettings,
+        saveGitLabImportSettings,
         validateModelConfig,
         getProvider,
         getEnabledProviders

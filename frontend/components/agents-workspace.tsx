@@ -1,5 +1,11 @@
 "use client";
 
+/**
+ * 配置型 Agent 工作区。
+ *
+ * 这个页面让你把 Prompt、模型、Skill 和知识范围固定成一份可复用配置，
+ * 然后在右侧反复输入问题做运行测试。
+ */
 import { useEffect, useMemo, useState } from "react";
 
 import { createAgent, getAgent, getCatalog, getKnowledgeTree, listAgents, runAgent, updateAgent } from "../lib/api";
@@ -7,6 +13,7 @@ import type { AgentConfig, AgentRunResponse, Catalog, KnowledgeTreeNode, Knowled
 import { ModelSelector } from "./model-selector";
 import { useModelSettings } from "./model-settings-provider";
 
+/** 新建 Agent 时默认使用学习模式模型。 */
 const DEFAULT_MODEL: ModelConfig = {
   mode: "learning",
   provider: "mock",
@@ -26,11 +33,13 @@ type AgentFormState = {
   knowledge_scope_id?: string | null;
 };
 
+/** 把知识树拍平成选项列表，方便下拉框直接展示路径。 */
 function flattenTree(node: KnowledgeTreeNode): Array<{ id: string; label: string }> {
   const current = [{ id: node.id, label: node.path + " · " + node.name }];
   return current.concat(node.children.flatMap(flattenTree));
 }
 
+/** 构造一个新的空白 Agent 表单。 */
 function buildEmptyForm(defaultSkills: string[]): AgentFormState {
   return {
     name: "新的 Agent",
@@ -45,6 +54,10 @@ function buildEmptyForm(defaultSkills: string[]): AgentFormState {
 
 export function AgentsWorkspace() {
   const { validateModelConfig, openModelSettings } = useModelSettings();
+  // 这个页面的核心状态有三块：
+  // 1. 可选资源：catalog / knowledge tree；
+  // 2. 当前编辑中的 Agent 表单；
+  // 3. 右侧运行输入与运行结果。
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [tree, setTree] = useState<KnowledgeTreeResponse | null>(null);
   const [agents, setAgents] = useState<AgentConfig[]>([]);
@@ -54,9 +67,11 @@ export function AgentsWorkspace() {
   const [error, setError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
   const modelValidation = validateModelConfig(form.model_config);
 
   const treeOptions = useMemo(() => {
+    // 只有知识树变化时才重新拍平，避免每次输入都重复做树遍历。
     if (tree == null) return [];
     return flattenTree(tree.root);
   }, [tree]);
@@ -66,25 +81,33 @@ export function AgentsWorkspace() {
     // 1. catalog：有哪些 skills 可选；
     // 2. knowledge tree：有哪些知识范围可绑定；
     // 3. agents：已有的配置型 Agent。
-    const [catalogData, treeData, agentsData] = await Promise.all([getCatalog(), getKnowledgeTree(), listAgents()]);
-    setCatalog(catalogData);
-    setTree(treeData);
-    setAgents(agentsData);
+    setIsBootstrapping(true);
+    setError("");
+    try {
+      const [catalogData, treeData, agentsData] = await Promise.all([getCatalog(), getKnowledgeTree(), listAgents()]);
+      setCatalog(catalogData);
+      setTree(treeData);
+      setAgents(agentsData);
 
-    const defaultSkillIds = catalogData.skills.filter((skill) => skill.enabled_by_default).map((skill) => skill.id);
-    if (agentsData.length > 0) {
-      const detail = await getAgent(agentsData[0].id);
-      setForm(detail);
-    } else {
-      setForm(buildEmptyForm(defaultSkillIds));
+      const defaultSkillIds = catalogData.skills.filter((skill) => skill.enabled_by_default).map((skill) => skill.id);
+      if (agentsData.length > 0) {
+        const detail = await getAgent(agentsData[0].id);
+        setForm(detail);
+      } else {
+        setForm(buildEmptyForm(defaultSkillIds));
+      }
+    } finally {
+      setIsBootstrapping(false);
     }
   }
 
   useEffect(() => {
-    bootstrap().catch((cause) => setError(String(cause)));
+    void bootstrap().catch((cause) => setError(String(cause)));
   }, []);
 
   async function refreshAgents(selectId?: string) {
+    // 保存后统一刷新列表，并尽量把焦点留在刚创建/更新的那一项上，
+    // 这样用户不会因为列表刷新而“丢失当前上下文”。
     const nextAgents = await listAgents();
     setAgents(nextAgents);
     if (selectId != null && selectId !== "") {
@@ -98,14 +121,17 @@ export function AgentsWorkspace() {
     }
   }
 
-  async function handleSave() {
+  async function handleSave(): Promise<string | null> {
     // 保存阶段只是把配置落库，还没有真正执行 Agent。
     // 这样你可以先配置，再在右侧运行面板里反复试不同问题。
-    if (form.name.trim() === "") return;
+    if (form.name.trim() === "") {
+      setError("请输入 Agent 名称。");
+      return null;
+    }
     if (!modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
-      return;
+      return null;
     }
     setError("");
     setIsSaving(true);
@@ -121,6 +147,7 @@ export function AgentsWorkspace() {
           knowledge_scope_id: form.knowledge_scope_type === "tree_recursive" ? form.knowledge_scope_id : null
         });
         await refreshAgents(created.id);
+        return created.id;
       } else {
         const updated = await updateAgent(form.id, {
           name: form.name,
@@ -132,9 +159,11 @@ export function AgentsWorkspace() {
           knowledge_scope_id: form.knowledge_scope_type === "tree_recursive" ? form.knowledge_scope_id : null
         });
         await refreshAgents(updated.id);
+        return updated.id;
       }
     } catch (cause) {
       setError(String(cause));
+      return null;
     } finally {
       setIsSaving(false);
     }
@@ -147,14 +176,13 @@ export function AgentsWorkspace() {
       openModelSettings(form.model_config.provider);
       return;
     }
-    if (form.id == null) {
-      await handleSave();
-    }
-    if (form.id == null || runInput.trim() === "") return;
+    const savedId = form.id == null ? await handleSave() : form.id;
+    const targetAgentId = savedId ?? form.id ?? null;
+    if (targetAgentId == null || runInput.trim() === "") return;
     setError("");
     setIsRunning(true);
     try {
-      const nextResult = await runAgent(form.id, runInput);
+      const nextResult = await runAgent(targetAgentId, runInput);
       setRunResult(nextResult);
     } catch (cause) {
       setError(String(cause));
@@ -164,8 +192,9 @@ export function AgentsWorkspace() {
   }
 
   return (
-    <div className="grid min-h-screen grid-cols-[300px_minmax(0,1fr)_420px]">
-      <aside className="border-r border-slate-800 bg-slate-900/50 p-5">
+    <div className="grid min-h-full grid-cols-1 xl:h-full xl:min-h-0 xl:overflow-hidden xl:grid-cols-[300px_minmax(0,1fr)_420px]">
+      {/* 左侧：Agent 列表，相当于一个“配置仓库”。 */}
+      <aside className="border-b border-slate-800 bg-slate-900/50 p-5 xl:flex xl:min-h-0 xl:flex-col xl:overflow-hidden xl:border-b-0 xl:border-r">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-xs uppercase tracking-[0.35em] text-amber-300">我的 Agent</div>
@@ -177,38 +206,61 @@ export function AgentsWorkspace() {
               const defaultSkills = catalog?.skills.filter((skill) => skill.enabled_by_default).map((skill) => skill.id) ?? [];
               setForm(buildEmptyForm(defaultSkills));
               setRunResult(null);
+              setError("");
             }}
           >
             新建
           </button>
         </div>
 
-        <div className="mt-5 space-y-3">
-          {agents.map((agent) => (
-            <button
-              key={agent.id}
-              className={
-                "w-full rounded-2xl border p-4 text-left transition " +
-                (form.id === agent.id
-                  ? "border-amber-300/60 bg-amber-300/10"
-                  : "border-slate-800 bg-slate-900 hover:border-slate-700")
-              }
-              onClick={async () => {
-                const detail = await getAgent(agent.id);
-                setForm(detail);
-                setRunResult(null);
-              }}
-            >
-              <div className="font-medium">{agent.name}</div>
-              <div className="mt-2 line-clamp-2 text-sm text-slate-400">{agent.description || agent.system_prompt}</div>
-              <div className="mt-3 text-xs text-slate-500">scope: {agent.knowledge_scope_type}</div>
-            </button>
-          ))}
-          {agents.length === 0 && <div className="text-sm text-slate-500">还没有配置型 Agent，可以先创建一个。</div>}
+        <div className="mt-5 xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:pr-1">
+          <div className="space-y-3">
+            {isBootstrapping && (
+              <div className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm text-slate-400">
+                正在加载 Agent 列表...
+              </div>
+            )}
+            {agents.map((agent) => (
+              <button
+                key={agent.id}
+                className={
+                  "w-full rounded-2xl border p-4 text-left transition " +
+                  (form.id === agent.id
+                    ? "border-amber-300/60 bg-amber-300/10"
+                    : "border-slate-800 bg-slate-900 hover:border-slate-700")
+                }
+                onClick={() => {
+                  void getAgent(agent.id)
+                    .then((detail) => {
+                      setForm(detail);
+                      setRunResult(null);
+                      setError("");
+                    })
+                    .catch((cause) => setError(String(cause)));
+                }}
+              >
+                <div className="font-medium">{agent.name}</div>
+                <div className="mt-2 line-clamp-2 text-sm text-slate-400">{agent.description || agent.system_prompt}</div>
+                <div className="mt-3 text-xs text-slate-500">scope: {agent.knowledge_scope_type}</div>
+              </button>
+            ))}
+            {agents.length === 0 && <div className="text-sm text-slate-500">还没有配置型 Agent，可以先创建一个。</div>}
+            {error !== "" && !isBootstrapping && (
+              <button
+                className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-500"
+                onClick={() => {
+                  void bootstrap().catch((cause) => setError(String(cause)));
+                }}
+                type="button"
+              >
+                重新加载
+              </button>
+            )}
+          </div>
         </div>
       </aside>
 
-      <main className="min-w-0 border-r border-slate-800 px-6 py-6">
+      <main className="min-w-0 border-b border-slate-800 px-6 py-6 xl:min-h-0 xl:overflow-y-auto xl:border-b-0 xl:border-r">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="flex items-center justify-between">
             <div>
@@ -220,7 +272,7 @@ export function AgentsWorkspace() {
               onClick={() => {
                 void handleSave();
               }}
-              disabled={isSaving}
+              disabled={isBootstrapping || isSaving}
             >
               {isSaving ? "保存中..." : "保存配置"}
             </button>
@@ -323,10 +375,16 @@ export function AgentsWorkspace() {
         {error !== "" && <div className="mt-6 text-sm text-rose-300">{error}</div>}
       </main>
 
-      <aside className="bg-slate-900/60 p-5">
+      {/* 右侧：运行面板，用来拿当前配置做即时验证。 */}
+      <aside className="bg-slate-900/60 p-5 xl:min-h-0 xl:overflow-y-auto">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="text-sm text-slate-400">专属运行面板</div>
           <h3 className="mt-1 text-xl font-semibold">运行 Agent</h3>
+          {form.id == null && (
+            <div className="mt-3 rounded-2xl border border-sky-400/20 bg-sky-400/10 px-4 py-3 text-xs leading-6 text-sky-100">
+              当前是未保存草稿，首次运行会自动先保存配置再执行。
+            </div>
+          )}
 
           <textarea
             className="mt-5 min-h-40 w-full rounded-2xl border border-slate-800 bg-slate-950/60 px-4 py-3 text-sm leading-6 outline-none"
@@ -339,7 +397,7 @@ export function AgentsWorkspace() {
             onClick={() => {
               void handleRun();
             }}
-            disabled={isRunning || !modelValidation.isRunnable}
+            disabled={isBootstrapping || isRunning || !modelValidation.isRunnable}
           >
             {isRunning ? "运行中..." : "运行 Agent"}
           </button>

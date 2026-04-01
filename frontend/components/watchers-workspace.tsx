@@ -1,5 +1,11 @@
 "use client";
 
+/**
+ * 巡检 Agent 工作区。
+ *
+ * 它包含抓取配置、Cookie / Curl 解析、责任人规则、运行记录等复杂交互，
+ * 是理解自动化巡检 Agent 前端配置面的核心入口。
+ */
 import { useEffect, useMemo, useState } from "react";
 
 import {
@@ -23,6 +29,7 @@ import type {
 import { ModelSelector } from "./model-selector";
 import { useModelSettings } from "./model-settings-provider";
 
+/** 巡检 Agent 默认使用的学习模式模型配置。 */
 const DEFAULT_MODEL: ModelConfig = {
   mode: "learning",
   provider: "mock",
@@ -54,11 +61,13 @@ type WatcherFormState = {
   owner_rules: OwnerRuleFormState[];
 };
 
+/** 把巡检运行时间戳格式化成中文日期时间。 */
 function formatDate(value?: string | null) {
   if (value == null || value === "") return "-";
   return new Date(value).toLocaleString("zh-CN");
 }
 
+/** 把逗号、换行等分隔文本解析成字符串数组。 */
 function parseCommaList(value: string): string[] {
   return value
     .split(/[\n,，;]/)
@@ -66,10 +75,29 @@ function parseCommaList(value: string): string[] {
     .filter((item) => item !== "");
 }
 
+/** 把对象安全格式化成 JSON 文本，便于展示和调试。 */
 function stringifyJson(value: unknown) {
   return JSON.stringify(value, null, 2);
 }
 
+function parseJsonObjectInput(value: string, label: string): Record<string, unknown> {
+  const normalized = value.trim();
+  if (normalized === "") return {};
+  try {
+    const parsed = JSON.parse(normalized) as unknown;
+    if (parsed == null || Array.isArray(parsed) || typeof parsed !== "object") {
+      throw new Error(`${label} 必须是 JSON 对象。`);
+    }
+    return parsed as Record<string, unknown>;
+  } catch (cause) {
+    if (cause instanceof Error && cause.message.includes("必须是 JSON 对象")) {
+      throw cause;
+    }
+    throw new Error(`${label} 不是合法 JSON：${cause instanceof Error ? cause.message : String(cause)}`);
+  }
+}
+
+/** 截断展示 Cookie，避免界面直接暴露完整敏感信息。 */
 function previewCookie(cookie: string) {
   const normalized = cookie.trim();
   if (normalized === "") return "未配置";
@@ -77,20 +105,24 @@ function previewCookie(cookie: string) {
   return normalized.slice(0, 96) + "...";
 }
 
+/** 从 headers 中读出 Cookie，便于单独放进表单编辑。 */
 function readCookieHeader(headers: Record<string, string>): string {
   return headers.Cookie ?? headers.cookie ?? "";
 }
 
+/** 从 headers 中剥离 Cookie，避免和专门的 Cookie 输入框重复。 */
 function stripCookieHeader(headers: Record<string, string>): Record<string, string> {
   return Object.fromEntries(
     Object.entries(headers).filter(([key]) => key.toLowerCase() !== "cookie")
   );
 }
 
+/** 统一规范 HTTP 方法大小写。 */
 function normalizeMethod(value?: string | null): WatcherRequestMethod {
   return value?.toUpperCase() === "POST" ? "POST" : "GET";
 }
 
+/** 对 curl 命令做轻量切词，为后续解析表单字段做准备。 */
 function shellTokenize(command: string): string[] {
   const tokens: string[] = [];
   const normalized = command.replace(/\\\r?\n/g, " ");
@@ -151,6 +183,7 @@ function shellTokenize(command: string): string[] {
   return tokens;
 }
 
+/** 把 curl 命令解析成巡检表单可编辑的抓取配置。 */
 function parseCurlCommand(command: string): {
   dashboard_url: string;
   request_method: WatcherRequestMethod;
@@ -216,7 +249,11 @@ function parseCurlCommand(command: string): {
   }
 
   if (sawData && requestBodyText.trim() !== "") {
-    JSON.parse(requestBodyText);
+    try {
+      JSON.parse(requestBodyText);
+    } catch (cause) {
+      throw new Error(`curl 里的请求体不是合法 JSON：${cause instanceof Error ? cause.message : String(cause)}`);
+    }
   }
 
   return {
@@ -346,6 +383,7 @@ export function WatchersWorkspace() {
   const [isTesting, setIsTesting] = useState(false);
   const [togglingWatcherId, setTogglingWatcherId] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<WatcherFetchTestResponse | null>(null);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
   const modelValidation = validateModelConfig(form.model_config);
 
   const selectedRun = useMemo(
@@ -358,6 +396,8 @@ export function WatchersWorkspace() {
   );
 
   async function loadWatcherDetail(watcherId: string) {
+    // 左侧切换 Watcher 时，需要同步刷新两类信息：
+    // 当前表单配置，以及这台 Watcher 的运行历史。
     const [watcher, watcherRuns] = await Promise.all([getWatcher(watcherId), listWatcherRuns(watcherId)]);
     setForm(watcherToForm(watcher));
     setRuns(watcherRuns);
@@ -366,23 +406,33 @@ export function WatchersWorkspace() {
   }
 
   async function bootstrap() {
-    const watcherList = await listWatchers();
-    setWatchers(watcherList);
-    if (watcherList.length > 0) {
-      await loadWatcherDetail(watcherList[0].id);
-      return;
+    // 首次进入页面时，优先加载 Watcher 列表；
+    // 如果已有配置，就默认打开第一条，保证页面不是空壳。
+    setIsBootstrapping(true);
+    setError("");
+    try {
+      const watcherList = await listWatchers();
+      setWatchers(watcherList);
+      if (watcherList.length > 0) {
+        await loadWatcherDetail(watcherList[0].id);
+        return;
+      }
+      setForm(buildEmptyForm());
+      setRuns([]);
+      setSelectedRunId(null);
+      setTestResult(null);
+    } finally {
+      setIsBootstrapping(false);
     }
-    setForm(buildEmptyForm());
-    setRuns([]);
-    setSelectedRunId(null);
-    setTestResult(null);
   }
 
   useEffect(() => {
-    bootstrap().catch((cause) => setError(String(cause)));
+    void bootstrap().catch((cause) => setError(String(cause)));
   }, []);
 
   async function refreshWatchers(selectId?: string) {
+    // 保存、运行、启停后统一走这个刷新入口，
+    // 避免每个操作都各自维护一套“刷新列表 + 切换详情”的逻辑。
     const watcherList = await listWatchers();
     setWatchers(watcherList);
     const targetId = selectId ?? watcherList[0]?.id;
@@ -396,10 +446,14 @@ export function WatchersWorkspace() {
   }
 
   function buildFetchRequest() {
-    const requestHeaders =
-      form.request_extra_headers_text.trim() === ""
-        ? {}
-        : (JSON.parse(form.request_extra_headers_text) as Record<string, string>);
+    // 巡检抓取配置最终要还原成一个 HTTP 请求：
+    // URL、方法、Headers、Body 都从表单草稿拼出来。
+    const requestHeaders = Object.fromEntries(
+      Object.entries(parseJsonObjectInput(form.request_extra_headers_text, "附加请求头 JSON")).map(([key, value]) => [
+        key,
+        String(value)
+      ])
+    );
     if (form.request_cookie.trim() !== "") {
       requestHeaders.Cookie = form.request_cookie.trim();
     }
@@ -409,9 +463,7 @@ export function WatchersWorkspace() {
       request_headers: requestHeaders,
       request_body_json:
         form.request_method === "POST"
-          ? form.request_body_text.trim() === ""
-            ? {}
-            : (JSON.parse(form.request_body_text) as Record<string, unknown>)
+          ? parseJsonObjectInput(form.request_body_text, "请求体 JSON")
           : null
     };
   }
@@ -435,6 +487,7 @@ export function WatchersWorkspace() {
   }
 
   function buildPayload() {
+    // 保存到后端前，把前端表单状态转换成后端 schema 需要的结构。
     return {
       name: form.name.trim(),
       description: form.description.trim(),
@@ -481,6 +534,8 @@ export function WatchersWorkspace() {
   }
 
   async function handleRun(mode: "snapshot" | "assign_current" = "snapshot") {
+    // 运行前先强制保存，是为了保证：
+    // “你刚刚在界面上改的配置”和“后端真正执行的配置”始终是一致的。
     if (!modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
@@ -507,6 +562,8 @@ export function WatchersWorkspace() {
   }
 
   async function handleTestFetch() {
+    // “测试抓取”只验证是否能成功拉到原始面板数据，
+    // 不会真正触发分配接口，也不会发送邮件。
     if (form.dashboard_url.trim() === "") {
       setError("请先填写面板 URL。");
       return;
@@ -525,6 +582,8 @@ export function WatchersWorkspace() {
   }
 
   async function handleToggleWatcherEnabled(watcher: WatcherAgentConfig, nextEnabled: boolean) {
+    // 列表里的启停按钮走的是轻量更新：
+    // 只改 enabled 字段，不打断当前页面其余编辑状态。
     setError("");
     setTogglingWatcherId(watcher.id);
     try {
@@ -546,8 +605,8 @@ export function WatchersWorkspace() {
   }
 
   return (
-    <div className="grid h-screen grid-cols-[320px_minmax(0,1fr)_420px] overflow-hidden">
-      <aside className="min-h-0 overflow-y-auto border-r border-slate-800 bg-slate-900/50 p-5">
+    <div className="grid min-h-full grid-cols-1 overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)_420px]">
+      <aside className="min-h-0 overflow-y-auto border-b border-slate-800 bg-slate-900/50 p-5 xl:border-b-0 xl:border-r">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-xs uppercase tracking-[0.35em] text-amber-300">巡检 Agent</div>
@@ -560,6 +619,7 @@ export function WatchersWorkspace() {
               setRuns([]);
               setSelectedRunId(null);
               setTestResult(null);
+              setError("");
             }}
           >
             新建
@@ -567,6 +627,11 @@ export function WatchersWorkspace() {
         </div>
 
         <div className="mt-5 space-y-3">
+          {isBootstrapping && (
+            <div className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm text-slate-400">
+              正在加载巡检 Agent...
+            </div>
+          )}
           {watchers.map((watcher) => (
             <div
               key={watcher.id}
@@ -579,12 +644,12 @@ export function WatchersWorkspace() {
                   : "border-slate-800 bg-slate-900 hover:border-slate-700")
               }
               onClick={() => {
-                void loadWatcherDetail(watcher.id);
+                void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
               }}
               onKeyDown={(event) => {
                 if (event.key !== "Enter" && event.key !== " ") return;
                 event.preventDefault();
-                void loadWatcherDetail(watcher.id);
+                void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
               }}
             >
               <div className="flex items-start justify-between gap-3">
@@ -623,10 +688,21 @@ export function WatchersWorkspace() {
             </div>
           ))}
           {watchers.length === 0 && <div className="text-sm text-slate-500">还没有巡检 Agent，可以先新建一个。</div>}
+          {error !== "" && !isBootstrapping && (
+            <button
+              className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-500"
+              onClick={() => {
+                void bootstrap().catch((cause) => setError(String(cause)));
+              }}
+              type="button"
+            >
+              重新加载
+            </button>
+          )}
         </div>
       </aside>
 
-      <main className="min-h-0 min-w-0 overflow-y-auto border-r border-slate-800 px-6 py-6">
+      <main className="min-h-0 min-w-0 overflow-y-auto border-b border-slate-800 px-6 py-6 xl:border-b-0 xl:border-r">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -639,7 +715,7 @@ export function WatchersWorkspace() {
                 onClick={() => {
                   void handleRun("snapshot");
                 }}
-                disabled={runningMode != null}
+                disabled={isBootstrapping || runningMode != null}
               >
                 {runningMode === "snapshot" ? "运行中..." : "立即运行"}
               </button>
@@ -648,7 +724,7 @@ export function WatchersWorkspace() {
                 onClick={() => {
                   void handleRun("assign_current");
                 }}
-                disabled={runningMode != null}
+                disabled={isBootstrapping || runningMode != null}
               >
                 {runningMode === "assign_current" ? "分配中..." : "立即运行并分配当前列表"}
               </button>
@@ -657,7 +733,7 @@ export function WatchersWorkspace() {
                 onClick={() => {
                   void handleTestFetch();
                 }}
-                disabled={isTesting}
+                disabled={isBootstrapping || isTesting}
               >
                 {isTesting ? "检查中..." : "接口检查"}
               </button>
@@ -666,7 +742,7 @@ export function WatchersWorkspace() {
                 onClick={() => {
                   void handleSave();
                 }}
-                disabled={isSaving}
+                disabled={isBootstrapping || isSaving}
               >
                 {isSaving ? "保存中..." : "保存配置"}
               </button>

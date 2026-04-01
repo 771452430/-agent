@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 飞书全局设置面板。
+ *
+ * 它负责保存支持问题 Agent 需要的飞书应用凭据，并提供测试与错误提示。
+ */
 import { useEffect, useMemo, useState } from "react";
 
 import { useModelSettings } from "./model-settings-provider";

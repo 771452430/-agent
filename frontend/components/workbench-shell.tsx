@@ -1,11 +1,17 @@
 "use client";
 
+/**
+ * 工作台公共外壳。
+ *
+ * 它负责左侧导航、全局设置入口和右侧主体内容区域，是所有功能页共享的骨架。
+ */
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 
 import { FeishuSettingsPanel } from "./feishu-settings-panel";
+import { GitLabImportSettingsPanel } from "./gitlab-import-settings-panel";
 import { MailSettingsPanel } from "./mail-settings-panel";
 import { ModelSettingsPanel } from "./model-settings-panel";
 import { useModelSettings } from "./model-settings-provider";
@@ -21,99 +27,129 @@ const NAV_ITEMS = [
 export function WorkbenchShell(props: { children: ReactNode }) {
   const pathname = usePathname();
   const [isUtilityMenuOpen, setIsUtilityMenuOpen] = useState(false);
-  const { openFeishuSettings, openMailSettings, openModelSettings } = useModelSettings();
+  const { openFeishuSettings, openGitLabImportSettings, openMailSettings, openModelSettings } = useModelSettings();
+
+  useEffect(() => {
+    setIsUtilityMenuOpen(false);
+  }, [pathname]);
 
   return (
-    <div className="grid min-h-screen grid-cols-[220px_minmax(0,1fr)] bg-slate-950 text-slate-100">
-      <aside className="flex min-h-screen flex-col border-r border-slate-800 bg-slate-900/80 p-5">
-        <div>
-          <div className="text-xs uppercase tracking-[0.35em] text-amber-300">RAG Workbench</div>
-          <h1 className="mt-3 text-2xl font-semibold">Learning Studio</h1>
-          <p className="mt-3 text-sm leading-6 text-slate-400">把聊天、检索范围和自定义 Agent 放到同一个学习型工作台里。</p>
-        </div>
+    <div className="min-h-screen px-4 py-4 md:px-6 md:py-6">
+      <div className="apple-window grid min-h-[calc(100vh-2rem)] overflow-hidden rounded-[34px] lg:h-[calc(100vh-3rem)] lg:min-h-0 lg:grid-cols-[280px_minmax(0,1fr)]">
+        <aside className="apple-sidebar relative flex min-h-0 flex-col overflow-hidden border-b border-white/10 p-5 lg:border-b-0 lg:border-r">
+          <div className="min-h-0 flex-1 overflow-y-auto pr-1">
+            <div className="mb-6 flex items-center gap-2">
+              <span className="h-3 w-3 rounded-full bg-[#ff5f57]" />
+              <span className="h-3 w-3 rounded-full bg-[#febc2e]" />
+              <span className="h-3 w-3 rounded-full bg-[#28c840]" />
+            </div>
 
-        <nav className="mt-8 space-y-3">
-          {NAV_ITEMS.map((item) => {
-            const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                className={
-                  "block rounded-2xl border px-4 py-4 transition " +
-                  (isActive
-                    ? "border-amber-300/60 bg-amber-300/10"
-                    : "border-slate-800 bg-slate-950/40 hover:border-slate-700")
-                }
-              >
-                <div className="font-medium">{item.label}</div>
-                <div className="mt-1 text-sm text-slate-400">{item.description}</div>
+            <div className="apple-panel rounded-[28px] p-5">
+              <div className="apple-kicker">Learning Studio</div>
+              <h1 className="mt-3 text-3xl font-semibold tracking-[-0.03em] text-white">RAG Workbench</h1>
+              <p className="mt-3 text-sm leading-6 text-slate-300">
+                把聊天、检索、配置型 Agent 和自动化工作流收进一个更轻、更清晰的学习工作台。
+              </p>
+            </div>
+
+            <nav className="mt-6 space-y-3">
+              {NAV_ITEMS.map((item) => {
+                const isActive = pathname === item.href || pathname.startsWith(item.href + "/");
+                return (
+                  <Link
+                    key={item.href}
+                    href={item.href}
+                    className={
+                      "apple-nav-link block rounded-[24px] px-4 py-4 transition " +
+                      (isActive ? "apple-nav-link-active" : "")
+                    }
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="font-medium text-white">{item.label}</div>
+                      {isActive && <span className="apple-pill rounded-full px-2.5 py-1 text-[11px] text-sky-100">当前</span>}
+                    </div>
+                    <div className="mt-1.5 text-sm leading-6 text-slate-400">{item.description}</div>
+                  </Link>
+                );
+              })}
+            </nav>
+
+            <div className="apple-panel-subtle mt-6 rounded-[26px] p-4 text-sm text-slate-300">
+              <div className="font-medium text-white">推荐学习路径</div>
+              <div className="mt-2 leading-6">
+                先在 Chat 里观察 Skill 路由，再去检索模式体验 scoped RAG，然后配置 Agent，最后学习巡检与支持问题链路。
+              </div>
+              <Link href="/catalog" className="mt-4 inline-flex items-center text-sm text-sky-200">
+                查看 Skill Catalog
               </Link>
-            );
-          })}
-        </nav>
+            </div>
+          </div>
 
-        <div className="mt-8 rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-sm text-slate-400">
-          <div className="font-medium text-slate-200">学习路径</div>
-          <div className="mt-2 leading-6">建议顺序：先在 Chat 里看 Skill 触发，再去检索模式体验 scoped RAG，然后配置我的 Agent，最后学习巡检 Agent 的自动化链路。</div>
-          <Link href="/catalog" className="mt-4 inline-block text-amber-300">
-            查看 Skill Catalog
-          </Link>
-        </div>
-
-        <div className="relative mt-auto pt-6">
+          <div className="relative mt-auto pt-6">
           {isUtilityMenuOpen && (
-            <div className="absolute inset-x-0 bottom-16 rounded-2xl border border-slate-800 bg-slate-950/95 p-2 shadow-xl shadow-black/30">
+              <div className="apple-panel-strong absolute inset-x-0 bottom-16 rounded-[28px] p-2.5">
               <button
-                className="w-full rounded-xl px-3 py-3 text-left text-sm text-slate-200 transition hover:bg-slate-900"
+                  className="apple-button-ghost w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
                 onClick={() => {
                   openModelSettings();
                   setIsUtilityMenuOpen(false);
                 }}
               >
-                <div className="font-medium">模型设置</div>
-                <div className="mt-1 text-xs text-slate-500">统一管理厂商、协议、API Key 和模型列表</div>
+                  <div className="font-medium text-white">模型设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理厂商、协议、API Key 和模型列表</div>
               </button>
               <button
-                className="mt-2 w-full rounded-xl px-3 py-3 text-left text-sm text-slate-200 transition hover:bg-slate-900"
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
                 onClick={() => {
                   openMailSettings();
                   setIsUtilityMenuOpen(false);
                 }}
-                >
-                  <div className="font-medium">邮箱设置</div>
-                  <div className="mt-1 text-xs text-slate-500">统一管理 SMTP、发件邮箱和测试发信</div>
-                </button>
+              >
+                  <div className="font-medium text-white">邮箱设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理 SMTP、发件邮箱和测试发信</div>
+              </button>
               <button
-                className="mt-2 w-full rounded-xl px-3 py-3 text-left text-sm text-slate-200 transition hover:bg-slate-900"
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
                 onClick={() => {
                   openFeishuSettings();
                   setIsUtilityMenuOpen(false);
                 }}
               >
-                <div className="font-medium">飞书设置</div>
-                <div className="mt-1 text-xs text-slate-500">统一管理支持问题 Agent 使用的飞书应用凭据</div>
+                  <div className="font-medium text-white">飞书设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理支持问题 Agent 使用的飞书应用凭据</div>
+              </button>
+              <button
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
+                onClick={() => {
+                  openGitLabImportSettings();
+                  setIsUtilityMenuOpen(false);
+                }}
+              >
+                  <div className="font-medium text-white">GitLab 导入设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理检索模式导入 GitLab 文档树使用的 Token 和域名白名单</div>
               </button>
             </div>
           )}
 
           <button
-            className="flex w-full items-center justify-between rounded-2xl border border-slate-800 bg-slate-950/80 px-4 py-3 text-left transition hover:border-slate-700"
+              className="apple-panel flex w-full items-center justify-between rounded-[26px] px-4 py-3.5 text-left"
             onClick={() => setIsUtilityMenuOpen((current) => !current)}
           >
             <div>
-              <div className="text-sm font-medium text-slate-100">设置</div>
-              <div className="mt-1 text-xs text-slate-500">模型设置、邮箱设置等全局配置</div>
+                <div className="text-sm font-medium text-white">工作台设置</div>
+                <div className="mt-1 text-xs leading-5 text-slate-400">模型、邮箱、飞书和全局接入配置</div>
             </div>
-            <div className="text-slate-500">{isUtilityMenuOpen ? "收起" : "展开"}</div>
+              <div className="apple-pill rounded-full px-3 py-1 text-xs">{isUtilityMenuOpen ? "收起" : "展开"}</div>
           </button>
         </div>
       </aside>
 
-      <main className="min-w-0">{props.children}</main>
+        <main className="min-w-0 bg-white/[0.02] lg:min-h-0 lg:overflow-hidden">{props.children}</main>
+      </div>
       <ModelSettingsPanel />
       <MailSettingsPanel />
       <FeishuSettingsPanel />
+      <GitLabImportSettingsPanel />
     </div>
   );
 }

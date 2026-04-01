@@ -18,6 +18,10 @@ from .schemas import (
     CreateThreadRequest,
     CreateThreadResponse,
     DirectoryUploadRequest,
+    GitLabImportSettings,
+    GitLabTreeImportRequest,
+    GitLabTreeImportResponse,
+    UpdateGitLabImportSettingsRequest,
     FeishuBitableFieldsRequest,
     FeishuBitableFieldsResponse,
     FeishuBitablePendingAnalysisRequest,
@@ -72,6 +76,9 @@ from .services.agent_store import AgentStore
 from .services.chat_service import ChatService
 from .services.feishu_service import FeishuService
 from .services.feishu_settings_store import FeishuSettingsStore
+from .services.gitlab_import_service import GitLabImportService
+from .services.gitlab_settings_service import GitLabSettingsService
+from .services.gitlab_settings_store import GitLabSettingsStore
 from .services.knowledge_store import KnowledgeStore
 from .services.llm_service import LLMService
 from .services.mail_service import MailService
@@ -94,14 +101,25 @@ agent_store = AgentStore(settings.sqlite_path)
 provider_store = ProviderStore(settings.sqlite_path)
 mail_store = MailSettingsStore(settings.sqlite_path)
 feishu_store = FeishuSettingsStore(settings.sqlite_path)
+gitlab_settings_store = GitLabSettingsStore(settings.sqlite_path)
 knowledge_store = KnowledgeStore(settings.sqlite_path, settings.chroma_dir)
 watcher_store = WatcherStore(settings.sqlite_path)
 support_issue_store = SupportIssueStore(settings.sqlite_path)
 skill_registry = build_skill_registry(knowledge_store)
 llm_service = LLMService(provider_store=provider_store, allow_mock_model=settings.allow_mock_model)
+gitlab_settings_service = GitLabSettingsService(gitlab_settings_store, settings)
+gitlab_import_service = GitLabImportService(knowledge_store, gitlab_settings_service)
 mail_service = MailService(mail_store=mail_store, app_settings=settings)
 feishu_service = FeishuService(feishu_store=feishu_store)
-chat_service = ChatService(thread_store, knowledge_store, skill_registry, llm_service, agent_store, provider_store)
+chat_service = ChatService(
+    thread_store,
+    knowledge_store,
+    skill_registry,
+    llm_service,
+    agent_store,
+    provider_store,
+    gitlab_import_service,
+)
 watcher_service = WatcherService(watcher_store, llm_service, settings, mail_service)
 watcher_scheduler = WatcherScheduler(watcher_service, settings.watcher_scheduler_interval_seconds)
 support_issue_service = SupportIssueService(
@@ -116,6 +134,9 @@ support_issue_scheduler = SupportIssueScheduler(
     settings.support_issue_scheduler_interval_seconds,
 )
 
+# 这一段是后端“对象装配区”：
+# 先把 Store / Service / Scheduler 串好，再把它们暴露成 HTTP 路由。
+# 这样每个路由函数都能保持很薄，只负责接收请求并转发到业务层。
 app = FastAPI(title=settings.app_name)
 app.add_middleware(
     CORSMiddleware,
@@ -144,6 +165,9 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# -----------------------------
+# Chat / 全局设置 / 知识库接口
+# -----------------------------
 @app.get("/api/catalog", response_model=CatalogResponse)
 def get_catalog() -> CatalogResponse:
     return chat_service.get_catalog()
@@ -214,6 +238,16 @@ def update_feishu_settings(request: UpdateFeishuSettingsRequest) -> FeishuSettin
     return feishu_service.update_feishu_settings(request)
 
 
+@app.get("/api/settings/gitlab-import", response_model=GitLabImportSettings)
+def get_gitlab_import_settings() -> GitLabImportSettings:
+    return gitlab_settings_service.get_public_settings()
+
+
+@app.patch("/api/settings/gitlab-import", response_model=GitLabImportSettings)
+def update_gitlab_import_settings(request: UpdateGitLabImportSettingsRequest) -> GitLabImportSettings:
+    return gitlab_settings_service.update_settings(request)
+
+
 @app.get("/api/knowledge/tree", response_model=KnowledgeTreeResponse)
 def get_knowledge_tree() -> KnowledgeTreeResponse:
     return chat_service.get_knowledge_tree()
@@ -227,6 +261,11 @@ def create_knowledge_node(request: KnowledgeNodeCreateRequest) -> KnowledgeTreeN
 @app.post("/api/knowledge/tree/upload-directory", response_model=list[KnowledgeDocument])
 def upload_directory(request: DirectoryUploadRequest) -> list[KnowledgeDocument]:
     return chat_service.upload_directory(request)
+
+
+@app.post("/api/knowledge/tree/import-gitlab", response_model=GitLabTreeImportResponse)
+def import_gitlab_tree(request: GitLabTreeImportRequest) -> GitLabTreeImportResponse:
+    return chat_service.import_gitlab_tree(request)
 
 
 @app.post("/api/knowledge/tree/{node_id}/documents", response_model=KnowledgeDocument)
@@ -285,6 +324,9 @@ def retrieval_query(request: RetrievalQueryRequest) -> RetrievalResult:
     return chat_service.query_retrieval(request)
 
 
+# -----------------------------
+# 配置型 Agent 接口
+# -----------------------------
 @app.get("/api/agents", response_model=list[AgentConfig])
 def list_agents() -> list[AgentConfig]:
     return chat_service.list_agents()
@@ -310,6 +352,9 @@ def run_agent(agent_id: str, request: RunAgentRequest) -> AgentRunResponse:
     return chat_service.run_agent(agent_id, request)
 
 
+# -----------------------------
+# 巡检 Agent 接口
+# -----------------------------
 @app.get("/api/watchers", response_model=list[WatcherAgentConfig])
 def list_watchers() -> list[WatcherAgentConfig]:
     return watcher_service.list_watchers()
@@ -350,6 +395,9 @@ def list_watcher_runs(watcher_id: str) -> list[WatcherRun]:
     return watcher_service.list_runs(watcher_id)
 
 
+# -----------------------------
+# 支持问题 Agent 接口
+# -----------------------------
 @app.get("/api/support-agents", response_model=list[SupportIssueAgentConfig])
 def list_support_agents() -> list[SupportIssueAgentConfig]:
     return support_issue_service.list_agents()

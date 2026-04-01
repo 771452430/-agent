@@ -105,6 +105,12 @@ agentDemo/
 │  ├─ components/
 │  ├─ lib/
 │  └─ package.json
+├─ skills/
+│  └─ yonyou-work-notify/
+│     ├─ SKILL.md
+│     ├─ agents/openai.yaml
+│     ├─ references/api.md
+│     └─ scripts/
 ├─ docs/
 │  ├─ architecture.md
 │  ├─ langchain-learning-map.md
@@ -164,6 +170,16 @@ export WATCHER_SCHEDULER_INTERVAL_SECONDS="15"
 - `设置 -> 邮箱设置`
 
 只有在你**还没保存全局邮箱配置**时，系统才会继续 fallback 到上面的 `WATCHER_SMTP_*`。
+
+如果你要在 Chat / Agent 里直接调用“用友工作通知” skill，还可以额外配置：
+
+```bash
+export YONYOU_APP_KEY="your-app-key"
+export YONYOU_APP_SECRET="your-app-secret"
+export YONYOU_AUTH_BASE_URL="https://c2.yonyoucloud.com"
+```
+
+对应的原始 Codex skill 资产已放在仓库根目录：`skills/yonyou-work-notify/`。
 
 如果不配置这些变量，也不在工作台里保存邮箱配置：
 
@@ -678,6 +694,7 @@ export LANGSMITH_PROJECT=langchain-learning-demo
 - `检索模式`
   - 支持知识树
   - 支持目录上传保留相对路径
+  - 支持导入 GitLab `/-/tree/<ref>/<path>` 文档树
   - 支持手动建节点后继续上传文件
   - 支持 `global` / `tree_recursive` 两种检索范围
   - 返回 `citations + retrieval_context + summary`
@@ -690,6 +707,7 @@ export LANGSMITH_PROJECT=langchain-learning-demo
 - `GET /api/knowledge/tree`
 - `POST /api/knowledge/tree/nodes`
 - `POST /api/knowledge/tree/upload-directory`
+- `POST /api/knowledge/tree/import-gitlab`
 - `POST /api/knowledge/tree/{node_id}/documents`
 - `GET /api/knowledge/tree/{node_id}`
 - `POST /api/retrieval/query`

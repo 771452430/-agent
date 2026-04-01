@@ -1,3 +1,9 @@
+/**
+ * 前端 API 封装层。
+ *
+ * 页面和组件尽量不要直接手写 `fetch` 细节，而是统一通过这里调用后端。
+ * 这样 URL、请求方法、上传序列化、SSE 解析、错误处理都能集中维护。
+ */
 import type {
   AgentConfig,
   AgentRunResponse,
@@ -8,6 +14,8 @@ import type {
   FeishuBitableValidationResponse,
   FeishuBitableWriteValidationResponse,
   FeishuSettings,
+  GitLabImportSettings,
+  GitLabTreeImportResponse,
   KnowledgeDeleteResponse,
   KnowledgeDocument,
   KnowledgeTreeNode,
@@ -41,6 +49,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 const SSE_SEPARATOR = String.fromCharCode(10, 10);
 const SSE_LINE_BREAK = String.fromCharCode(10);
 
+/** 统一解析 JSON 响应，并把 HTTP 错误转换成前端可见异常。 */
 async function parseJson<T>(response: Response): Promise<T> {
   if (response.ok === false) {
     throw new Error(await response.text());
@@ -48,6 +57,7 @@ async function parseJson<T>(response: Response): Promise<T> {
   return (await response.json()) as T;
 }
 
+/** 把浏览器里的文件对象转成 Base64，便于通过 JSON 上传。 */
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -60,6 +70,9 @@ function fileToBase64(file: File): Promise<string> {
   });
 }
 
+// -----------------------------
+// Catalog / Provider / 全局设置
+// -----------------------------
 export async function getCatalog(): Promise<Catalog> {
   const response = await fetch(API_BASE + "/api/catalog", { cache: "no-store" });
   return parseJson<Catalog>(response);
@@ -131,6 +144,24 @@ export async function updateFeishuSettings(input: {
     body: JSON.stringify(input)
   });
   return parseJson<FeishuSettings>(response);
+}
+
+export async function getGitLabImportSettings(): Promise<GitLabImportSettings> {
+  const response = await fetch(API_BASE + "/api/settings/gitlab-import", { cache: "no-store" });
+  return parseJson<GitLabImportSettings>(response);
+}
+
+export async function updateGitLabImportSettings(input: {
+  token?: string;
+  clear_token?: boolean;
+  allowed_hosts?: string[];
+}): Promise<GitLabImportSettings> {
+  const response = await fetch(API_BASE + "/api/settings/gitlab-import", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<GitLabImportSettings>(response);
 }
 
 export async function validateSupportAgentBitable(input: {
@@ -268,6 +299,9 @@ function parseSseEvent(raw: string): SseEvent | null {
   };
 }
 
+// -----------------------------
+// 知识库与检索模式
+// -----------------------------
 export async function listDocuments(): Promise<KnowledgeDocument[]> {
   const response = await fetch(API_BASE + "/api/knowledge/documents", { cache: "no-store" });
   return parseJson<KnowledgeDocument[]>(response);
@@ -319,6 +353,18 @@ export async function uploadDirectory(files: File[], parentNodeId?: string | nul
     body: JSON.stringify({ parent_node_id: parentNodeId ?? null, files: encodedFiles })
   });
   return parseJson<KnowledgeDocument[]>(response);
+}
+
+export async function importGitLabTree(input: {
+  tree_url: string;
+  parent_node_id?: string | null;
+}): Promise<GitLabTreeImportResponse> {
+  const response = await fetch(API_BASE + "/api/knowledge/tree/import-gitlab", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<GitLabTreeImportResponse>(response);
 }
 
 export async function uploadDocumentToNode(nodeId: string, file: File): Promise<KnowledgeDocument> {
@@ -376,6 +422,9 @@ export async function queryRetrieval(input: {
   return parseJson<RetrievalResult>(response);
 }
 
+// -----------------------------
+// 配置型 Agent
+// -----------------------------
 export async function listAgents(): Promise<AgentConfig[]> {
   const response = await fetch(API_BASE + "/api/agents", { cache: "no-store" });
   return parseJson<AgentConfig[]>(response);
@@ -432,6 +481,9 @@ export async function runAgent(agentId: string, content: string): Promise<AgentR
   return parseJson<AgentRunResponse>(response);
 }
 
+// -----------------------------
+// 巡检 Agent
+// -----------------------------
 export async function listWatchers(): Promise<WatcherAgentConfig[]> {
   const response = await fetch(API_BASE + "/api/watchers", { cache: "no-store" });
   return parseJson<WatcherAgentConfig[]>(response);
@@ -534,6 +586,9 @@ export async function listWatcherRuns(watcherId: string): Promise<WatcherRun[]> 
   return parseJson<WatcherRun[]>(response);
 }
 
+// -----------------------------
+// 支持问题 Agent
+// -----------------------------
 export async function listSupportAgents(): Promise<SupportIssueAgentConfig[]> {
   const response = await fetch(API_BASE + "/api/support-agents", { cache: "no-store" });
   return parseJson<SupportIssueAgentConfig[]>(response);

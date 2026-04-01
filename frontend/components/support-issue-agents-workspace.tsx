@@ -1,5 +1,11 @@
 "use client";
 
+/**
+ * 支持问题 Agent 工作区。
+ *
+ * 这里汇总了飞书表格接入、字段映射、RAG 生成、运行记录、统计洞察和案例沉淀等能力，
+ * 是前端里最复杂的业务页面之一。阅读时建议按“配置 -> 验证 -> 运行 -> 查看结果”顺序理解。
+ */
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
@@ -43,6 +49,7 @@ import type {
 import { ModelSelector } from "./model-selector";
 import { useModelSettings } from "./model-settings-provider";
 
+/** 支持问题 Agent 默认采用学习模式模型。 */
 const DEFAULT_MODEL: ModelConfig = {
   mode: "learning",
   provider: "mock",
@@ -105,16 +112,19 @@ type PendingAnalysisState = {
   result: FeishuBitablePendingAnalysisResponse;
 };
 
+/** 把时间戳格式化成适合界面展示的中文时间。 */
 function formatDate(value?: string | null) {
   if (value == null || value === "") return "-";
   return new Date(value).toLocaleString("zh-CN");
 }
 
+/** 把知识树拍平成线性选项，便于表单选择知识范围。 */
 function flattenTree(node: KnowledgeTreeNode): Array<{ id: string; label: string }> {
   const current = [{ id: node.id, label: node.path + " · " + node.name }];
   return current.concat(node.children.flatMap(flattenTree));
 }
 
+/** 构造新建支持问题 Agent 时的默认表单值。 */
 function buildEmptyForm(): SupportIssueAgentFormState {
   return {
     name: "新的支持问题 Agent",
@@ -145,10 +155,12 @@ function buildEmptyForm(): SupportIssueAgentFormState {
   };
 }
 
+/** 把小数比率转换成百分比文本。 */
 function formatPercent(value: number) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+/** 把逗号/换行分隔文本解析成邮箱或字段列表，并自动去重。 */
 function parseCommaList(value: string) {
   return value
     .split(/[,，\n]/)
@@ -156,6 +168,7 @@ function parseCommaList(value: string) {
     .filter((item, index, list) => item !== "" && list.indexOf(item) === index);
 }
 
+/** 构造统一的校验失败对象，方便前端复用同一套展示逻辑。 */
 function buildValidationFailure(message: string): FeishuBitableValidationResponse {
   return {
     ok: false,
@@ -167,6 +180,7 @@ function buildValidationFailure(message: string): FeishuBitableValidationRespons
   };
 }
 
+/** 把不同飞书校验接口的返回结果收敛成统一的基础展示结构。 */
 function toValidationResult(
   result:
     | FeishuBitableValidationResponse
@@ -210,6 +224,7 @@ export function SupportIssueAgentsWorkspace() {
   const [isFilteringPendingAnalysis, setIsFilteringPendingAnalysis] = useState(false);
   const [isSyncingFeedback, setIsSyncingFeedback] = useState(false);
   const [isDigesting, setIsDigesting] = useState(false);
+  const [isBootstrapping, setIsBootstrapping] = useState(true);
   const modelValidation = validateModelConfig(form.model_config);
 
   const treeOptions = useMemo(() => {
@@ -325,23 +340,31 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function bootstrap() {
-    const [treeData, agentsData] = await Promise.all([getKnowledgeTree(), listSupportAgents()]);
-    setTree(treeData);
-    setAgents(agentsData);
-    if (agentsData.length > 0) {
-      await selectAgent(agentsData[0].id);
-    } else {
-      setForm(buildEmptyForm());
-      setRuns([]);
-      setCaseCandidates([]);
-      setDigestRuns([]);
-      setInsights(null);
-      setFeedbackSyncResult(null);
-      resetDiagnostics();
+    setIsBootstrapping(true);
+    setError("");
+    try {
+      const [treeData, agentsData] = await Promise.all([getKnowledgeTree(), listSupportAgents()]);
+      setTree(treeData);
+      setAgents(agentsData);
+      if (agentsData.length > 0) {
+        await selectAgent(agentsData[0].id);
+      } else {
+        setForm(buildEmptyForm());
+        setRuns([]);
+        setCaseCandidates([]);
+        setDigestRuns([]);
+        setInsights(null);
+        setFeedbackSyncResult(null);
+        resetDiagnostics();
+      }
+    } finally {
+      setIsBootstrapping(false);
     }
   }
 
   async function refreshAgents(selectId?: string, options?: { resetValidation?: boolean }) {
+    // 这个刷新入口负责统一同步：
+    // Agent 列表、当前选中项、运行记录、案例候选、洞察面板。
     const nextOptions = { resetValidation: true, ...options };
     const nextAgents = await listSupportAgents();
     setAgents(nextAgents);
@@ -362,10 +385,12 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   useEffect(() => {
-    bootstrap().catch((cause) => setError(String(cause)));
+    void bootstrap().catch((cause) => setError(String(cause)));
   }, []);
 
   useEffect(() => {
+    // 只要飞书表格 URL 变了，之前基于旧地址拿到的验证/预览/字段结果
+    // 就不再可信，因此这里会统一清空这些诊断信息。
     const validationChanged = validationState != null && validationState.validatedInput !== normalizedBitableUrl;
     const fieldsChanged = fieldsState != null && fieldsState.fieldsInput !== normalizedBitableUrl;
     const previewChanged = previewState != null && previewState.previewInput !== normalizedBitableUrl;
@@ -377,6 +402,8 @@ export function SupportIssueAgentsWorkspace() {
   }, [normalizedBitableUrl, validationState, fieldsState, previewState, writeValidationState, pendingAnalysisState]);
 
   useEffect(() => {
+    // 飞书全局配置变化后，之前缓存的校验结果也可能失效，
+    // 因为新的 App ID / Secret 会对应新的访问权限上下文。
     if (
       validationState != null ||
       fieldsState != null ||
@@ -389,6 +416,8 @@ export function SupportIssueAgentsWorkspace() {
   }, [feishuSettings?.configured, feishuSettings?.app_id, feishuSettings?.app_secret_masked]);
 
   async function handleValidateAddress() {
+    // 第一步先验证“这个飞书地址本身能不能被正确解析”，
+    // 只有地址通过了，后面的预览、字段发现、写回验证才有意义。
     const currentUrl = normalizedBitableUrl;
     if (currentUrl === "") {
       setValidationState({
@@ -425,6 +454,9 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handlePreviewBitable() {
+    // 预览用于回答两个问题：
+    // 1. 当前凭据能否真正读到表；
+    // 2. 表里的原始字段和样例数据长什么样。
     if (previewBlockedReason !== "") {
       setError(previewBlockedReason);
       if (!feishuSettings?.configured) {
@@ -461,6 +493,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleLoadFields() {
+    // 字段发现会尽量走元数据接口；
+    // 如果接口能力受限，再回退到预览数据里猜字段结构。
     if (fieldsBlockedReason !== "") {
       setError(fieldsBlockedReason);
       if (!feishuSettings?.configured) {
@@ -496,6 +530,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleWriteValidation() {
+    // 写回验证是最接近“正式运行”的一次探测：
+    // 它会模拟创建/更新/删除记录，确认当前字段映射和写权限是否可用。
     if (writeValidationBlockedReason !== "") {
       setError(writeValidationBlockedReason);
       if (!feishuSettings?.configured) {
@@ -539,6 +575,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleFilterPendingAnalysis() {
+    // 这个操作帮助你确认：
+    // 配置的“待分析”筛选条件，是否真的能筛出预期的飞书记录。
     if (pendingAnalysisBlockedReason !== "") {
       setError(pendingAnalysisBlockedReason);
       if (!feishuSettings?.configured) {
@@ -586,7 +624,12 @@ export function SupportIssueAgentsWorkspace() {
   }, [fieldsState]);
 
   async function handleSave(): Promise<string | null> {
-    if (form.name.trim() === "") return null;
+    // 保存时会尽量复用最近一次成功验证得到的 normalized_url，
+    // 避免把用户输入里的临时格式差异直接落进数据库。
+    if (form.name.trim() === "") {
+      setError("请输入 Agent 名称。");
+      return null;
+    }
     if (!modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
@@ -639,6 +682,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleRun() {
+    // 正式运行前要通过三道前置条件：
+    // 1. 模型可运行；2. 飞书全局凭据已配置；3. 当前 bitable 地址已验证通过。
     if (!modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
@@ -673,6 +718,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleSyncFeedback() {
+    // 反馈同步会把平台侧的人工处理事实拉回本地，
+    // 供洞察统计、案例候选沉淀和 digest 汇总继续复用。
     if (form.id == null) {
       setError("请先保存当前 Agent，再执行反馈同步。");
       return;
@@ -699,6 +746,7 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   async function handleRunDigest() {
+    // digest 不是逐行处理问题，而是对一段时间内的运行结果做汇总和邮件摘要。
     if (form.id == null) {
       setError("请先保存当前 Agent，再执行立即汇总。");
       return;
@@ -728,8 +776,8 @@ export function SupportIssueAgentsWorkspace() {
   }
 
   return (
-    <div className="grid min-h-screen grid-cols-[280px_minmax(0,1fr)_420px] overflow-hidden">
-      <aside className="min-h-0 overflow-y-auto border-r border-slate-800 bg-slate-900/50 p-5">
+    <div className="grid min-h-full grid-cols-1 xl:h-full xl:min-h-0 xl:overflow-hidden xl:grid-cols-[280px_minmax(0,1fr)_420px]">
+      <aside className="border-b border-slate-800 bg-slate-900/50 p-5 xl:min-h-0 xl:overflow-y-auto xl:border-b-0 xl:border-r">
         <div className="flex items-center justify-between gap-4">
           <div>
             <div className="text-xs uppercase tracking-[0.35em] text-amber-300">支持问题 Agent</div>
@@ -740,8 +788,12 @@ export function SupportIssueAgentsWorkspace() {
             onClick={() => {
               setForm(buildEmptyForm());
               setRuns([]);
+              setCaseCandidates([]);
+              setDigestRuns([]);
               setInsights(null);
+              setFeedbackSyncResult(null);
               resetDiagnostics();
+              setError("");
             }}
           >
             新建
@@ -749,6 +801,11 @@ export function SupportIssueAgentsWorkspace() {
         </div>
 
         <div className="mt-5 space-y-3">
+          {isBootstrapping && (
+            <div className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm text-slate-400">
+              正在加载支持问题 Agent...
+            </div>
+          )}
           {agents.map((agent) => (
             <button
               key={agent.id}
@@ -759,7 +816,7 @@ export function SupportIssueAgentsWorkspace() {
                   : "border-slate-800 bg-slate-900 hover:border-slate-700")
               }
               onClick={() => {
-                void selectAgent(agent.id);
+                void selectAgent(agent.id).catch((cause) => setError(String(cause)));
               }}
             >
               <div className="flex items-center justify-between gap-3">
@@ -776,10 +833,21 @@ export function SupportIssueAgentsWorkspace() {
             </button>
           ))}
           {agents.length === 0 && <div className="text-sm text-slate-500">还没有支持问题 Agent，可以先创建一个。</div>}
+          {error !== "" && !isBootstrapping && (
+            <button
+              className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-500"
+              onClick={() => {
+                void bootstrap().catch((cause) => setError(String(cause)));
+              }}
+              type="button"
+            >
+              重新加载
+            </button>
+          )}
         </div>
       </aside>
 
-      <main className="min-h-0 overflow-y-auto border-r border-slate-800 px-6 py-6">
+      <main className="border-b border-slate-800 px-6 py-6 xl:min-h-0 xl:overflow-y-auto xl:border-b-0 xl:border-r">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -792,7 +860,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleLoadFields();
                 }}
-                disabled={isActionBusy || fieldsBlockedReason !== ""}
+                disabled={isBootstrapping || isActionBusy || fieldsBlockedReason !== ""}
               >
                 {isLoadingFields ? "读取中..." : "读取字段"}
               </button>
@@ -801,7 +869,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handlePreviewBitable();
                 }}
-                disabled={isActionBusy || previewBlockedReason !== ""}
+                disabled={isBootstrapping || isActionBusy || previewBlockedReason !== ""}
               >
                 {isPreviewing ? "拉取中..." : "拉取表格"}
               </button>
@@ -810,7 +878,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleFilterPendingAnalysis();
                 }}
-                disabled={isActionBusy || pendingAnalysisBlockedReason !== ""}
+                disabled={isBootstrapping || isActionBusy || pendingAnalysisBlockedReason !== ""}
               >
                 {isFilteringPendingAnalysis ? "筛选中..." : "筛选待分析"}
               </button>
@@ -819,7 +887,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleWriteValidation();
                 }}
-                disabled={isActionBusy || writeValidationBlockedReason !== ""}
+                disabled={isBootstrapping || isActionBusy || writeValidationBlockedReason !== ""}
               >
                 {isWriteValidating ? "验证中..." : "编辑验证"}
               </button>
@@ -828,7 +896,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleSave();
                 }}
-                disabled={isSaving}
+                disabled={isBootstrapping || isSaving}
               >
                 {isSaving ? "保存中..." : "保存配置"}
               </button>
@@ -1333,7 +1401,7 @@ export function SupportIssueAgentsWorkspace() {
               ))}
             </datalist>
             <div className="mt-4 text-xs leading-6 text-slate-500">
-              固定补充列按字段名读取：`补充1`、`补充2`、`补充3`、`补充4`、`补充5`。轮巡只处理 `回复进度列` 为 `待分析` 或 `失败待重试` 的行；低置信度结果会写入草稿并转成 `待人工确认`。
+              固定补充列按字段名读取：`补充1`、`补充2`、`补充3`、`补充4`、`补充5`。轮巡只处理 `回复进度列` 为 `待分析` 或 `失败待重试` 的行；低置信度或无命中结果都会写入草稿并转成 `待人工确认`。
             </div>
           </div>
 
@@ -1352,7 +1420,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleSyncFeedback();
                 }}
-                disabled={form.id == null || isActionBusy}
+                disabled={isBootstrapping || form.id == null || isActionBusy}
               >
                 {isSyncingFeedback ? "同步中..." : "同步反馈"}
               </button>
@@ -1402,7 +1470,7 @@ export function SupportIssueAgentsWorkspace() {
         </div>
       </main>
 
-      <section className="min-h-0 overflow-y-auto px-5 py-6">
+      <section className="px-5 py-6 xl:min-h-0 xl:overflow-y-auto">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -1415,7 +1483,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleRunDigest();
                 }}
-                disabled={form.id == null || isActionBusy}
+                disabled={isBootstrapping || form.id == null || isActionBusy}
               >
                 {isDigesting ? "汇总中..." : "立即汇总"}
               </button>
@@ -1424,7 +1492,7 @@ export function SupportIssueAgentsWorkspace() {
                 onClick={() => {
                   void handleRun();
                 }}
-                disabled={isRunning || runBlockedReason !== ""}
+                disabled={isBootstrapping || isRunning || runBlockedReason !== ""}
               >
                 {isRunning ? "运行中..." : "立即运行"}
               </button>

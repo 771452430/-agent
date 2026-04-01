@@ -29,6 +29,8 @@ from ..schemas import (
     CreateThreadResponse,
     DirectoryUploadRequest,
     FinalResponse,
+    GitLabTreeImportRequest,
+    GitLabTreeImportResponse,
     KnowledgeDocument,
     KnowledgeDeleteResponse,
     KnowledgeNodeCreateRequest,
@@ -50,6 +52,7 @@ from ..schemas import (
     UpdateAgentRequest,
 )
 from ..services.agent_store import AgentStore
+from ..services.gitlab_import_service import GitLabImportError, GitLabImportService
 from ..services.knowledge_store import KnowledgeStore, ROOT_NODE_ID
 from ..services.llm_service import LLMService
 from ..services.provider_store import ProviderStore
@@ -72,6 +75,7 @@ class ChatService:
         llm_service: LLMService,
         agent_store: AgentStore,
         provider_store: ProviderStore,
+        gitlab_import_service: GitLabImportService,
     ) -> None:
         self.thread_store = thread_store
         self.knowledge_store = knowledge_store
@@ -79,6 +83,7 @@ class ChatService:
         self.llm_service = llm_service
         self.agent_store = agent_store
         self.provider_store = provider_store
+        self.gitlab_import_service = gitlab_import_service
         self.rag_pipeline = RAGPipeline(knowledge_store)
         self.retrieval_service = RetrievalService(knowledge_store, llm_service)
         self.chat_graph = LearningChatGraph(skill_registry, self.rag_pipeline, llm_service)
@@ -201,6 +206,15 @@ class ChatService:
             return self.knowledge_store.ingest_directory(request.parent_node_id, request.files)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def import_gitlab_tree(self, request: GitLabTreeImportRequest) -> GitLabTreeImportResponse:
+        try:
+            return self.gitlab_import_service.import_tree(
+                tree_url=request.tree_url,
+                parent_node_id=request.parent_node_id,
+            )
+        except GitLabImportError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     def get_knowledge_node_detail(self, node_id: str) -> KnowledgeTreeNodeDetail:
         try:

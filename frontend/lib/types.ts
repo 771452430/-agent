@@ -1,3 +1,16 @@
+/**
+ * 前端共享类型定义。
+ *
+ * 这些类型尽量与后端 `backend/app/schemas.py` 保持同构，
+ * 这样页面组件在读写接口数据时就能直接复用稳定的字段语义。
+ */
+
+/**
+ * 模型与 Provider 相关类型。
+ *
+ * 这一组类型描述“系统可以连哪些模型厂商、当前运行想选哪个模型”，
+ * 会被 Chat、检索模式、巡检 Agent、支持问题 Agent 共用。
+ */
 export type ScopeType = "none" | "global" | "tree_recursive";
 export type ModelMode = "learning" | "provider";
 export type ProviderProtocol = "openai_compatible" | "anthropic_compatible" | "ollama_native" | "mock_local";
@@ -46,6 +59,7 @@ export type ProviderTestResponse = {
   available_models: ProviderModel[];
 };
 
+/** 邮箱设置类型：供全局 SMTP 面板和通知能力复用。 */
 export type MailSettings = {
   enabled: boolean;
   smtp_host: string;
@@ -81,12 +95,21 @@ export type MailTestResponse = {
   recipient_email: string;
 };
 
+/** 飞书设置类型：主要服务于支持问题 Agent 的表格读取与回写。 */
 export type FeishuSettings = {
   configured: boolean;
   app_id: string;
   has_app_secret: boolean;
   app_secret_masked?: string | null;
   auth_mode: "tenant_access_token_internal";
+};
+
+export type GitLabImportSettings = {
+  configured: boolean;
+  has_token: boolean;
+  token_masked?: string | null;
+  token_source: "database" | "environment" | "none";
+  allowed_hosts: string[];
 };
 
 export type FeishuBitableValidationResponse = {
@@ -172,6 +195,11 @@ export type FeishuBitableWriteValidationResponse = {
   updated_fields_preview: Record<string, unknown>;
 };
 
+/**
+ * Chat / 检索 / Skill 相关类型。
+ *
+ * 这一组类型决定了前端如何展示消息、工具轨迹、引用片段和最终答案。
+ */
 export type Citation = {
   document_id: string;
   document_name: string;
@@ -212,7 +240,7 @@ export type SkillDescriptor = {
   id: string;
   name: string;
   description: string;
-  category: "core" | "tool" | "knowledge";
+  category: "core" | "tool" | "knowledge" | "integration";
   tools: string[];
   enabled_by_default: boolean;
   requires_rag: boolean;
@@ -252,6 +280,7 @@ export type Catalog = {
   learning_focus: { name: string; description: string }[];
 };
 
+/** 知识库与知识树相关类型。 */
 export type KnowledgeDocument = {
   id: string;
   node_id: string;
@@ -295,6 +324,22 @@ export type KnowledgeDeleteResponse = {
   deleted_chunk_count: number;
 };
 
+export type KnowledgeImportIssue = {
+  path: string;
+  reason: string;
+};
+
+export type GitLabTreeImportResponse = {
+  source_url: string;
+  created_count: number;
+  updated_count: number;
+  skipped_count: number;
+  failed_count: number;
+  skipped_paths: string[];
+  failed_items: KnowledgeImportIssue[];
+  documents: KnowledgeDocument[];
+};
+
 export type RetrievalResult = {
   query: string;
   scope_type: ScopeType;
@@ -329,6 +374,11 @@ export type AgentRunResponse = {
   retrieval_context: string;
 };
 
+/**
+ * 巡检 Agent 类型。
+ *
+ * 这些类型会同时出现在配置页面、抓取测试、责任人匹配和运行记录中。
+ */
 export type WatcherRunStatus = "success" | "no_change" | "baseline_seeded" | "partial_success" | "failed";
 export type WatcherMatchSource = "rule" | "llm" | "unmatched";
 export type WatcherAssignmentStatus = "pending" | "success" | "failed" | "skipped" | "unmatched";
@@ -433,6 +483,12 @@ export type WatcherFetchTestResponse = {
   parsed_bug_preview: ParsedBug[];
 };
 
+/**
+ * 支持问题 Agent 类型。
+ *
+ * 它们描述飞书问题行、运行结果、反馈事实、案例候选与 digest 汇总，
+ * 是整个支持问题工作区的数据基础。
+ */
 export type SupportIssueRunStatus = "success" | "no_change" | "partial_success" | "failed";
 export type SupportIssueRowResultStatus = "generated" | "manual_review" | "no_hit" | "failed";
 export type SupportIssueCaseCandidateStatus = "pending_review" | "approved";
@@ -626,6 +682,7 @@ export type SupportIssueDigestRun = {
 };
 
 
+/** SSE 事件：前端用它接住后端流式返回的每个阶段更新。 */
 export type SseEvent = {
   event: string;
   data: Record<string, unknown>;

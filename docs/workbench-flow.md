@@ -24,19 +24,23 @@
 
 1. 左侧知识树来自 `GET /api/knowledge/tree`。
 2. 目录上传时，前端会把每个文件的 `relative_path` 一起发给后端。
-3. `KnowledgeStore.ingest_directory()` 按相对路径逐级建树。
-4. 文档进入 `KnowledgeStore.ingest_document()`：
+3. 如果粘贴 GitLab `/-/tree/<ref>/<path>` 地址，前端会调用 `POST /api/knowledge/tree/import-gitlab`。
+4. `GitLabImportService` 会校验 URL、使用 `PRIVATE-TOKEN` 调 GitLab API 拉取目录树和 raw 文件。
+5. 无论来自本地目录还是 GitLab，后端最终都会进入 `KnowledgeStore`：
+   - 本地目录走 `KnowledgeStore.ingest_directory()`
+   - GitLab 文档树走 `KnowledgeStore.upsert_document()`
+6. 文档进入 `KnowledgeStore.ingest_document()`：
    - 解析文本
    - 切分 chunk
    - 写入 SQLite
    - 记录 tree metadata
-5. 检索时前端调用 `POST /api/retrieval/query`。
-6. `ChatService.query_retrieval()` 调用 `RAGPipeline.run()`。
-7. `RAGPipeline` 依次完成：
+7. 检索时前端调用 `POST /api/retrieval/query`。
+8. `ChatService.query_retrieval()` 调用 `RAGPipeline.run()`。
+9. `RAGPipeline` 依次完成：
    - query rewrite
    - scoped retrieve
    - context format
-8. `LLMService.summarize_retrieval()` 再把命中片段总结成 summary。
+10. `LLMService.summarize_retrieval()` 再把命中片段总结成 summary。
 
 ## 3. 我的 Agent 链路
 

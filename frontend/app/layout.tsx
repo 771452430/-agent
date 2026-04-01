@@ -1,3 +1,8 @@
+/**
+ * Next.js 根布局。
+ *
+ * 这里决定整个前端应用最外层的 HTML 结构，以及全局 Provider 的挂载位置。
+ */
 import "./globals.css";
 
 import type { Metadata } from "next";

@@ -1,5 +1,10 @@
 "use client";
 
+/**
+ * 邮箱全局设置面板。
+ *
+ * 巡检 Agent 和支持问题 Agent 都会复用这份 SMTP 配置，因此这里集中管理表单和测试发信。
+ */
 import { useEffect, useMemo, useState } from "react";
 
 import { useModelSettings } from "./model-settings-provider";

@@ -17,6 +17,7 @@ import html
 import importlib
 import json
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib import error as urlerror
@@ -58,6 +59,27 @@ DEFAULT_SYSTEM_PROMPT = (
     "如果当前处于本地学习模式，也要清楚说明答案依据来自哪一部分。"
 )
 
+# 一些第三方 OpenAI-compatible 网关并不是“稳定地返回同一种错误”，
+# 而是会出现：
+# - 某次请求打到异常节点，直接回空串 / HTML / 502；
+# - 下一次同样的请求又恢复正常。
+# 因此这里维护一组“值得自动重试”的特征，尽量把这种偶发抖动挡在后端内部。
+RETRYABLE_PROVIDER_ERROR_PATTERNS = (
+    "unsupported content type",
+    "expecting value: line 1 column 1",
+    "bad gateway",
+    "502",
+    "503",
+    "504",
+    "<!doctype html",
+    "<html",
+    "temporarily unavailable",
+    "connection reset",
+    "connection aborted",
+    "timed out",
+    "timeout",
+)
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -81,6 +103,8 @@ class LLMService:
     }
 
     def __init__(self, provider_store: ProviderStore, allow_mock_model: bool = True) -> None:
+        # `provider_store` 负责读取“真实连接配置”，
+        # 而 LLMService 负责把这些配置变成真正可调用的模型实例或 HTTP 请求。
         self.provider_store = provider_store
         self.allow_mock_model = allow_mock_model
 
@@ -194,6 +218,9 @@ class LLMService:
             return False
 
     def _build_prompt(self, system_prompt: str | None = None) -> ChatPromptTemplate:
+        # 这里把最终要喂给模型的信息拆成 4 块：
+        # system prompt、历史消息、最新问题、工具/检索结果。
+        # 这样你能清楚看到一个回答到底依赖了哪些上下文来源。
         return ChatPromptTemplate.from_messages(
             [
                 ("system", system_prompt or DEFAULT_SYSTEM_PROMPT),
@@ -208,7 +235,24 @@ class LLMService:
             ]
         )
 
+    def _is_retryable_provider_error(self, message: str) -> bool:
+        """判断错误是否像“第三方网关抖动”而不是明确的业务配置错误。
+
+        这里不会把所有失败都重试，例如：
+        - API Key 无效
+        - provider 被禁用
+        - 模型名不存在
+        这些属于确定性错误，重试没有意义。
+        """
+
+        normalized = re.sub(r"\s+", " ", message).strip().lower()
+        if normalized == "":
+            return False
+        return any(pattern in normalized for pattern in RETRYABLE_PROVIDER_ERROR_PATTERNS)
+
     def _build_history(self, messages: list[ChatMessage]) -> list[BaseMessage]:
+        # 这里只保留最近几轮历史，是一个有意的教学取舍：
+        # 既能体现多轮上下文，又不会让 prompt 膨胀得太难读。
         history: list[BaseMessage] = []
         for message in messages[-6:]:
             if message.role == "assistant":
@@ -231,6 +275,8 @@ class LLMService:
         retrieval_context: str,
         system_prompt: str | None = None,
     ) -> FinalResponse:
+        # Learning mode 不调用真实模型，而是把已有中间产物重新组织成一个“可解释答案”。
+        # 这样即使没有 API Key，学习者也能走通整条链路。
         answer_parts = [
             "当前处于本地学习模式，以下答案由 LangGraph 节点、工具结果和检索上下文拼装生成。",
         ]
@@ -323,6 +369,8 @@ class LLMService:
         - 但 structured output / tool calling 的协议细节可能各家不同。
         """
 
+        # 真实厂商的“结构化输出”支持度并不完全一致，
+        # 因此这里准备了一个更保守但更兼容的纯文本兜底路径。
         raw_result = model.invoke(prompt_messages)
         answer = self._stringify_model_content(getattr(raw_result, "content", raw_result)).strip()
         if answer == "":
@@ -372,7 +420,19 @@ class LLMService:
         req = request.Request(url, data=data, headers=headers, method="POST")
         with request.urlopen(req, timeout=45) as response:
             raw = response.read().decode("utf-8")
-        parsed = json.loads(raw or "{}")
+        try:
+            parsed = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            normalized = raw.lstrip().lower()
+            # 有些兼容网关在异常时直接回整页 HTML；
+            # 这里保留一个更可读的错误，避免最终只看到“第 1 列无法解析 JSON”。
+            if normalized.startswith("<!doctype html") or normalized.startswith("<html"):
+                raise ValueError(f"上游返回了 HTML，而不是 JSON：{raw[:240]}")
+            # 少数兼容层会直接回纯文本。
+            # 这种场景虽然不标准，但先保留下来，让后面的文本提取逻辑还有机会兜底。
+            if raw.strip() != "":
+                return {"raw": raw}
+            raise
         if isinstance(parsed, dict):
             return parsed
         return {"raw": parsed}
@@ -530,32 +590,113 @@ class LLMService:
             model_config=model_config,
             prompt_messages=prompt_messages,
         ):
-            try:
-                response_payload = self._request_json_post(url, headers=headers, payload=payload)
-                answer = self._extract_completion_text(provider, response_payload).strip()
-                if answer == "":
-                    answer = "模型已返回响应，但当前未能解析出文本内容。"
-                return FinalResponse(
-                    answer=answer,
-                    citations=citations,
-                    used_tools=list(tool_outputs.keys()),
-                    next_actions=[],
-                )
-            except urlerror.HTTPError as exc:
+            for retry_index in range(3):
                 try:
-                    detail = exc.read().decode("utf-8")
-                except Exception:
-                    detail = str(exc)
-                summary = re.sub(r"\s+", " ", detail).strip()
-                if len(summary) > 240:
-                    summary = summary[:237] + "..."
-                attempt_errors.append(f"{attempt_label} {parse.urlparse(url).path}: {exc.code} {summary}".strip())
-            except Exception as exc:
-                summary = re.sub(r"\s+", " ", str(exc)).strip()
-                if len(summary) > 240:
-                    summary = summary[:237] + "..."
-                attempt_errors.append(f"{attempt_label} {parse.urlparse(url).path}: {summary}".strip())
+                    response_payload = self._request_json_post(url, headers=headers, payload=payload)
+                    answer = self._extract_completion_text(provider, response_payload).strip()
+                    if answer == "":
+                        answer = "模型已返回响应，但当前未能解析出文本内容。"
+                    return FinalResponse(
+                        answer=answer,
+                        citations=citations,
+                        used_tools=list(tool_outputs.keys()),
+                        next_actions=[],
+                    )
+                except urlerror.HTTPError as exc:
+                    try:
+                        detail = exc.read().decode("utf-8")
+                    except Exception:
+                        detail = str(exc)
+                    summary = re.sub(r"\s+", " ", detail).strip()
+                    if len(summary) > 240:
+                        summary = summary[:237] + "..."
+                    formatted = f"{attempt_label} {parse.urlparse(url).path}: {exc.code} {summary}".strip()
+                    if retry_index < 2 and self._is_retryable_provider_error(formatted):
+                        time.sleep(0.8 * (retry_index + 1))
+                        continue
+                    attempt_errors.append(formatted)
+                    break
+                except Exception as exc:
+                    summary = re.sub(r"\s+", " ", str(exc)).strip()
+                    if len(summary) > 240:
+                        summary = summary[:237] + "..."
+                    formatted = f"{attempt_label} {parse.urlparse(url).path}: {summary}".strip()
+                    if retry_index < 2 and self._is_retryable_provider_error(formatted):
+                        time.sleep(0.8 * (retry_index + 1))
+                        continue
+                    attempt_errors.append(formatted)
+                    break
         raise RuntimeError("；".join(attempt_errors) or "协议级请求失败")
+
+    def _generate_provider_response_once(
+        self,
+        *,
+        provider: ProviderRuntimeConfig,
+        normalized_config: ModelConfig,
+        prompt_messages: list[BaseMessage],
+        query: str,
+        tool_outputs: dict[str, object],
+        citations: list[Citation],
+        retrieval_context: str,
+        system_prompt: str | None,
+    ) -> FinalResponse:
+        """执行一次真实 provider 调用。
+
+        之所以单独拆出来，是为了让外层可以在“第三方网关疑似抖动”时整轮重试。
+        """
+
+        if not self._provider_available(provider.protocol):
+            return self._provider_error_response(
+                query=query,
+                tool_outputs=tool_outputs,
+                citations=citations,
+                retrieval_context=retrieval_context,
+                provider=provider,
+                model_config=normalized_config,
+                message=f"当前环境缺少 `{self.PROTOCOL_MODULES[provider.protocol]}` 依赖。",
+            )
+
+        try:
+            model = init_chat_model(**self._build_model_kwargs(provider, normalized_config))
+            try:
+                structured_model = model.with_structured_output(FinalResponse)
+                result = structured_model.invoke(prompt_messages)
+                return FinalResponse.model_validate(result)
+            except Exception:
+                try:
+                    return self._plain_text_response(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        citations=citations,
+                        tool_outputs=tool_outputs,
+                    )
+                except Exception:
+                    return self._direct_completion_response(
+                        provider=provider,
+                        model_config=normalized_config,
+                        prompt_messages=prompt_messages,
+                        citations=citations,
+                        tool_outputs=tool_outputs,
+                    )
+        except Exception as exc:
+            try:
+                return self._direct_completion_response(
+                    provider=provider,
+                    model_config=normalized_config,
+                    prompt_messages=prompt_messages,
+                    citations=citations,
+                    tool_outputs=tool_outputs,
+                )
+            except Exception as fallback_exc:
+                return self._provider_error_response(
+                    query=query,
+                    tool_outputs=tool_outputs,
+                    citations=citations,
+                    retrieval_context=retrieval_context,
+                    provider=provider,
+                    model_config=normalized_config,
+                    message=f"{exc}；协议级兜底也失败：{fallback_exc}",
+                )
 
     def _build_model_kwargs(self, provider: ProviderRuntimeConfig, model_config: ModelConfig) -> dict[str, Any]:
         """把全局 provider 配置解析成 LangChain 能理解的连接参数。"""
@@ -609,58 +750,26 @@ class LLMService:
                 system_prompt=system_prompt,
             )
 
-        if not self._provider_available(provider.protocol):
-            return self._provider_error_response(
+        prompt_messages = prompt_value.to_messages()
+        for retry_index in range(3):
+            result = self._generate_provider_response_once(
+                provider=provider,
+                normalized_config=normalized_config,
+                prompt_messages=prompt_messages,
                 query=query,
                 tool_outputs=tool_outputs,
                 citations=citations,
                 retrieval_context=retrieval_context,
-                provider=provider,
-                model_config=normalized_config,
-                message=f"当前环境缺少 `{self.PROTOCOL_MODULES[provider.protocol]}` 依赖。",
+                system_prompt=system_prompt,
             )
-
-        try:
-            model = init_chat_model(**self._build_model_kwargs(provider, normalized_config))
-            try:
-                structured_model = model.with_structured_output(FinalResponse)
-                result = structured_model.invoke(prompt_value.to_messages())
-                return FinalResponse.model_validate(result)
-            except Exception:
-                try:
-                    return self._plain_text_response(
-                        model=model,
-                        prompt_messages=prompt_value.to_messages(),
-                        citations=citations,
-                        tool_outputs=tool_outputs,
-                    )
-                except Exception:
-                    return self._direct_completion_response(
-                        provider=provider,
-                        model_config=normalized_config,
-                        prompt_messages=prompt_value.to_messages(),
-                        citations=citations,
-                        tool_outputs=tool_outputs,
-                    )
-        except Exception as exc:
-            try:
-                return self._direct_completion_response(
-                    provider=provider,
-                    model_config=normalized_config,
-                    prompt_messages=prompt_value.to_messages(),
-                    citations=citations,
-                    tool_outputs=tool_outputs,
-                )
-            except Exception as fallback_exc:
-                return self._provider_error_response(
-                    query=query,
-                    tool_outputs=tool_outputs,
-                    citations=citations,
-                    retrieval_context=retrieval_context,
-                    provider=provider,
-                    model_config=normalized_config,
-                    message=f"{exc}；协议级兜底也失败：{fallback_exc}",
-                )
+            # 对第三方兼容网关的间歇性抖动做整轮重试。
+            # 只有当错误特征像“上游节点异常”时才重试，避免无意义重复调用。
+            if not result.answer.startswith("真实接口模式调用失败。"):
+                return result
+            if retry_index >= 2 or not self._is_retryable_provider_error(result.answer):
+                return result
+            time.sleep(1.0 * (retry_index + 1))
+        return result
 
     def summarize_retrieval(
         self,

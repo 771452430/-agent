@@ -1,3 +1,8 @@
+/**
+ * 支持问题案例候选页面路由。
+ *
+ * 这个入口专门用于查看和审核支持问题 Agent 自动沉淀出的案例候选。
+ */
 import { Suspense } from "react";
 
 import { SupportIssueCaseCandidatesWorkspace } from "../../../components/support-issue-case-candidates-workspace";
