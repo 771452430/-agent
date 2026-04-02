@@ -13,12 +13,14 @@ import {
   getFeishuSettings,
   getGitLabImportSettings,
   getMailSettings,
+  getWorkNotifySettings,
   listProviders,
   testMailSettings,
   testProvider,
   updateFeishuSettings,
   updateGitLabImportSettings,
   updateMailSettings,
+  updateWorkNotifySettings,
   updateProvider
 } from "../lib/api";
 import type {
@@ -32,7 +34,9 @@ import type {
   ProviderModel,
   ProviderTestResponse,
   UpdateMailSettingsRequest,
-  UpdateProviderRequest
+  UpdateProviderRequest,
+  UpdateWorkNotifySettingsRequest,
+  WorkNotifySettings
 } from "../lib/types";
 
 type ModelConfigValidation = {
@@ -52,25 +56,32 @@ type ModelSettingsContextValue = {
   feishuSettings: FeishuSettings | null;
   isFeishuSettingsLoading: boolean;
   feishuError: string;
+  workNotifySettings: WorkNotifySettings | null;
+  isWorkNotifySettingsLoading: boolean;
+  workNotifyError: string;
   gitlabImportSettings: GitLabImportSettings | null;
   isGitLabImportSettingsLoading: boolean;
   gitlabImportError: string;
   isModelSettingsOpen: boolean;
   isMailSettingsOpen: boolean;
   isFeishuSettingsOpen: boolean;
+  isWorkNotifySettingsOpen: boolean;
   isGitLabImportSettingsOpen: boolean;
   selectedProviderId: string;
   refreshProviders: () => Promise<void>;
   refreshMailSettings: () => Promise<void>;
   refreshFeishuSettings: () => Promise<void>;
+  refreshWorkNotifySettings: () => Promise<void>;
   refreshGitLabImportSettings: () => Promise<void>;
   openModelSettings: (providerId?: string) => void;
   openMailSettings: () => void;
   openFeishuSettings: () => void;
+  openWorkNotifySettings: () => void;
   openGitLabImportSettings: () => void;
   closeModelSettings: () => void;
   closeMailSettings: () => void;
   closeFeishuSettings: () => void;
+  closeWorkNotifySettings: () => void;
   closeGitLabImportSettings: () => void;
   setSelectedProviderId: (providerId: string) => void;
   saveProvider: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderConfig>;
@@ -78,6 +89,7 @@ type ModelSettingsContextValue = {
   saveMailSettings: (input: UpdateMailSettingsRequest) => Promise<MailSettings>;
   runMailTest: (input: MailTestRequest) => Promise<MailTestResponse>;
   saveFeishuSettings: (input: { app_id?: string; app_secret?: string }) => Promise<FeishuSettings>;
+  saveWorkNotifySettings: (input: UpdateWorkNotifySettingsRequest) => Promise<WorkNotifySettings>;
   saveGitLabImportSettings: (input: {
     token?: string;
     clear_token?: boolean;
@@ -108,12 +120,16 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   const [feishuSettings, setFeishuSettings] = useState<FeishuSettings | null>(null);
   const [isFeishuSettingsLoading, setIsFeishuSettingsLoading] = useState(true);
   const [feishuError, setFeishuError] = useState("");
+  const [workNotifySettings, setWorkNotifySettings] = useState<WorkNotifySettings | null>(null);
+  const [isWorkNotifySettingsLoading, setIsWorkNotifySettingsLoading] = useState(true);
+  const [workNotifyError, setWorkNotifyError] = useState("");
   const [gitlabImportSettings, setGitlabImportSettings] = useState<GitLabImportSettings | null>(null);
   const [isGitLabImportSettingsLoading, setIsGitLabImportSettingsLoading] = useState(true);
   const [gitlabImportError, setGitlabImportError] = useState("");
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isMailSettingsOpen, setIsMailSettingsOpen] = useState(false);
   const [isFeishuSettingsOpen, setIsFeishuSettingsOpen] = useState(false);
+  const [isWorkNotifySettingsOpen, setIsWorkNotifySettingsOpen] = useState(false);
   const [isGitLabImportSettingsOpen, setIsGitLabImportSettingsOpen] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState("");
 
@@ -141,6 +157,11 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setFeishuSettings(await getFeishuSettings());
   }
 
+  async function refreshWorkNotifySettings() {
+    setWorkNotifyError("");
+    setWorkNotifySettings(await getWorkNotifySettings());
+  }
+
   async function refreshGitLabImportSettings() {
     setGitlabImportError("");
     setGitlabImportSettings(await getGitLabImportSettings());
@@ -158,6 +179,9 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     refreshFeishuSettings()
       .catch((cause) => setFeishuError(String(cause)))
       .finally(() => setIsFeishuSettingsLoading(false));
+    refreshWorkNotifySettings()
+      .catch((cause) => setWorkNotifyError(String(cause)))
+      .finally(() => setIsWorkNotifySettingsLoading(false));
     refreshGitLabImportSettings()
       .catch((cause) => setGitlabImportError(String(cause)))
       .finally(() => setIsGitLabImportSettingsLoading(false));
@@ -176,6 +200,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   function openModelSettings(providerId?: string) {
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     if (providerId != null && providerId !== "") {
       setSelectedProviderId(providerId);
@@ -188,6 +213,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   function openMailSettings() {
     setIsModelSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     setIsMailSettingsOpen(true);
   }
@@ -195,14 +221,24 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   function openFeishuSettings() {
     setIsModelSettingsOpen(false);
     setIsMailSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     setIsFeishuSettingsOpen(true);
+  }
+
+  function openWorkNotifySettings() {
+    setIsModelSettingsOpen(false);
+    setIsMailSettingsOpen(false);
+    setIsFeishuSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(true);
   }
 
   function openGitLabImportSettings() {
     setIsModelSettingsOpen(false);
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
     setIsGitLabImportSettingsOpen(true);
   }
 
@@ -216,6 +252,10 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
 
   function closeFeishuSettings() {
     setIsFeishuSettingsOpen(false);
+  }
+
+  function closeWorkNotifySettings() {
+    setIsWorkNotifySettingsOpen(false);
   }
 
   function closeGitLabImportSettings() {
@@ -247,6 +287,12 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   async function saveFeishuSettings(input: { app_id?: string; app_secret?: string }) {
     const saved = await updateFeishuSettings(input);
     setFeishuSettings(saved);
+    return saved;
+  }
+
+  async function saveWorkNotifySettings(input: UpdateWorkNotifySettingsRequest) {
+    const saved = await updateWorkNotifySettings(input);
+    setWorkNotifySettings(saved);
     return saved;
   }
 
@@ -323,25 +369,32 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
         feishuSettings,
         isFeishuSettingsLoading,
         feishuError,
+        workNotifySettings,
+        isWorkNotifySettingsLoading,
+        workNotifyError,
         gitlabImportSettings,
         isGitLabImportSettingsLoading,
         gitlabImportError,
         isModelSettingsOpen,
         isMailSettingsOpen,
         isFeishuSettingsOpen,
+        isWorkNotifySettingsOpen,
         isGitLabImportSettingsOpen,
         selectedProviderId,
         refreshProviders,
         refreshMailSettings,
         refreshFeishuSettings,
+        refreshWorkNotifySettings,
         refreshGitLabImportSettings,
         openModelSettings,
         openMailSettings,
         openFeishuSettings,
+        openWorkNotifySettings,
         openGitLabImportSettings,
         closeModelSettings,
         closeMailSettings,
         closeFeishuSettings,
+        closeWorkNotifySettings,
         closeGitLabImportSettings,
         setSelectedProviderId,
         saveProvider,
@@ -349,6 +402,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
         saveMailSettings,
         runMailTest,
         saveFeishuSettings,
+        saveWorkNotifySettings,
         saveGitLabImportSettings,
         validateModelConfig,
         getProvider,

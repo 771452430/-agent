@@ -70,7 +70,7 @@ class SupportIssueScheduler:
 
     async def _run_digest(self, agent_id: str) -> None:
         try:
-            await asyncio.to_thread(self.support_issue_service.run_digest, agent_id)
+            await asyncio.to_thread(self.support_issue_service.run_digest, agent_id, trigger_source="scheduled")
         except Exception as exc:
             logger.exception("support issue agent %s digest failed: %s", agent_id, exc)
         finally:

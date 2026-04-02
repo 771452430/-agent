@@ -63,6 +63,7 @@ from .schemas import (
     UpdateKnowledgeDocumentRequest,
     UpdateMailSettingsRequest,
     UpdateProviderRequest,
+    UpdateWorkNotifySettingsRequest,
     UpdateSupportIssueAgentRequest,
     UpdateAgentRequest,
     UpdateWatcherRequest,
@@ -71,6 +72,7 @@ from .schemas import (
     WatcherFetchTestRequest,
     WatcherFetchTestResponse,
     WatcherRun,
+    WorkNotifySettings,
 )
 from .services.agent_store import AgentStore
 from .services.chat_service import ChatService
@@ -91,6 +93,9 @@ from .services.thread_store import ThreadStore
 from .services.watcher_scheduler import WatcherScheduler
 from .services.watcher_service import WatcherService
 from .services.watcher_store import WatcherStore
+from .services.work_notify_settings_service import WorkNotifySettingsService
+from .services.work_notify_settings_store import WorkNotifySettingsStore
+from .services.yonyou_work_notify_service import YonyouWorkNotifyService
 from .settings import load_settings
 from .skills.learning import build_skill_registry
 
@@ -105,12 +110,15 @@ gitlab_settings_store = GitLabSettingsStore(settings.sqlite_path)
 knowledge_store = KnowledgeStore(settings.sqlite_path, settings.chroma_dir)
 watcher_store = WatcherStore(settings.sqlite_path)
 support_issue_store = SupportIssueStore(settings.sqlite_path)
-skill_registry = build_skill_registry(knowledge_store)
+work_notify_settings_store = WorkNotifySettingsStore(settings.sqlite_path)
 llm_service = LLMService(provider_store=provider_store, allow_mock_model=settings.allow_mock_model)
 gitlab_settings_service = GitLabSettingsService(gitlab_settings_store, settings)
 gitlab_import_service = GitLabImportService(knowledge_store, gitlab_settings_service)
 mail_service = MailService(mail_store=mail_store, app_settings=settings)
 feishu_service = FeishuService(feishu_store=feishu_store)
+yonyou_work_notify_settings_service = WorkNotifySettingsService(work_notify_store=work_notify_settings_store)
+yonyou_work_notify_service = YonyouWorkNotifyService(work_notify_settings_service=yonyou_work_notify_settings_service)
+skill_registry = build_skill_registry(knowledge_store, yonyou_work_notify_service)
 chat_service = ChatService(
     thread_store,
     knowledge_store,
@@ -128,6 +136,7 @@ support_issue_service = SupportIssueService(
     llm_service=llm_service,
     feishu_service=feishu_service,
     mail_service=mail_service,
+    yonyou_work_notify_service=yonyou_work_notify_service,
 )
 support_issue_scheduler = SupportIssueScheduler(
     support_issue_service,
@@ -236,6 +245,16 @@ def get_feishu_settings() -> FeishuSettings:
 @app.patch("/api/settings/feishu", response_model=FeishuSettings)
 def update_feishu_settings(request: UpdateFeishuSettingsRequest) -> FeishuSettings:
     return feishu_service.update_feishu_settings(request)
+
+
+@app.get("/api/settings/work-notify", response_model=WorkNotifySettings)
+def get_work_notify_settings() -> WorkNotifySettings:
+    return yonyou_work_notify_settings_service.get_work_notify_settings()
+
+
+@app.patch("/api/settings/work-notify", response_model=WorkNotifySettings)
+def update_work_notify_settings(request: UpdateWorkNotifySettingsRequest) -> WorkNotifySettings:
+    return yonyou_work_notify_settings_service.update_work_notify_settings(request)
 
 
 @app.get("/api/settings/gitlab-import", response_model=GitLabImportSettings)
@@ -493,7 +512,7 @@ def update_support_case_candidate(
 
 @app.post("/api/support-agents/{agent_id}/digest", response_model=SupportIssueDigestRun)
 def run_support_agent_digest(agent_id: str) -> SupportIssueDigestRun:
-    return support_issue_service.run_digest(agent_id)
+    return support_issue_service.run_digest(agent_id, trigger_source="manual")
 
 
 @app.get("/api/support-agents/{agent_id}/digest-runs", response_model=list[SupportIssueDigestRun])

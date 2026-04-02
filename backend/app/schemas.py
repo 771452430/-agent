@@ -148,6 +148,31 @@ class UpdateMailSettingsRequest(BaseModel):
     use_ssl: bool | None = None
 
 
+class WorkNotifySettings(BaseModel):
+    """返回给前端的工作通知设置。"""
+
+    configured: bool = False
+    app_key: str = ""
+    has_app_secret: bool = False
+    app_secret_masked: str | None = None
+
+
+class WorkNotifyRuntimeSettings(BaseModel):
+    """服务内部使用的真实工作通知配置。"""
+
+    app_key: str | None = None
+    app_secret: str | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateWorkNotifySettingsRequest(BaseModel):
+    """更新工作通知设置。"""
+
+    app_key: str | None = None
+    app_secret: str | None = None
+
+
 class MailTestRequest(BaseModel):
     """测试发信请求。"""
 
@@ -910,6 +935,9 @@ SupportIssueRowResultStatus = Literal["generated", "manual_review", "no_hit", "f
 SupportIssueCaseCandidateStatus = Literal["pending_review", "approved"]
 SupportIssueCaseReviewAction = Literal["save_edit", "approve_and_publish"]
 SupportIssueDigestRunStatus = Literal["success", "failed"]
+SupportIssueDigestTriggerSource = Literal["manual", "scheduled"]
+SupportIssueNotificationEventType = Literal["manual_review_assigned", "registrant_confirmed"]
+SupportIssueNotificationEventStatus = Literal["sent", "skipped", "failed"]
 
 # -----------------------------
 # 支持问题 Agent 相关模型
@@ -921,6 +949,13 @@ class SupportIssueFeedbackSnapshot(BaseModel):
     result: str = ""
     final_solution: str = ""
     comment: str = ""
+
+
+class SupportIssueOwnerRule(BaseModel):
+    """按业务模块匹配人工确认负责人。"""
+
+    module_value: str = ""
+    yht_user_id: str = ""
 
 
 class SupportIssueRowResult(BaseModel):
@@ -962,11 +997,15 @@ class SupportIssueAgentConfig(BaseModel):
     link_field_name: str = "相关文档链接"
     progress_field_name: str = "回复进度"
     status_field_name: str = "处理状态"
+    module_field_name: str = "负责模块"
+    registrant_field_name: str = "登记人"
     feedback_result_field_name: str = "人工处理结果"
     feedback_final_answer_field_name: str = "人工最终方案"
     feedback_comment_field_name: str = "反馈备注"
     confidence_field_name: str = "AI置信度"
     hit_count_field_name: str = "命中知识数"
+    support_owner_rules: list[SupportIssueOwnerRule] = Field(default_factory=list)
+    fallback_support_yht_user_id: str = ""
     digest_enabled: bool = False
     digest_recipient_emails: list[str] = Field(default_factory=list)
     case_review_enabled: bool = True
@@ -998,11 +1037,15 @@ class CreateSupportIssueAgentRequest(BaseModel):
     link_field_name: str = "相关文档链接"
     progress_field_name: str = "回复进度"
     status_field_name: str = "处理状态"
+    module_field_name: str = "负责模块"
+    registrant_field_name: str = "登记人"
     feedback_result_field_name: str = "人工处理结果"
     feedback_final_answer_field_name: str = "人工最终方案"
     feedback_comment_field_name: str = "反馈备注"
     confidence_field_name: str = "AI置信度"
     hit_count_field_name: str = "命中知识数"
+    support_owner_rules: list[SupportIssueOwnerRule] = Field(default_factory=list)
+    fallback_support_yht_user_id: str = ""
     digest_enabled: bool = False
     digest_recipient_emails: list[str] = Field(default_factory=list)
     case_review_enabled: bool = True
@@ -1026,11 +1069,15 @@ class UpdateSupportIssueAgentRequest(BaseModel):
     link_field_name: str | None = None
     progress_field_name: str | None = None
     status_field_name: str | None = None
+    module_field_name: str | None = None
+    registrant_field_name: str | None = None
     feedback_result_field_name: str | None = None
     feedback_final_answer_field_name: str | None = None
     feedback_comment_field_name: str | None = None
     confidence_field_name: str | None = None
     hit_count_field_name: str | None = None
+    support_owner_rules: list[SupportIssueOwnerRule] | None = None
+    fallback_support_yht_user_id: str | None = None
     digest_enabled: bool | None = None
     digest_recipient_emails: list[str] | None = None
     case_review_enabled: bool | None = None
@@ -1186,6 +1233,7 @@ class SupportIssueDigestRun(BaseModel):
     id: str
     agent_id: str
     status: SupportIssueDigestRunStatus
+    trigger_source: SupportIssueDigestTriggerSource = "manual"
     started_at: datetime
     ended_at: datetime | None = None
     period_start: datetime
@@ -1214,6 +1262,19 @@ class SupportIssueDigestRun(BaseModel):
     knowledge_gap_suggestions: list[str] = Field(default_factory=list)
     new_candidate_count: int = 0
     approved_candidate_count: int = 0
+
+
+class SupportIssueNotificationEvent(BaseModel):
+    """支持问题 Agent 的通知日志。"""
+
+    id: str
+    agent_id: str
+    record_id: str
+    event_type: SupportIssueNotificationEventType
+    recipient_user_id: str = ""
+    status: SupportIssueNotificationEventStatus
+    error_message: str | None = None
+    created_at: datetime
 
 
 class CatalogResponse(BaseModel):

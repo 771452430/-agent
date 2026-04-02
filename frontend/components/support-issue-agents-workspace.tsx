@@ -44,6 +44,7 @@ import type {
   SupportIssueDigestRun,
   SupportIssueFeedbackSyncResponse,
   SupportIssueInsights,
+  SupportIssueOwnerRule,
   SupportIssueRun
 } from "../lib/types";
 import { ModelSelector } from "./model-selector";
@@ -73,11 +74,15 @@ type SupportIssueAgentFormState = {
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
+  module_field_name: string;
+  registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
   feedback_comment_field_name: string;
   confidence_field_name: string;
   hit_count_field_name: string;
+  support_owner_rules: SupportIssueOwnerRule[];
+  fallback_support_yht_user_id: string;
   digest_enabled: boolean;
   digest_recipient_emails_text: string;
   case_review_enabled: boolean;
@@ -140,11 +145,15 @@ function buildEmptyForm(): SupportIssueAgentFormState {
     link_field_name: "相关文档链接",
     progress_field_name: "回复进度",
     status_field_name: "处理状态",
+    module_field_name: "负责模块",
+    registrant_field_name: "登记人",
     feedback_result_field_name: "人工处理结果",
     feedback_final_answer_field_name: "人工最终方案",
     feedback_comment_field_name: "反馈备注",
     confidence_field_name: "AI置信度",
     hit_count_field_name: "命中知识数",
+    support_owner_rules: [],
+    fallback_support_yht_user_id: "",
     digest_enabled: false,
     digest_recipient_emails_text: "",
     case_review_enabled: true,
@@ -166,6 +175,13 @@ function parseCommaList(value: string) {
     .split(/[,，\n]/)
     .map((item) => item.trim())
     .filter((item, index, list) => item !== "" && list.indexOf(item) === index);
+}
+
+function buildEmptyOwnerRule(): SupportIssueOwnerRule {
+  return {
+    module_value: "",
+    yht_user_id: ""
+  };
 }
 
 /** 构造统一的校验失败对象，方便前端复用同一套展示逻辑。 */
@@ -316,11 +332,15 @@ export function SupportIssueAgentsWorkspace() {
       link_field_name: detail.link_field_name,
       progress_field_name: detail.progress_field_name,
       status_field_name: detail.status_field_name,
+      module_field_name: detail.module_field_name,
+      registrant_field_name: detail.registrant_field_name,
       feedback_result_field_name: detail.feedback_result_field_name,
       feedback_final_answer_field_name: detail.feedback_final_answer_field_name,
       feedback_comment_field_name: detail.feedback_comment_field_name,
       confidence_field_name: detail.confidence_field_name,
       hit_count_field_name: detail.hit_count_field_name,
+      support_owner_rules: detail.support_owner_rules,
+      fallback_support_yht_user_id: detail.fallback_support_yht_user_id,
       digest_enabled: detail.digest_enabled,
       digest_recipient_emails_text: detail.digest_recipient_emails.join(", "),
       case_review_enabled: detail.case_review_enabled,
@@ -655,11 +675,20 @@ export function SupportIssueAgentsWorkspace() {
         link_field_name: form.link_field_name,
         progress_field_name: form.progress_field_name,
         status_field_name: form.status_field_name,
+        module_field_name: form.module_field_name,
+        registrant_field_name: form.registrant_field_name,
         feedback_result_field_name: form.feedback_result_field_name,
         feedback_final_answer_field_name: form.feedback_final_answer_field_name,
         feedback_comment_field_name: form.feedback_comment_field_name,
         confidence_field_name: form.confidence_field_name,
         hit_count_field_name: form.hit_count_field_name,
+        support_owner_rules: form.support_owner_rules
+          .map((item) => ({
+            module_value: item.module_value.trim(),
+            yht_user_id: item.yht_user_id.trim()
+          }))
+          .filter((item) => item.module_value !== "" && item.yht_user_id !== ""),
+        fallback_support_yht_user_id: form.fallback_support_yht_user_id.trim(),
         digest_enabled: form.digest_enabled,
         digest_recipient_emails: parseCommaList(form.digest_recipient_emails_text),
         case_review_enabled: form.case_review_enabled
@@ -1377,6 +1406,24 @@ export function SupportIssueAgentsWorkspace() {
                 />
               </label>
               <label className="grid gap-1 text-sm">
+                <span className="text-slate-400">模块列</span>
+                <input
+                  list="support-agent-feishu-fields"
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                  value={form.module_field_name}
+                  onChange={(event) => setForm((current) => ({ ...current, module_field_name: event.target.value }))}
+                />
+              </label>
+              <label className="grid gap-1 text-sm">
+                <span className="text-slate-400">登记人列</span>
+                <input
+                  list="support-agent-feishu-fields"
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                  value={form.registrant_field_name}
+                  onChange={(event) => setForm((current) => ({ ...current, registrant_field_name: event.target.value }))}
+                />
+              </label>
+              <label className="grid gap-1 text-sm">
                 <span className="text-slate-400">AI 置信度列</span>
                 <input
                   list="support-agent-feishu-fields"
@@ -1402,6 +1449,101 @@ export function SupportIssueAgentsWorkspace() {
             </datalist>
             <div className="mt-4 text-xs leading-6 text-slate-500">
               固定补充列按字段名读取：`补充1`、`补充2`、`补充3`、`补充4`、`补充5`。轮巡只处理 `回复进度列` 为 `待分析` 或 `失败待重试` 的行；低置信度或无命中结果都会写入草稿并转成 `待人工确认`。
+            </div>
+          </div>
+
+          <div className="mt-6 rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-medium text-slate-100">人工确认通知路由</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  按“模块列”当前值匹配负责人 userId；未命中时走兜底负责人。登记人通知会从“登记人列”中提取 userId。
+                </div>
+              </div>
+              <button
+                className="rounded-xl border border-sky-400/40 px-3 py-2 text-sm text-sky-200 transition hover:bg-sky-400/10"
+                onClick={() =>
+                  setForm((current) => ({
+                    ...current,
+                    support_owner_rules: current.support_owner_rules.concat(buildEmptyOwnerRule())
+                  }))
+                }
+              >
+                新增模块负责人
+              </button>
+            </div>
+
+            <div className="mt-4 grid gap-4 xl:grid-cols-2">
+              <label className="grid gap-1 text-sm">
+                <span className="text-slate-400">兜底负责人 userId</span>
+                <input
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                  value={form.fallback_support_yht_user_id}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, fallback_support_yht_user_id: event.target.value }))
+                  }
+                  placeholder="未命中模块时发送给这个 userId"
+                />
+              </label>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              {form.support_owner_rules.map((rule, index) => (
+                <div key={`owner-rule-${index}`} className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
+                  <div className="grid gap-3 xl:grid-cols-[1fr_1fr_auto]">
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-slate-400">模块值</span>
+                      <input
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                        value={rule.module_value}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            support_owner_rules: current.support_owner_rules.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, module_value: event.target.value } : item
+                            )
+                          }))
+                        }
+                        placeholder="例如：工作台"
+                      />
+                    </label>
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-slate-400">负责人 userId</span>
+                      <input
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                        value={rule.yht_user_id}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            support_owner_rules: current.support_owner_rules.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, yht_user_id: event.target.value } : item
+                            )
+                          }))
+                        }
+                        placeholder="例如：099187e8-348e-46f3-8c53-14357870d4d8"
+                      />
+                    </label>
+                    <div className="flex items-end">
+                      <button
+                        className="rounded-xl border border-rose-400/40 px-3 py-2 text-sm text-rose-200 transition hover:bg-rose-400/10"
+                        onClick={() =>
+                          setForm((current) => ({
+                            ...current,
+                            support_owner_rules: current.support_owner_rules.filter((_, itemIndex) => itemIndex !== index)
+                          }))
+                        }
+                      >
+                        删除
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {form.support_owner_rules.length === 0 && (
+                <div className="rounded-2xl border border-dashed border-slate-700 px-4 py-5 text-sm text-slate-500">
+                  当前还没有模块负责人规则。命中 `待人工确认` 时会优先按模块值匹配负责人，未配置时只会尝试兜底负责人。
+                </div>
+              )}
             </div>
           </div>
 

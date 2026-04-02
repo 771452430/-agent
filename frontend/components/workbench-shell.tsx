@@ -15,6 +15,7 @@ import { GitLabImportSettingsPanel } from "./gitlab-import-settings-panel";
 import { MailSettingsPanel } from "./mail-settings-panel";
 import { ModelSettingsPanel } from "./model-settings-panel";
 import { useModelSettings } from "./model-settings-provider";
+import { WorkNotifySettingsPanel } from "./work-notify-settings-panel";
 
 const NAV_ITEMS = [
   { href: "/", label: "Chat", description: "多轮对话 + Skill" },
@@ -27,7 +28,8 @@ const NAV_ITEMS = [
 export function WorkbenchShell(props: { children: ReactNode }) {
   const pathname = usePathname();
   const [isUtilityMenuOpen, setIsUtilityMenuOpen] = useState(false);
-  const { openFeishuSettings, openGitLabImportSettings, openMailSettings, openModelSettings } = useModelSettings();
+  const { openFeishuSettings, openGitLabImportSettings, openMailSettings, openModelSettings, openWorkNotifySettings } =
+    useModelSettings();
 
   useEffect(() => {
     setIsUtilityMenuOpen(false);
@@ -121,6 +123,16 @@ export function WorkbenchShell(props: { children: ReactNode }) {
               <button
                   className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
                 onClick={() => {
+                  openWorkNotifySettings();
+                  setIsUtilityMenuOpen(false);
+                }}
+              >
+                  <div className="font-medium text-white">工作通知设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理用友工作通知的 AppKey 和 AppSecret</div>
+              </button>
+              <button
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
+                onClick={() => {
                   openGitLabImportSettings();
                   setIsUtilityMenuOpen(false);
                 }}
@@ -137,7 +149,7 @@ export function WorkbenchShell(props: { children: ReactNode }) {
           >
             <div>
                 <div className="text-sm font-medium text-white">工作台设置</div>
-                <div className="mt-1 text-xs leading-5 text-slate-400">模型、邮箱、飞书和全局接入配置</div>
+                <div className="mt-1 text-xs leading-5 text-slate-400">模型、邮箱、飞书、工作通知和全局接入配置</div>
             </div>
               <div className="apple-pill rounded-full px-3 py-1 text-xs">{isUtilityMenuOpen ? "收起" : "展开"}</div>
           </button>
@@ -149,6 +161,7 @@ export function WorkbenchShell(props: { children: ReactNode }) {
       <ModelSettingsPanel />
       <MailSettingsPanel />
       <FeishuSettingsPanel />
+      <WorkNotifySettingsPanel />
       <GitLabImportSettingsPanel />
     </div>
   );

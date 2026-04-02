@@ -34,15 +34,18 @@ import type {
   SupportIssueDigestRun,
   SupportIssueFeedbackSyncResponse,
   SupportIssueInsights,
+  SupportIssueOwnerRule,
   SupportIssueRun,
   SseEvent,
   ThreadState,
   ThreadSummary,
   UpdateMailSettingsRequest,
   UpdateProviderRequest,
+  UpdateWorkNotifySettingsRequest,
   WatcherAgentConfig,
   WatcherFetchTestResponse,
-  WatcherRun
+  WatcherRun,
+  WorkNotifySettings
 } from "./types";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
@@ -144,6 +147,20 @@ export async function updateFeishuSettings(input: {
     body: JSON.stringify(input)
   });
   return parseJson<FeishuSettings>(response);
+}
+
+export async function getWorkNotifySettings(): Promise<WorkNotifySettings> {
+  const response = await fetch(API_BASE + "/api/settings/work-notify", { cache: "no-store" });
+  return parseJson<WorkNotifySettings>(response);
+}
+
+export async function updateWorkNotifySettings(input: UpdateWorkNotifySettingsRequest): Promise<WorkNotifySettings> {
+  const response = await fetch(API_BASE + "/api/settings/work-notify", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<WorkNotifySettings>(response);
 }
 
 export async function getGitLabImportSettings(): Promise<GitLabImportSettings> {
@@ -613,11 +630,15 @@ export async function createSupportAgent(input: {
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
+  module_field_name: string;
+  registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
   feedback_comment_field_name: string;
   confidence_field_name: string;
   hit_count_field_name: string;
+  support_owner_rules: SupportIssueOwnerRule[];
+  fallback_support_yht_user_id: string;
   digest_enabled: boolean;
   digest_recipient_emails: string[];
   case_review_enabled: boolean;
@@ -646,11 +667,15 @@ export async function updateSupportAgent(
     link_field_name: string;
     progress_field_name: string;
     status_field_name: string;
+    module_field_name: string;
+    registrant_field_name: string;
     feedback_result_field_name: string;
     feedback_final_answer_field_name: string;
     feedback_comment_field_name: string;
     confidence_field_name: string;
     hit_count_field_name: string;
+    support_owner_rules: SupportIssueOwnerRule[];
+    fallback_support_yht_user_id: string;
     digest_enabled: boolean;
     digest_recipient_emails: string[];
     case_review_enabled: boolean;

@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any
 
+from .work_notify_settings_service import WorkNotifySettingsService
+
 
 AUTH_PATH = "/iuap-api-auth/open-auth/selfAppAuth/base/v1/getAccessToken"
 DEFAULT_AUTH_BASE_URL = "https://c2.yonyoucloud.com"
+DEFAULT_OPENAPI_BASE_URL = "https://c1.yonyoucloud.com"
 NOTIFY_PATHS = (
     "/iuap-api-gateway/yonbip/uspace/rest/openapi/idempotent/work/notify/push",
     "/yonbip/uspace/rest/openapi/idempotent/work/notify/push",
@@ -45,6 +48,9 @@ class ResolvedYonyouCredentials:
 class YonyouWorkNotifyService:
     """处理 access_token 获取与工作通知发送。"""
 
+    def __init__(self, work_notify_settings_service: WorkNotifySettingsService | None = None) -> None:
+        self.work_notify_settings_service = work_notify_settings_service
+
     def resolve_credentials(
         self,
         *,
@@ -53,8 +59,21 @@ class YonyouWorkNotifyService:
         auth_base_url: str | None,
         openapi_base_url: str,
     ) -> ResolvedYonyouCredentials:
-        normalized_app_key = (app_key or os.getenv("YONYOU_APP_KEY", "")).strip()
-        normalized_app_secret = (app_secret or os.getenv("YONYOU_APP_SECRET", "")).strip()
+        stored_runtime = (
+            self.work_notify_settings_service.get_runtime_settings()
+            if self.work_notify_settings_service is not None
+            else None
+        )
+        normalized_app_key = (
+            app_key
+            or (stored_runtime.app_key if stored_runtime is not None else None)
+            or os.getenv("YONYOU_APP_KEY", "")
+        ).strip()
+        normalized_app_secret = (
+            app_secret
+            or (stored_runtime.app_secret if stored_runtime is not None else None)
+            or os.getenv("YONYOU_APP_SECRET", "")
+        ).strip()
         normalized_auth_base_url = (
             auth_base_url
             or os.getenv("YONYOU_AUTH_BASE_URL")
@@ -64,7 +83,8 @@ class YonyouWorkNotifyService:
 
         if normalized_app_key == "" or normalized_app_secret == "":
             raise YonyouWorkNotifyError(
-                "缺少用友应用凭据：请在工具入参中传 `app_key` / `app_secret`，或配置环境变量 "
+                "缺少用友应用凭据：请在工作台设置 -> 工作通知设置中保存 AppKey / AppSecret，"
+                "或在工具入参中传 `app_key` / `app_secret`，或配置环境变量 "
                 "`YONYOU_APP_KEY` / `YONYOU_APP_SECRET`。"
             )
 
@@ -182,7 +202,7 @@ class YonyouWorkNotifyService:
     def send_work_notify(
         self,
         *,
-        openapi_base_url: str,
+        openapi_base_url: str | None = None,
         src_msg_id: str,
         yht_user_ids: list[str],
         title: str,
@@ -202,7 +222,11 @@ class YonyouWorkNotifyService:
         auth_base_url: str | None = None,
         timeout: int = 30,
     ) -> dict[str, Any]:
-        normalized_openapi_base_url = openapi_base_url.strip()
+        normalized_openapi_base_url = (
+            openapi_base_url
+            or os.getenv("YONYOU_OPENAPI_BASE_URL")
+            or DEFAULT_OPENAPI_BASE_URL
+        ).strip()
         normalized_src_msg_id = src_msg_id.strip()
         normalized_title = title.strip()
         normalized_content = content.strip()

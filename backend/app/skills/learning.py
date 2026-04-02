@@ -60,8 +60,14 @@ class SendYonyouWorkNotifyInput(BaseModel):
         default=None,
         description="业务属性 JSON，可传对象或对象数组",
     )
-    app_key: str | None = Field(default=None, description="应用 appKey；不传时回退到 YONYOU_APP_KEY")
-    app_secret: str | None = Field(default=None, description="应用 appSecret；不传时回退到 YONYOU_APP_SECRET")
+    app_key: str | None = Field(
+        default=None,
+        description="应用 appKey；不传时优先回退到工作通知设置，其次回退到 YONYOU_APP_KEY",
+    )
+    app_secret: str | None = Field(
+        default=None,
+        description="应用 appSecret；不传时优先回退到工作通知设置，其次回退到 YONYOU_APP_SECRET",
+    )
     auth_base_url: str | None = Field(
         default=None,
         description="鉴权基础域名；不传时回退到 YONYOU_AUTH_BASE_URL 或 openapi_base_url",
@@ -69,9 +75,12 @@ class SendYonyouWorkNotifyInput(BaseModel):
     timeout: int = Field(default=30, ge=1, le=120, description="请求超时秒数")
 
 
-def build_skill_registry(knowledge_store: KnowledgeStore) -> SkillRegistry:
+def build_skill_registry(
+    knowledge_store: KnowledgeStore,
+    yonyou_notify_service: YonyouWorkNotifyService | None = None,
+) -> SkillRegistry:
     registry = SkillRegistry()
-    yonyou_notify_service = YonyouWorkNotifyService()
+    yonyou_notify_service = yonyou_notify_service or YonyouWorkNotifyService()
 
     @tool("calc_money", args_schema=CalcMoneyInput)
     def calc_money(days: int, daily: float) -> float:

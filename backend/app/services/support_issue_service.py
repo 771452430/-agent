@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from collections import Counter
 import difflib
+from html import escape
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -43,6 +44,8 @@ from ..schemas import (
     SupportIssueFeedbackFact,
     SupportIssueFeedbackSyncResponse,
     SupportIssueDigestRun,
+    SupportIssueNotificationEvent,
+    SupportIssueOwnerRule,
     SupportIssueInsights,
     SupportIssueRowResult,
     SupportIssueRun,
@@ -55,6 +58,7 @@ from .llm_service import LLMService
 from .mail_service import MailService
 from .retrieval_service import RetrievalService
 from .support_issue_store import SupportIssueStore
+from .yonyou_work_notify_service import YonyouWorkNotifyError, YonyouWorkNotifyService
 
 
 def _utc_now() -> datetime:
@@ -70,9 +74,11 @@ DONE_PROGRESS_VALUE = "AI分析完成"
 MANUAL_REVIEW_PROGRESS_VALUE = "待人工确认"
 NO_HIT_PROGRESS_VALUE = "无命中"
 FAILED_PROGRESS_VALUE = "失败待重试"
+HUMAN_CONFIRMED_PROGRESS_VALUE = "人工确认完成"
 NO_HIT_MESSAGE = "未检索到相关知识，已标记待人工确认，请人工补充处理。"
 NO_HIT_MESSAGE_KEYWORD = "未检索到相关知识"
 LOW_CONFIDENCE_THRESHOLD = 0.65
+YONYOU_USER_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 MAX_SIMILAR_CASES = 2
 FEEDBACK_ACCEPTED = "直接采纳"
 FEEDBACK_REVISED_ACCEPTED = "修改后采纳"
@@ -108,6 +114,7 @@ class SupportIssueService:
         llm_service: LLMService,
         feishu_service: FeishuService,
         mail_service: MailService,
+        yonyou_work_notify_service: YonyouWorkNotifyService | None = None,
     ) -> None:
         # SupportIssueService 是支持问题业务的总编排层：
         # - Store 管配置、运行记录、反馈事实、案例候选；
@@ -119,6 +126,7 @@ class SupportIssueService:
         self.llm_service = llm_service
         self.feishu_service = feishu_service
         self.mail_service = mail_service
+        self.yonyou_work_notify_service = yonyou_work_notify_service or YonyouWorkNotifyService()
         self.rag_pipeline = RAGPipeline(knowledge_store)
         self.retrieval_service = RetrievalService(knowledge_store, llm_service)
 
@@ -228,6 +236,226 @@ class SupportIssueService:
             final_solution=self._stringify_field_value(fields.get(agent.feedback_final_answer_field_name)),
             comment=self._stringify_field_value(fields.get(agent.feedback_comment_field_name)),
         )
+
+    def _normalize_module_match_key(self, value: str) -> str:
+        return self._normalize_field_match_key(value)
+
+    def _resolve_support_owner_user_id(
+        self,
+        *,
+        module_value: str,
+        rules: list[SupportIssueOwnerRule],
+        fallback_user_id: str,
+    ) -> str:
+        normalized_module = self._normalize_module_match_key(module_value)
+        if normalized_module != "":
+            for rule in rules:
+                if self._normalize_module_match_key(rule.module_value) == normalized_module:
+                    return rule.yht_user_id.strip()
+        return fallback_user_id.strip()
+
+    def _extract_user_ids_from_field_value(self, value: Any) -> list[str]:
+        user_ids: list[str] = []
+
+        def append_candidate(raw_candidate: Any) -> None:
+            candidate = str(raw_candidate or "").strip()
+            if candidate == "":
+                return
+            lowered = candidate.lower()
+            if lowered.startswith("ou_") or lowered.startswith("on_") or YONYOU_USER_ID_PATTERN.fullmatch(candidate):
+                user_ids.append(candidate)
+
+        def collect(item: Any) -> None:
+            if item is None:
+                return
+            if isinstance(item, str):
+                append_candidate(item)
+                return
+            if isinstance(item, list):
+                for nested in item:
+                    collect(nested)
+                return
+            if isinstance(item, dict):
+                for key in ("user_id", "userId", "id", "open_id", "openId", "yhtUserId"):
+                    append_candidate(item.get(key))
+                for key in ("user", "member", "owner"):
+                    nested = item.get(key)
+                    if nested is not None:
+                        collect(nested)
+                return
+            append_candidate(self._stringify_field_value(item))
+
+        collect(value)
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in user_ids:
+            normalized = item.strip()
+            if normalized == "" or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+        return deduped
+
+    def _extract_registrant_user_ids(
+        self,
+        *,
+        fields: dict[str, Any],
+        registrant_field: FeishuBitableFieldInfo,
+    ) -> list[str]:
+        primary_user_ids = self._extract_user_ids_from_field_value(fields.get(registrant_field.field_name))
+        if len(primary_user_ids) > 0:
+            return primary_user_ids
+
+        base_name = registrant_field.field_name.strip()
+        fallback_field_names: list[str] = []
+        if base_name != "":
+            fallback_field_names.extend(
+                [
+                    base_name + "userID",
+                    base_name + "userid",
+                    base_name + "UserID",
+                    base_name + "_userID",
+                    base_name + "_userid",
+                    base_name + " userID",
+                    base_name + " userId",
+                    base_name + "用户ID",
+                ]
+            )
+        fallback_field_names.extend(["登记人userID", "登记人userid", "提交人userID", "提问人userID"])
+
+        seen_field_names: set[str] = set()
+        for field_name in fallback_field_names:
+            normalized_field_name = field_name.strip()
+            if normalized_field_name == "" or normalized_field_name in seen_field_names:
+                continue
+            seen_field_names.add(normalized_field_name)
+            if normalized_field_name not in fields:
+                continue
+            fallback_user_ids = self._extract_user_ids_from_field_value(fields.get(normalized_field_name))
+            if len(fallback_user_ids) > 0:
+                return fallback_user_ids
+        return []
+
+    def _record_notification_event(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_id: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> None:
+        self.support_issue_store.record_notification_event(
+            SupportIssueNotificationEvent(
+                id=str(uuid4()),
+                agent_id=agent_id,
+                record_id=record_id,
+                event_type=event_type,
+                recipient_user_id=recipient_user_id,
+                status=status,
+                error_message=error_message,
+                created_at=_utc_now(),
+            )
+        )
+
+    def _has_notification_event(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> bool:
+        return self.support_issue_store.has_notification_event(
+            agent_id=agent_id,
+            record_id=record_id,
+            event_type=event_type,
+            statuses=statuses,
+        )
+
+    def _has_notification_event_for_recipient(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_id: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> bool:
+        return self.support_issue_store.has_notification_event_for_recipient(
+            agent_id=agent_id,
+            record_id=record_id,
+            event_type=event_type,
+            recipient_user_id=recipient_user_id,
+            statuses=statuses,
+        )
+
+    def _send_yonyou_notification(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_ids: list[str],
+        src_msg_id: str,
+        title: str,
+        content: str,
+        web_url: str | None = None,
+    ) -> None:
+        normalized_recipients = [item.strip() for item in recipient_user_ids if item.strip() != ""]
+        if len(normalized_recipients) == 0:
+            self._record_notification_event(
+                agent_id=agent_id,
+                record_id=record_id,
+                event_type=event_type,
+                recipient_user_id="",
+                status="skipped",
+                error_message="缺少可用的通知接收人 userId。",
+            )
+            return
+
+        try:
+            response = self.yonyou_work_notify_service.send_work_notify(
+                openapi_base_url=None,
+                src_msg_id=src_msg_id,
+                yht_user_ids=normalized_recipients,
+                title=title,
+                content=content,
+                label_code="OA",
+                web_url=web_url,
+            )
+            if response.get("ok") is not True:
+                error_message = str(response.get("message") or "工作通知接口返回非成功状态。").strip()
+                code = str(response.get("code") or "").strip()
+                if code != "":
+                    error_message = f"code={code}: {error_message}"
+                raise YonyouWorkNotifyError(error_message)
+            for recipient in normalized_recipients:
+                self._record_notification_event(
+                    agent_id=agent_id,
+                    record_id=record_id,
+                    event_type=event_type,
+                    recipient_user_id=recipient,
+                    status="sent",
+                )
+        except YonyouWorkNotifyError as exc:
+            error_message = str(exc)
+            for recipient in normalized_recipients:
+                self._record_notification_event(
+                    agent_id=agent_id,
+                    record_id=record_id,
+                    event_type=event_type,
+                    recipient_user_id=recipient,
+                    status="failed",
+                    error_message=error_message,
+                )
+
+    def _short_text(self, value: str, *, limit: int = 120) -> str:
+        compact = " ".join(value.strip().split())
+        if len(compact) <= limit:
+            return compact
+        return compact[: limit - 1] + "…"
 
     def _normalize_similarity_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", text).strip().lower()
@@ -661,6 +889,14 @@ class SupportIssueService:
             available_fields,
             [agent.progress_field_name, "回复进度", "处理状态", "进度", "状态"],
         )
+        module_field = self._pick_field_by_candidates(
+            available_fields,
+            [agent.module_field_name, "负责模块", "模块", "业务模块"],
+        )
+        registrant_field = self._pick_field_by_candidates(
+            available_fields,
+            [agent.registrant_field_name, "登记人", "提交人", "提问人"],
+        )
         feedback_result_field = self._pick_field_by_candidates(
             available_fields,
             [agent.feedback_result_field_name, "人工处理结果", "处理结果", "人工结果"],
@@ -687,6 +923,8 @@ class SupportIssueService:
             "answer": answer_field or FeishuBitableFieldInfo(field_name=agent.answer_field_name),
             "link": link_field or FeishuBitableFieldInfo(field_name=agent.link_field_name),
             "progress": progress_field or FeishuBitableFieldInfo(field_name=agent.progress_field_name),
+            "module": module_field or FeishuBitableFieldInfo(field_name=agent.module_field_name),
+            "registrant": registrant_field or FeishuBitableFieldInfo(field_name=agent.registrant_field_name),
             "feedback_result": feedback_result_field
             or FeishuBitableFieldInfo(field_name=agent.feedback_result_field_name),
             "feedback_final_answer": feedback_final_answer_field
@@ -893,6 +1131,169 @@ class SupportIssueService:
             created_at=synced_at,
             updated_at=synced_at,
             last_synced_at=synced_at,
+        )
+
+    def _notify_support_owner_for_manual_review(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        run_id: str,
+        record_id: str,
+        question: str,
+        module_value: str,
+        solution: str,
+    ) -> None:
+        owner_user_id = self._resolve_support_owner_user_id(
+            module_value=module_value,
+            rules=agent.support_owner_rules,
+            fallback_user_id=agent.fallback_support_yht_user_id,
+        )
+        if owner_user_id == "":
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="manual_review_assigned",
+                recipient_user_id="",
+                status="skipped",
+                error_message="模块未匹配到负责人，且未配置兜底负责人。",
+            )
+            return
+
+        topic = self._question_topic(question)
+        title = f"支持问题待人工确认｜{module_value or '未分类模块'}"
+        content = (
+            f"模块：{module_value or '未分类模块'}\n"
+            f"问题：{topic}\n"
+            f"当前进度：{MANUAL_REVIEW_PROGRESS_VALUE}\n"
+            f"处理摘要：{self._short_text(solution or NO_HIT_MESSAGE)}\n"
+            f"飞书表：{agent.feishu_bitable_url}\n"
+            f"record_id：{record_id}"
+        )
+        self._send_yonyou_notification(
+            agent_id=agent.id,
+            record_id=record_id,
+            event_type="manual_review_assigned",
+            recipient_user_ids=[owner_user_id],
+            src_msg_id=f"SUPPORT_MANUAL_REVIEW:{agent.id}:{record_id}:{run_id}",
+            title=title,
+            content=content,
+            web_url=agent.feishu_bitable_url,
+        )
+
+    def _backfill_support_owner_notification_if_needed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+    ) -> None:
+        if fact.progress_value != MANUAL_REVIEW_PROGRESS_VALUE:
+            return
+
+        module_field = resolved_fields["module"]
+        module_value = self._stringify_field_value(fields.get(module_field.field_name))
+        owner_user_id = self._resolve_support_owner_user_id(
+            module_value=module_value,
+            rules=agent.support_owner_rules,
+            fallback_user_id=agent.fallback_support_yht_user_id,
+        )
+        if owner_user_id != "" and self._has_notification_event_for_recipient(
+            agent_id=agent.id,
+            record_id=record_id,
+            event_type="manual_review_assigned",
+            recipient_user_id=owner_user_id,
+            statuses=("sent",),
+        ):
+            return
+        self._notify_support_owner_for_manual_review(
+            agent=agent,
+            run_id=f"sync-{synced_at.strftime('%Y%m%d%H%M%S')}",
+            record_id=record_id,
+            question=fact.question,
+            module_value=module_value,
+            solution=fact.ai_solution or NO_HIT_MESSAGE,
+        )
+
+    def _notify_registrants_for_confirmation_completed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        progress_changed_at: datetime,
+    ) -> None:
+        registrant_field = resolved_fields["registrant"]
+        registrant_user_ids = self._extract_registrant_user_ids(fields=fields, registrant_field=registrant_field)
+        if len(registrant_user_ids) == 0:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id="",
+                status="skipped",
+                error_message=f"登记人列“{registrant_field.field_name}”及其 userId 伴随列未提取到有效 userId。",
+            )
+            return
+
+        topic = self._question_topic(fact.question)
+        final_summary = fact.feedback_final_answer.strip() or fact.ai_solution.strip() or "请到支持问题表查看处理结果。"
+        content = (
+            f"提示您登记的问题「{topic}」已经回复，请去支持问题表格查看。\n"
+            f"当前进度：{HUMAN_CONFIRMED_PROGRESS_VALUE}\n"
+            f"处理结果：{self._short_text(final_summary, limit=180)}\n"
+            f"飞书表：{agent.feishu_bitable_url}\n"
+            f"record_id：{record_id}"
+        )
+        self._send_yonyou_notification(
+            agent_id=agent.id,
+            record_id=record_id,
+            event_type="registrant_confirmed",
+            recipient_user_ids=registrant_user_ids,
+            src_msg_id=f"SUPPORT_CONFIRM_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
+            title=f"支持问题已回复｜{topic}",
+            content=content,
+            web_url=agent.feishu_bitable_url,
+        )
+
+    def _backfill_registrant_confirmation_notification_if_needed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+    ) -> None:
+        if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
+            return
+        registrant_user_ids = self._extract_registrant_user_ids(
+            fields=fields,
+            registrant_field=resolved_fields["registrant"],
+        )
+        if len(registrant_user_ids) > 0 and all(
+            self._has_notification_event_for_recipient(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id=recipient_user_id,
+                statuses=("sent",),
+            )
+            for recipient_user_id in registrant_user_ids
+        ):
+            return
+        self._notify_registrants_for_confirmation_completed(
+            agent=agent,
+            record_id=record_id,
+            fields=fields,
+            resolved_fields=resolved_fields,
+            fact=fact,
+            progress_changed_at=synced_at,
         )
 
     def _feedback_fact_to_candidate(
@@ -1227,6 +1628,9 @@ class SupportIssueService:
             f"新增候选案例 {new_candidate_count} 条，审核通过入库 {approved_candidate_count} 条。"
         )
 
+    def _format_digest_datetime(self, value: datetime) -> str:
+        return value.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")
+
     def _build_digest_email_bodies(
         self,
         *,
@@ -1234,52 +1638,113 @@ class SupportIssueService:
         digest_run: SupportIssueDigestRun,
     ) -> tuple[str, str]:
         """生成 digest 的纯文本和 HTML 邮件正文。"""
-
-        top_category_lines = (
-            "\n".join(f"- {item.category}：{item.count}" for item in digest_run.top_categories)
-            if len(digest_run.top_categories) > 0
-            else "- 无"
-        )
-        highlight_lines = (
-            "\n".join(f"- {item}" for item in digest_run.highlight_samples)
-            if len(digest_run.highlight_samples) > 0
-            else "- 无"
-        )
-        no_hit_lines = (
-            "\n".join(f"- {item}" for item in digest_run.top_no_hit_topics)
-            if len(digest_run.top_no_hit_topics) > 0
-            else "- 无"
-        )
-        suggestion_lines = (
-            "\n".join(f"- {item}" for item in digest_run.knowledge_gap_suggestions)
-            if len(digest_run.knowledge_gap_suggestions) > 0
-            else "- 暂无"
-        )
+        time_range = f"{self._format_digest_datetime(digest_run.period_start)} ~ {self._format_digest_datetime(digest_run.period_end)}"
+        top_category_lines = [f"- {item.category}：{item.count}" for item in digest_run.top_categories] or ["- 无"]
+        highlight_lines = [f"- {item}" for item in digest_run.highlight_samples] or ["- 无"]
+        no_hit_lines = [f"- {item}" for item in digest_run.top_no_hit_topics] or ["- 无"]
+        suggestion_lines = [f"- {item}" for item in digest_run.knowledge_gap_suggestions] or ["- 暂无"]
+        top_category_text = "\n".join(top_category_lines)
+        highlight_text = "\n".join(highlight_lines)
+        no_hit_text = "\n".join(no_hit_lines)
+        suggestion_text = "\n".join(suggestion_lines)
 
         body = (
-            f"{agent.name} 单 Agent 周期汇总\n\n"
-            f"时间范围：{digest_run.period_start.astimezone(timezone.utc).isoformat()} ~ {digest_run.period_end.astimezone(timezone.utc).isoformat()}\n\n"
-            f"【本周期概览】\n{digest_run.summary}\n\n"
-            f"【Top 分类】\n{top_category_lines}\n\n"
-            f"【重点问题样本】\n{highlight_lines}\n\n"
-            f"【高频无命中主题】\n{no_hit_lines}\n\n"
-            f"【知识缺口建议】\n{suggestion_lines}\n\n"
-            f"【候选案例 / 已入库案例】\n"
+            f"{agent.name} 汇总邮件\n\n"
+            f"汇总类型：{'立即汇总' if digest_run.trigger_source == 'manual' else '周期汇总'}\n"
+            f"统计时间范围：{time_range}（Asia/Shanghai）\n\n"
+            f"【核心结论】\n{digest_run.summary}\n\n"
+            f"【处理概览】\n"
+            f"- 总处理量：{digest_run.total_processed_count}\n"
+            f"- AI分析完成：{digest_run.generated_count}\n"
+            f"- 待人工确认：{digest_run.manual_review_count}\n"
+            f"- 无命中：{digest_run.no_hit_count}\n"
+            f"- 失败：{digest_run.failed_count}\n\n"
+            f"【人工反馈】\n"
+            f"- 直接采纳：{digest_run.acceptance_count}\n"
+            f"- 修改后采纳：{digest_run.revised_acceptance_count}\n"
+            f"- 驳回：{digest_run.rejected_count}\n\n"
+            f"【高频分类 Top 5】\n{top_category_text}\n\n"
+            f"【高频无命中主题 Top 5】\n{no_hit_text}\n\n"
+            f"【重点问题样本】\n{highlight_text}\n\n"
+            f"【案例沉淀】\n"
             f"- 新增候选案例：{digest_run.new_candidate_count}\n"
-            f"- 审核通过入库：{digest_run.approved_candidate_count}\n"
+            f"- 审核通过入库：{digest_run.approved_candidate_count}\n\n"
+            f"【知识缺口建议】\n{suggestion_text}\n"
         )
 
+        stat_cards = [
+            ("总处理量", digest_run.total_processed_count),
+            ("AI分析完成", digest_run.generated_count),
+            ("待人工确认", digest_run.manual_review_count),
+            ("无命中", digest_run.no_hit_count),
+            ("失败", digest_run.failed_count),
+            ("直接采纳", digest_run.acceptance_count + digest_run.revised_acceptance_count),
+        ]
+        cards_html = "".join(
+            (
+                "<div style=\"flex:1 1 160px;border:1px solid #dbe7f3;border-radius:14px;padding:14px 16px;"
+                "background:#f8fbff;min-width:140px;\">"
+                f"<div style=\"font-size:12px;color:#5f7286;\">{escape(label)}</div>"
+                f"<div style=\"margin-top:8px;font-size:24px;font-weight:700;color:#102a43;\">{value}</div>"
+                "</div>"
+            )
+            for label, value in stat_cards
+        )
+
+        def render_list(items: list[str]) -> str:
+            return "".join(f"<li style=\"margin:6px 0;\">{escape(item)}</li>" for item in items)
+
+        top_categories_html = "".join(
+            f"<tr><td style=\"padding:8px 10px;border-bottom:1px solid #e5edf5;\">{escape(item.category)}</td>"
+            f"<td style=\"padding:8px 10px;border-bottom:1px solid #e5edf5;text-align:right;\">{item.count}</td></tr>"
+            for item in digest_run.top_categories
+        ) or "<tr><td colspan=\"2\" style=\"padding:8px 10px;color:#6b7c93;\">无</td></tr>"
+
         html_body = (
-            f"<h2>{agent.name} 单 Agent 周期汇总</h2>"
-            f"<p>时间范围：{digest_run.period_start.astimezone(timezone.utc).isoformat()} ~ "
-            f"{digest_run.period_end.astimezone(timezone.utc).isoformat()}</p>"
-            f"<h3>本周期概览</h3><p>{digest_run.summary}</p>"
-            f"<h3>Top 分类</h3><ul>{''.join(f'<li>{item.category}：{item.count}</li>' for item in digest_run.top_categories) or '<li>无</li>'}</ul>"
-            f"<h3>重点问题样本</h3><ul>{''.join(f'<li>{item}</li>' for item in digest_run.highlight_samples) or '<li>无</li>'}</ul>"
-            f"<h3>高频无命中主题</h3><ul>{''.join(f'<li>{item}</li>' for item in digest_run.top_no_hit_topics) or '<li>无</li>'}</ul>"
-            f"<h3>知识缺口建议</h3><ul>{''.join(f'<li>{item}</li>' for item in digest_run.knowledge_gap_suggestions) or '<li>暂无</li>'}</ul>"
-            f"<h3>候选案例 / 已入库案例</h3>"
-            f"<ul><li>新增候选案例：{digest_run.new_candidate_count}</li><li>审核通过入库：{digest_run.approved_candidate_count}</li></ul>"
+            "<div style=\"font-family:'PingFang SC','Microsoft YaHei',sans-serif;background:#f4f7fb;padding:24px;color:#102a43;\">"
+            "<div style=\"max-width:960px;margin:0 auto;background:#ffffff;border:1px solid #d9e2ec;border-radius:20px;overflow:hidden;\">"
+            "<div style=\"padding:24px 28px;background:linear-gradient(135deg,#0f4c81,#1f7a8c);color:#ffffff;\">"
+            f"<div style=\"font-size:13px;opacity:0.9;\">支持问题 Agent {'立即汇总' if digest_run.trigger_source == 'manual' else '周期汇总'}</div>"
+            f"<h2 style=\"margin:8px 0 0;font-size:28px;\">{escape(agent.name)}</h2>"
+            f"<div style=\"margin-top:10px;font-size:13px;opacity:0.92;\">统计时间范围：{escape(time_range)}（Asia/Shanghai）</div>"
+            "</div>"
+            "<div style=\"padding:24px 28px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:18px;\">核心结论</h3>"
+            f"<div style=\"padding:16px 18px;border-radius:14px;background:#f8fbff;border:1px solid #dbe7f3;line-height:1.8;\">{escape(digest_run.summary)}</div>"
+            "<div style=\"margin-top:18px;display:flex;flex-wrap:wrap;gap:12px;\">"
+            f"{cards_html}"
+            "</div>"
+            "<div style=\"margin-top:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;\">"
+            "<div style=\"border:1px solid #e5edf5;border-radius:16px;padding:18px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:16px;\">人工反馈</h3>"
+            "<ul style=\"padding-left:18px;margin:0;color:#334e68;line-height:1.8;\">"
+            f"{render_list([f'直接采纳：{digest_run.acceptance_count}', f'修改后采纳：{digest_run.revised_acceptance_count}', f'驳回：{digest_run.rejected_count}'])}"
+            "</ul></div>"
+            "<div style=\"border:1px solid #e5edf5;border-radius:16px;padding:18px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:16px;\">案例沉淀</h3>"
+            "<ul style=\"padding-left:18px;margin:0;color:#334e68;line-height:1.8;\">"
+            f"{render_list([f'新增候选案例：{digest_run.new_candidate_count}', f'审核通过入库：{digest_run.approved_candidate_count}'])}"
+            "</ul></div></div>"
+            "<div style=\"margin-top:24px;border:1px solid #e5edf5;border-radius:16px;overflow:hidden;\">"
+            "<div style=\"padding:14px 18px;background:#f8fbff;font-weight:600;\">高频分类 Top 5</div>"
+            "<table style=\"width:100%;border-collapse:collapse;font-size:14px;color:#243b53;\">"
+            "<thead><tr><th style=\"padding:10px;text-align:left;background:#fdfefe;border-bottom:1px solid #e5edf5;\">分类</th>"
+            "<th style=\"padding:10px;text-align:right;background:#fdfefe;border-bottom:1px solid #e5edf5;\">次数</th></tr></thead>"
+            f"<tbody>{top_categories_html}</tbody></table></div>"
+            "<div style=\"margin-top:24px;display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:18px;\">"
+            "<div style=\"border:1px solid #e5edf5;border-radius:16px;padding:18px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:16px;\">高频无命中主题 Top 5</h3>"
+            f"<ul style=\"padding-left:18px;margin:0;color:#334e68;line-height:1.8;\">{render_list(digest_run.top_no_hit_topics or ['无'])}</ul>"
+            "</div>"
+            "<div style=\"border:1px solid #e5edf5;border-radius:16px;padding:18px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:16px;\">知识缺口建议</h3>"
+            f"<ul style=\"padding-left:18px;margin:0;color:#334e68;line-height:1.8;\">{render_list(digest_run.knowledge_gap_suggestions or ['暂无'])}</ul>"
+            "</div></div>"
+            "<div style=\"margin-top:24px;border:1px solid #e5edf5;border-radius:16px;padding:18px;\">"
+            "<h3 style=\"margin:0 0 12px;font-size:16px;\">重点问题样本</h3>"
+            f"<ul style=\"padding-left:18px;margin:0;color:#334e68;line-height:1.8;\">{render_list(digest_run.highlight_samples or ['无'])}</ul>"
+            "</div>"
+            "</div></div></div>"
         )
         return body, html_body
 
@@ -1624,11 +2089,15 @@ class SupportIssueService:
             link_field_name=request.link_field_name,
             progress_field_name=request.progress_field_name,
             status_field_name=request.status_field_name,
+            module_field_name=request.module_field_name,
+            registrant_field_name=request.registrant_field_name,
             feedback_result_field_name=request.feedback_result_field_name,
             feedback_final_answer_field_name=request.feedback_final_answer_field_name,
             feedback_comment_field_name=request.feedback_comment_field_name,
             confidence_field_name=request.confidence_field_name,
             hit_count_field_name=request.hit_count_field_name,
+            support_owner_rules=request.support_owner_rules,
+            fallback_support_yht_user_id=request.fallback_support_yht_user_id,
             digest_enabled=request.digest_enabled,
             digest_recipient_emails=request.digest_recipient_emails,
             case_review_enabled=request.case_review_enabled,
@@ -1667,11 +2136,15 @@ class SupportIssueService:
             link_field_name=request.link_field_name,
             progress_field_name=request.progress_field_name,
             status_field_name=request.status_field_name,
+            module_field_name=request.module_field_name,
+            registrant_field_name=request.registrant_field_name,
             feedback_result_field_name=request.feedback_result_field_name,
             feedback_final_answer_field_name=request.feedback_final_answer_field_name,
             feedback_comment_field_name=request.feedback_comment_field_name,
             confidence_field_name=request.confidence_field_name,
             hit_count_field_name=request.hit_count_field_name,
+            support_owner_rules=request.support_owner_rules,
+            fallback_support_yht_user_id=request.fallback_support_yht_user_id,
             digest_enabled=request.digest_enabled,
             digest_recipient_emails=request.digest_recipient_emails,
             case_review_enabled=request.case_review_enabled,
@@ -1845,6 +2318,24 @@ class SupportIssueService:
                 )
                 history_appended_count += 1
 
+            self._backfill_support_owner_notification_if_needed(
+                agent=agent,
+                record_id=record_id,
+                fields=fields,
+                resolved_fields=resolved_fields,
+                fact=persisted_fact,
+                synced_at=synced_at,
+            )
+
+            self._backfill_registrant_confirmation_notification_if_needed(
+                agent=agent,
+                record_id=record_id,
+                fields=fields,
+                resolved_fields=resolved_fields,
+                fact=persisted_fact,
+                synced_at=synced_at,
+            )
+
             current_candidate = self.support_issue_store.get_case_candidate_by_record(agent.id, record_id)
 
             next_candidate = self._feedback_fact_to_candidate(persisted_fact)
@@ -1988,7 +2479,7 @@ class SupportIssueService:
         self.get_agent(agent_id)
         return self.support_issue_store.list_digest_runs(agent_id)
 
-    def run_digest(self, agent_id: str) -> SupportIssueDigestRun:
+    def run_digest(self, agent_id: str, *, trigger_source: str = "manual") -> SupportIssueDigestRun:
         """执行单 Agent digest，并发送周期邮件。"""
 
         agent = self.get_agent(agent_id)
@@ -2066,6 +2557,7 @@ class SupportIssueService:
             id=str(uuid4()),
             agent_id=agent.id,
             status="success",
+            trigger_source=trigger_source if trigger_source in {"manual", "scheduled"} else "manual",
             started_at=started_at,
             ended_at=_utc_now(),
             period_start=period_start,
@@ -2107,7 +2599,11 @@ class SupportIssueService:
             approved_candidate_count=len(approved_candidates_in_period),
         )
 
-        digest_run.email_subject = f"【支持问题 Agent 汇总】{agent.name}"
+        digest_run.email_subject = (
+            f"【支持问题 Agent 立即汇总】{agent.name}"
+            if digest_run.trigger_source == "manual"
+            else f"【支持问题 Agent 周期汇总】{agent.name}"
+        )
         body, html_body = self._build_digest_email_bodies(agent=agent, digest_run=digest_run)
 
         digest_items: list[dict[str, object]] = []
@@ -2177,6 +2673,7 @@ class SupportIssueService:
     def run_agent(self, agent_id: str) -> SupportIssueRun:
         agent = self.get_agent(agent_id)
         started_at = _utc_now()
+        run_id = str(uuid4())
 
         try:
             raw_rows = self.feishu_service.list_bitable_records(
@@ -2185,7 +2682,7 @@ class SupportIssueService:
             )
         except Exception as exc:
             failed_run = SupportIssueRun(
-                id=str(uuid4()),
+                id=run_id,
                 agent_id=agent.id,
                 status="failed",
                 started_at=started_at,
@@ -2208,6 +2705,7 @@ class SupportIssueService:
         answer_field = resolved_fields["answer"]
         link_field = resolved_fields["link"]
         progress_field = resolved_fields["progress"]
+        module_field = resolved_fields["module"]
         confidence_field = resolved_fields["confidence"]
         hit_count_field = resolved_fields["hit_count"]
         question_field_name = question_field.field_name
@@ -2240,7 +2738,7 @@ class SupportIssueService:
 
         if len(candidate_rows) == 0:
             run = SupportIssueRun(
-                id=str(uuid4()),
+                id=run_id,
                 agent_id=agent.id,
                 status="no_change",
                 started_at=started_at,
@@ -2256,6 +2754,10 @@ class SupportIssueService:
                 row_results=[],
             )
             self.support_issue_store.record_run(agent.id, run)
+            try:
+                self.sync_feedback(agent.id)
+            except Exception:
+                pass
             return run
 
         generated_count = 0
@@ -2269,6 +2771,7 @@ class SupportIssueService:
             record_id = str(item.get("record_id") or item.get("recordId") or "").strip()
             fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
             question = self._stringify_field_value(fields.get(question_field_name))
+            module_value = self._stringify_field_value(fields.get(module_field.field_name))
             feedback_snapshot = self._extract_feedback_snapshot(agent, fields)
             composed_query = self._compose_query(question=question, fields=fields)
             category = self._classify_question(composed_query if composed_query != "" else question)
@@ -2396,6 +2899,14 @@ class SupportIssueService:
                         ),
                     )
                     no_hit_count += 1
+                    self._notify_support_owner_for_manual_review(
+                        agent=agent,
+                        run_id=run_id,
+                        record_id=record_id,
+                        question=question,
+                        module_value=module_value,
+                        solution=NO_HIT_MESSAGE,
+                    )
                     row_results.append(
                         SupportIssueRowResult(
                             record_id=record_id,
@@ -2445,6 +2956,14 @@ class SupportIssueService:
                     generated_count += 1
                 else:
                     manual_review_count += 1
+                    self._notify_support_owner_for_manual_review(
+                        agent=agent,
+                        run_id=run_id,
+                        record_id=record_id,
+                        question=question,
+                        module_value=module_value,
+                        solution=solution,
+                    )
                 row_results.append(
                     SupportIssueRowResult(
                         record_id=record_id,
@@ -2528,7 +3047,7 @@ class SupportIssueService:
             f"无命中 {no_hit_count} 行，失败 {failed_count} 行。"
         )
         run = SupportIssueRun(
-            id=str(uuid4()),
+            id=run_id,
             agent_id=agent.id,
             status=run_status,
             started_at=started_at,

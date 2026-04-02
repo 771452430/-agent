@@ -27,6 +27,8 @@ from ..schemas import (
     SupportIssueCategoryStat,
     SupportIssueDigestRun,
     SupportIssueFeedbackFact,
+    SupportIssueNotificationEvent,
+    SupportIssueOwnerRule,
     SupportIssueRowResult,
     SupportIssueRun,
 )
@@ -82,6 +84,20 @@ def _normalize_email_list(emails: list[str] | None) -> list[str]:
             continue
         seen.add(item)
         normalized.append(item)
+    return normalized
+
+
+def _normalize_owner_rules(rules: list[SupportIssueOwnerRule] | None) -> list[SupportIssueOwnerRule]:
+    """统一清洗“模块 -> 负责人”规则。"""
+
+    normalized: list[SupportIssueOwnerRule] = []
+    for item in rules or []:
+        rule = item if isinstance(item, SupportIssueOwnerRule) else SupportIssueOwnerRule.model_validate(item)
+        module_value = rule.module_value.strip()
+        yht_user_id = rule.yht_user_id.strip()
+        if module_value == "" or yht_user_id == "":
+            continue
+        normalized.append(SupportIssueOwnerRule(module_value=module_value, yht_user_id=yht_user_id))
     return normalized
 
 
@@ -170,11 +186,15 @@ class SupportIssueStore:
                     link_field_name TEXT NOT NULL,
                     progress_field_name TEXT NOT NULL DEFAULT '回复进度',
                     status_field_name TEXT NOT NULL,
+                    module_field_name TEXT NOT NULL DEFAULT '负责模块',
+                    registrant_field_name TEXT NOT NULL DEFAULT '登记人',
                     feedback_result_field_name TEXT NOT NULL DEFAULT '人工处理结果',
                     feedback_final_answer_field_name TEXT NOT NULL DEFAULT '人工最终方案',
                     feedback_comment_field_name TEXT NOT NULL DEFAULT '反馈备注',
                     confidence_field_name TEXT NOT NULL DEFAULT 'AI置信度',
                     hit_count_field_name TEXT NOT NULL DEFAULT '命中知识数',
+                    support_owner_rules_json TEXT NOT NULL DEFAULT '[]',
+                    fallback_support_yht_user_id TEXT NOT NULL DEFAULT '',
                     digest_enabled INTEGER NOT NULL DEFAULT 0,
                     digest_recipient_emails_json TEXT NOT NULL DEFAULT '[]',
                     case_review_enabled INTEGER NOT NULL DEFAULT 1,
@@ -260,6 +280,7 @@ class SupportIssueStore:
                     id TEXT PRIMARY KEY,
                     agent_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    trigger_source TEXT NOT NULL DEFAULT 'manual',
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
                     period_start TEXT NOT NULL,
@@ -290,6 +311,17 @@ class SupportIssueStore:
                     approved_candidate_count INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS support_issue_notification_events (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    record_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    recipient_user_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    error_message TEXT,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS support_issue_digest_items (
                     id TEXT PRIMARY KEY,
                     digest_run_id TEXT NOT NULL,
@@ -313,12 +345,17 @@ class SupportIssueStore:
 
                 CREATE INDEX IF NOT EXISTS idx_support_issue_feedback_history_agent_record
                     ON support_issue_feedback_history(agent_id, record_id, changed_at DESC);
+
+                CREATE INDEX IF NOT EXISTS idx_support_issue_notification_events_agent_created
+                    ON support_issue_notification_events(agent_id, created_at DESC);
                 """
             )
 
             # 老数据迁移：在已有表上补齐新列。
             self._ensure_column(conn, "support_issue_agents", "feishu_bitable_url", "TEXT")
             self._ensure_column(conn, "support_issue_agents", "progress_field_name", "TEXT NOT NULL DEFAULT '回复进度'")
+            self._ensure_column(conn, "support_issue_agents", "module_field_name", "TEXT NOT NULL DEFAULT '负责模块'")
+            self._ensure_column(conn, "support_issue_agents", "registrant_field_name", "TEXT NOT NULL DEFAULT '登记人'")
             self._ensure_column(
                 conn,
                 "support_issue_agents",
@@ -352,6 +389,18 @@ class SupportIssueStore:
             self._ensure_column(
                 conn,
                 "support_issue_agents",
+                "support_owner_rules_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(
+                conn,
+                "support_issue_agents",
+                "fallback_support_yht_user_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
+                conn,
+                "support_issue_agents",
                 "digest_enabled",
                 "INTEGER NOT NULL DEFAULT 0",
             )
@@ -375,11 +424,25 @@ class SupportIssueStore:
                 "manual_review_count",
                 "INTEGER NOT NULL DEFAULT 0",
             )
+            self._ensure_column(
+                conn,
+                "support_issue_digest_runs",
+                "trigger_source",
+                "TEXT NOT NULL DEFAULT 'manual'",
+            )
 
             # 把新增列的空值补齐为默认值，保证旧数据读取稳定。
             conn.execute(
                 "UPDATE support_issue_agents SET progress_field_name = '回复进度' "
                 "WHERE progress_field_name IS NULL OR progress_field_name = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_agents SET module_field_name = '负责模块' "
+                "WHERE module_field_name IS NULL OR module_field_name = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_agents SET registrant_field_name = '登记人' "
+                "WHERE registrant_field_name IS NULL OR registrant_field_name = ''"
             )
             conn.execute(
                 "UPDATE support_issue_agents SET feedback_result_field_name = '人工处理结果' "
@@ -400,6 +463,14 @@ class SupportIssueStore:
             conn.execute(
                 "UPDATE support_issue_agents SET hit_count_field_name = '命中知识数' "
                 "WHERE hit_count_field_name IS NULL OR hit_count_field_name = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_agents SET support_owner_rules_json = '[]' "
+                "WHERE support_owner_rules_json IS NULL OR support_owner_rules_json = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_agents SET fallback_support_yht_user_id = '' "
+                "WHERE fallback_support_yht_user_id IS NULL"
             )
             conn.execute(
                 "UPDATE support_issue_agents SET digest_recipient_emails_json = '[]' "
@@ -452,11 +523,17 @@ class SupportIssueStore:
             link_field_name=row["link_field_name"],
             progress_field_name=row["progress_field_name"] or "回复进度",
             status_field_name=row["status_field_name"],
+            module_field_name=row["module_field_name"] or "负责模块",
+            registrant_field_name=row["registrant_field_name"] or "登记人",
             feedback_result_field_name=row["feedback_result_field_name"] or "人工处理结果",
             feedback_final_answer_field_name=row["feedback_final_answer_field_name"] or "人工最终方案",
             feedback_comment_field_name=row["feedback_comment_field_name"] or "反馈备注",
             confidence_field_name=row["confidence_field_name"] or "AI置信度",
             hit_count_field_name=row["hit_count_field_name"] or "命中知识数",
+            support_owner_rules=_normalize_owner_rules(
+                [item for item in _safe_load_json_list(row["support_owner_rules_json"]) if isinstance(item, dict)]
+            ),
+            fallback_support_yht_user_id=row["fallback_support_yht_user_id"] or "",
             digest_enabled=bool(row["digest_enabled"]),
             digest_recipient_emails=[
                 str(item)
@@ -543,6 +620,7 @@ class SupportIssueStore:
             id=row["id"],
             agent_id=row["agent_id"],
             status=row["status"],
+            trigger_source=row["trigger_source"] or "manual",
             started_at=datetime.fromisoformat(row["started_at"]),
             ended_at=datetime.fromisoformat(row["ended_at"]) if row["ended_at"] else None,
             period_start=datetime.fromisoformat(row["period_start"]),
@@ -583,6 +661,18 @@ class SupportIssueStore:
             ],
             new_candidate_count=int(row["new_candidate_count"] or 0),
             approved_candidate_count=int(row["approved_candidate_count"] or 0),
+        )
+
+    def _row_to_notification_event(self, row: sqlite3.Row) -> SupportIssueNotificationEvent:
+        return SupportIssueNotificationEvent(
+            id=row["id"],
+            agent_id=row["agent_id"],
+            record_id=row["record_id"],
+            event_type=row["event_type"],
+            recipient_user_id=row["recipient_user_id"] or "",
+            status=row["status"],
+            error_message=row["error_message"],
+            created_at=datetime.fromisoformat(row["created_at"]),
         )
 
     def _select_agents_query(self) -> str:
@@ -632,11 +722,15 @@ class SupportIssueStore:
         link_field_name: str,
         progress_field_name: str,
         status_field_name: str,
+        module_field_name: str,
+        registrant_field_name: str,
         feedback_result_field_name: str,
         feedback_final_answer_field_name: str,
         feedback_comment_field_name: str,
         confidence_field_name: str,
         hit_count_field_name: str,
+        support_owner_rules: list[SupportIssueOwnerRule],
+        fallback_support_yht_user_id: str,
         digest_enabled: bool,
         digest_recipient_emails: list[str],
         case_review_enabled: bool,
@@ -653,12 +747,14 @@ class SupportIssueStore:
                     feishu_bitable_url, feishu_app_token, feishu_table_id, model_config_json,
                     knowledge_scope_type, knowledge_scope_id,
                     question_field_name, answer_field_name, link_field_name, progress_field_name, status_field_name,
+                    module_field_name, registrant_field_name,
                     feedback_result_field_name, feedback_final_answer_field_name, feedback_comment_field_name,
                     confidence_field_name, hit_count_field_name,
+                    support_owner_rules_json, fallback_support_yht_user_id,
                     digest_enabled, digest_recipient_emails_json, case_review_enabled,
                     created_at, updated_at, last_run_at, next_run_at, last_digest_at, next_digest_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
@@ -677,11 +773,15 @@ class SupportIssueStore:
                     link_field_name,
                     progress_field_name,
                     status_field_name,
+                    module_field_name,
+                    registrant_field_name,
                     feedback_result_field_name,
                     feedback_final_answer_field_name,
                     feedback_comment_field_name,
                     confidence_field_name,
                     hit_count_field_name,
+                    json.dumps([item.model_dump(mode="json") for item in _normalize_owner_rules(support_owner_rules)], ensure_ascii=False),
+                    fallback_support_yht_user_id.strip(),
                     1 if digest_enabled else 0,
                     json.dumps(_normalize_email_list(digest_recipient_emails), ensure_ascii=False),
                     1 if case_review_enabled else 0,
@@ -716,11 +816,15 @@ class SupportIssueStore:
         link_field_name: str | None = None,
         progress_field_name: str | None = None,
         status_field_name: str | None = None,
+        module_field_name: str | None = None,
+        registrant_field_name: str | None = None,
         feedback_result_field_name: str | None = None,
         feedback_final_answer_field_name: str | None = None,
         feedback_comment_field_name: str | None = None,
         confidence_field_name: str | None = None,
         hit_count_field_name: str | None = None,
+        support_owner_rules: list[SupportIssueOwnerRule] | None = None,
+        fallback_support_yht_user_id: str | None = None,
         digest_enabled: bool | None = None,
         digest_recipient_emails: list[str] | None = None,
         case_review_enabled: bool | None = None,
@@ -766,8 +870,10 @@ class SupportIssueStore:
                     feishu_bitable_url = ?, feishu_app_token = ?, feishu_table_id = ?, model_config_json = ?,
                     knowledge_scope_type = ?, knowledge_scope_id = ?,
                     question_field_name = ?, answer_field_name = ?, link_field_name = ?, progress_field_name = ?, status_field_name = ?,
+                    module_field_name = ?, registrant_field_name = ?,
                     feedback_result_field_name = ?, feedback_final_answer_field_name = ?, feedback_comment_field_name = ?,
                     confidence_field_name = ?, hit_count_field_name = ?,
+                    support_owner_rules_json = ?, fallback_support_yht_user_id = ?,
                     digest_enabled = ?, digest_recipient_emails_json = ?, case_review_enabled = ?,
                     updated_at = ?, next_run_at = ?, next_digest_at = ?
                 WHERE id = ?
@@ -790,6 +896,8 @@ class SupportIssueStore:
                     link_field_name if link_field_name is not None else current.link_field_name,
                     progress_field_name if progress_field_name is not None else current.progress_field_name,
                     status_field_name if status_field_name is not None else current.status_field_name,
+                    module_field_name if module_field_name is not None else current.module_field_name,
+                    registrant_field_name if registrant_field_name is not None else current.registrant_field_name,
                     feedback_result_field_name
                     if feedback_result_field_name is not None
                     else current.feedback_result_field_name,
@@ -801,6 +909,20 @@ class SupportIssueStore:
                     else current.feedback_comment_field_name,
                     confidence_field_name if confidence_field_name is not None else current.confidence_field_name,
                     hit_count_field_name if hit_count_field_name is not None else current.hit_count_field_name,
+                    json.dumps(
+                        [
+                            item.model_dump(mode="json")
+                            for item in _normalize_owner_rules(
+                                current.support_owner_rules if support_owner_rules is None else support_owner_rules
+                            )
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    (
+                        current.fallback_support_yht_user_id
+                        if fallback_support_yht_user_id is None
+                        else fallback_support_yht_user_id.strip()
+                    ),
                     1 if next_digest_enabled else 0,
                     json.dumps(next_digest_recipients, ensure_ascii=False),
                     1
@@ -1237,6 +1359,82 @@ class SupportIssueStore:
             ).fetchall()
         return [self._row_to_digest_run(row) for row in rows]
 
+    def record_notification_event(self, event: SupportIssueNotificationEvent) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO support_issue_notification_events (
+                    id, agent_id, record_id, event_type, recipient_user_id, status, error_message, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.id,
+                    event.agent_id,
+                    event.record_id,
+                    event.event_type,
+                    event.recipient_user_id,
+                    event.status,
+                    event.error_message,
+                    event.created_at.isoformat(),
+                ),
+            )
+
+    def has_notification_event(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> bool:
+        status_clause = ""
+        params: list[str] = [agent_id, record_id, event_type]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            status_clause = f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM support_issue_notification_events
+                WHERE agent_id = ? AND record_id = ? AND event_type = ?
+                {status_clause}
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return row is not None
+
+    def has_notification_event_for_recipient(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_id: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> bool:
+        status_clause = ""
+        params: list[str] = [agent_id, record_id, event_type, recipient_user_id]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            status_clause = f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT 1
+                FROM support_issue_notification_events
+                WHERE agent_id = ? AND record_id = ? AND event_type = ? AND recipient_user_id = ?
+                {status_clause}
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return row is not None
+
     def record_digest_run(
         self,
         *,
@@ -1255,7 +1453,7 @@ class SupportIssueStore:
             conn.execute(
                 """
                 INSERT INTO support_issue_digest_runs (
-                    id, agent_id, status, started_at, ended_at, period_start, period_end,
+                    id, agent_id, status, trigger_source, started_at, ended_at, period_start, period_end,
                     recipient_emails_json, email_sent, email_subject, summary, error_message,
                     total_processed_count, generated_count, manual_review_count, no_hit_count, failed_count,
                     acceptance_count, revised_acceptance_count, rejected_count,
@@ -1263,12 +1461,13 @@ class SupportIssueStore:
                     top_categories_json, top_no_hit_topics_json, highlight_samples_json, knowledge_gap_suggestions_json,
                     new_candidate_count, approved_candidate_count
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
                     agent_id,
                     run.status,
+                    run.trigger_source,
                     run.started_at.isoformat(),
                     ended_at.isoformat(),
                     run.period_start.isoformat(),

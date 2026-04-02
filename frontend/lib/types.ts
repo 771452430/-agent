@@ -104,6 +104,18 @@ export type FeishuSettings = {
   auth_mode: "tenant_access_token_internal";
 };
 
+export type WorkNotifySettings = {
+  configured: boolean;
+  app_key: string;
+  has_app_secret: boolean;
+  app_secret_masked?: string | null;
+};
+
+export type UpdateWorkNotifySettingsRequest = Partial<{
+  app_key: string;
+  app_secret: string;
+}>;
+
 export type GitLabImportSettings = {
   configured: boolean;
   has_token: boolean;
@@ -533,11 +545,15 @@ export type SupportIssueAgentConfig = {
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
+  module_field_name: string;
+  registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
   feedback_comment_field_name: string;
   confidence_field_name: string;
   hit_count_field_name: string;
+  support_owner_rules: SupportIssueOwnerRule[];
+  fallback_support_yht_user_id: string;
   digest_enabled: boolean;
   digest_recipient_emails: string[];
   case_review_enabled: boolean;
@@ -549,6 +565,11 @@ export type SupportIssueAgentConfig = {
   next_digest_at?: string | null;
   last_run_status?: SupportIssueRunStatus | null;
   last_run_summary?: string | null;
+};
+
+export type SupportIssueOwnerRule = {
+  module_value: string;
+  yht_user_id: string;
 };
 
 export type SupportIssueRun = {
@@ -651,6 +672,7 @@ export type SupportIssueDigestRun = {
   id: string;
   agent_id: string;
   status: SupportIssueDigestRunStatus;
+  trigger_source: "manual" | "scheduled";
   started_at: string;
   ended_at?: string | null;
   period_start: string;
