@@ -93,6 +93,7 @@ from .services.thread_store import ThreadStore
 from .services.watcher_scheduler import WatcherScheduler
 from .services.watcher_service import WatcherService
 from .services.watcher_store import WatcherStore
+from .services.yonyou_contacts_search_service import YonyouContactsSearchService
 from .services.work_notify_settings_service import WorkNotifySettingsService
 from .services.work_notify_settings_store import WorkNotifySettingsStore
 from .services.yonyou_work_notify_service import YonyouWorkNotifyService
@@ -118,6 +119,9 @@ mail_service = MailService(mail_store=mail_store, app_settings=settings)
 feishu_service = FeishuService(feishu_store=feishu_store)
 yonyou_work_notify_settings_service = WorkNotifySettingsService(work_notify_store=work_notify_settings_store)
 yonyou_work_notify_service = YonyouWorkNotifyService(work_notify_settings_service=yonyou_work_notify_settings_service)
+yonyou_contacts_search_service = YonyouContactsSearchService(
+    work_notify_settings_service=yonyou_work_notify_settings_service
+)
 skill_registry = build_skill_registry(knowledge_store, yonyou_work_notify_service)
 chat_service = ChatService(
     thread_store,
@@ -137,6 +141,7 @@ support_issue_service = SupportIssueService(
     feishu_service=feishu_service,
     mail_service=mail_service,
     yonyou_work_notify_service=yonyou_work_notify_service,
+    yonyou_contacts_search_service=yonyou_contacts_search_service,
 )
 support_issue_scheduler = SupportIssueScheduler(
     support_issue_service,

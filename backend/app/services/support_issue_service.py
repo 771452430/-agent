@@ -58,6 +58,7 @@ from .llm_service import LLMService
 from .mail_service import MailService
 from .retrieval_service import RetrievalService
 from .support_issue_store import SupportIssueStore
+from .yonyou_contacts_search_service import YonyouContactsSearchError, YonyouContactsSearchService
 from .yonyou_work_notify_service import YonyouWorkNotifyError, YonyouWorkNotifyService
 
 
@@ -79,6 +80,16 @@ NO_HIT_MESSAGE = "未检索到相关知识，已标记待人工确认，请人�
 NO_HIT_MESSAGE_KEYWORD = "未检索到相关知识"
 LOW_CONFIDENCE_THRESHOLD = 0.65
 YONYOU_USER_ID_PATTERN = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+YONYOU_ACCOUNT_PATTERN = re.compile(r"^[A-Za-z0-9._-]{2,64}(?:@yonyou\.com)?$")
+REGISTRANT_LOOKUP_FIELD_HINTS = (
+    "域名",
+    "邮箱",
+    "邮件",
+    "email",
+    "mail",
+    "账号",
+    "account",
+)
 MAX_SIMILAR_CASES = 2
 FEEDBACK_ACCEPTED = "直接采纳"
 FEEDBACK_REVISED_ACCEPTED = "修改后采纳"
@@ -115,6 +126,7 @@ class SupportIssueService:
         feishu_service: FeishuService,
         mail_service: MailService,
         yonyou_work_notify_service: YonyouWorkNotifyService | None = None,
+        yonyou_contacts_search_service: YonyouContactsSearchService | None = None,
     ) -> None:
         # SupportIssueService 是支持问题业务的总编排层：
         # - Store 管配置、运行记录、反馈事实、案例候选；
@@ -127,6 +139,7 @@ class SupportIssueService:
         self.feishu_service = feishu_service
         self.mail_service = mail_service
         self.yonyou_work_notify_service = yonyou_work_notify_service or YonyouWorkNotifyService()
+        self.yonyou_contacts_search_service = yonyou_contacts_search_service or YonyouContactsSearchService()
         self.rag_pipeline = RAGPipeline(knowledge_store)
         self.retrieval_service = RetrievalService(knowledge_store, llm_service)
 
@@ -296,45 +309,124 @@ class SupportIssueService:
             deduped.append(normalized)
         return deduped
 
+    def _extract_contact_lookup_candidates_from_field_value(self, value: Any) -> list[str]:
+        candidates: list[str] = []
+
+        def append_candidate(raw_candidate: Any) -> None:
+            candidate = str(raw_candidate or "").strip()
+            if candidate == "":
+                return
+            lowered = candidate.lower()
+            if lowered.startswith("ou_") or lowered.startswith("on_") or YONYOU_USER_ID_PATTERN.fullmatch(candidate):
+                return
+            if "@" in candidate:
+                if " " in candidate:
+                    return
+            elif YONYOU_ACCOUNT_PATTERN.fullmatch(candidate) is None:
+                return
+            if lowered not in {item.lower() for item in candidates}:
+                candidates.append(candidate)
+
+        def collect(item: Any) -> None:
+            if item is None:
+                return
+            if isinstance(item, str):
+                append_candidate(item)
+                return
+            if isinstance(item, list):
+                for nested in item:
+                    collect(nested)
+                return
+            if isinstance(item, dict):
+                for key in ("email", "mail", "work_email", "workEmail", "user_email", "userEmail"):
+                    append_candidate(item.get(key))
+                for key in ("user", "member", "owner"):
+                    nested = item.get(key)
+                    if nested is not None:
+                        collect(nested)
+                return
+            append_candidate(self._stringify_field_value(item))
+
+        collect(value)
+        return candidates
+
+    def _collect_registrant_lookup_field_names(
+        self,
+        *,
+        fields: dict[str, Any],
+        registrant_field_name: str,
+    ) -> list[str]:
+        candidate_field_names = [
+            registrant_field_name,
+            "域名（xxx@yonyou.com）",
+            "域名",
+            "邮箱",
+            "邮件",
+            "短账号",
+            "账号",
+            "登记人域名",
+            "登记人邮箱",
+            "提交人域名",
+            "提交人邮箱",
+            "提问人域名",
+            "提问人邮箱",
+        ]
+        candidate_field_names.extend(str(field_name) for field_name in fields.keys())
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for field_name in candidate_field_names:
+            normalized_field_name = str(field_name or "").strip()
+            if normalized_field_name == "":
+                continue
+            normalized_match_key = self._normalize_field_match_key(normalized_field_name)
+            if normalized_match_key == "":
+                continue
+            if normalized_field_name != registrant_field_name and not any(
+                hint in normalized_match_key for hint in REGISTRANT_LOOKUP_FIELD_HINTS
+            ):
+                continue
+            if normalized_match_key in seen:
+                continue
+            seen.add(normalized_match_key)
+            deduped.append(normalized_field_name)
+        return deduped
+
     def _extract_registrant_user_ids(
         self,
         *,
         fields: dict[str, Any],
         registrant_field: FeishuBitableFieldInfo,
     ) -> list[str]:
-        primary_user_ids = self._extract_user_ids_from_field_value(fields.get(registrant_field.field_name))
-        if len(primary_user_ids) > 0:
-            return primary_user_ids
+        resolved_user_ids: list[str] = []
+        seen_user_ids: set[str] = set()
+        seen_lookup_candidates: set[str] = set()
+        field_names = self._collect_registrant_lookup_field_names(
+            fields=fields,
+            registrant_field_name=registrant_field.field_name,
+        )
+        for field_name in field_names:
+            for user_id in self._extract_user_ids_from_field_value(fields.get(field_name)):
+                normalized_user_id = user_id.strip()
+                if normalized_user_id == "" or normalized_user_id in seen_user_ids:
+                    continue
+                seen_user_ids.add(normalized_user_id)
+                resolved_user_ids.append(normalized_user_id)
+            for candidate in self._extract_contact_lookup_candidates_from_field_value(fields.get(field_name)):
+                normalized_candidate = candidate.strip().lower()
+                if normalized_candidate == "" or normalized_candidate in seen_lookup_candidates:
+                    continue
+                seen_lookup_candidates.add(normalized_candidate)
+                for user_id in self.yonyou_contacts_search_service.resolve_yht_user_ids(candidate):
+                    normalized_user_id = user_id.strip()
+                    if normalized_user_id == "" or normalized_user_id in seen_user_ids:
+                        continue
+                    seen_user_ids.add(normalized_user_id)
+                    resolved_user_ids.append(normalized_user_id)
+        return resolved_user_ids
 
-        base_name = registrant_field.field_name.strip()
-        fallback_field_names: list[str] = []
-        if base_name != "":
-            fallback_field_names.extend(
-                [
-                    base_name + "userID",
-                    base_name + "userid",
-                    base_name + "UserID",
-                    base_name + "_userID",
-                    base_name + "_userid",
-                    base_name + " userID",
-                    base_name + " userId",
-                    base_name + "用户ID",
-                ]
-            )
-        fallback_field_names.extend(["登记人userID", "登记人userid", "提交人userID", "提问人userID"])
-
-        seen_field_names: set[str] = set()
-        for field_name in fallback_field_names:
-            normalized_field_name = field_name.strip()
-            if normalized_field_name == "" or normalized_field_name in seen_field_names:
-                continue
-            seen_field_names.add(normalized_field_name)
-            if normalized_field_name not in fields:
-                continue
-            fallback_user_ids = self._extract_user_ids_from_field_value(fields.get(normalized_field_name))
-            if len(fallback_user_ids) > 0:
-                return fallback_user_ids
-        return []
+    def _registrant_notification_reminder(self) -> str:
+        return "如确认问题已闭环，请将“回复进度”改为“完成”，否则后续轮巡仍可能继续提醒。"
 
     def _record_notification_event(
         self,
@@ -1228,7 +1320,18 @@ class SupportIssueService:
         progress_changed_at: datetime,
     ) -> None:
         registrant_field = resolved_fields["registrant"]
-        registrant_user_ids = self._extract_registrant_user_ids(fields=fields, registrant_field=registrant_field)
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(fields=fields, registrant_field=registrant_field)
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return
         if len(registrant_user_ids) == 0:
             self._record_notification_event(
                 agent_id=agent.id,
@@ -1236,7 +1339,7 @@ class SupportIssueService:
                 event_type="registrant_confirmed",
                 recipient_user_id="",
                 status="skipped",
-                error_message=f"登记人列“{registrant_field.field_name}”及其 userId 伴随列未提取到有效 userId。",
+                error_message=f"登记人列“{registrant_field.field_name}”未提取到有效邮箱/短账号，或未查询到对应 userId。",
             )
             return
 
@@ -1246,6 +1349,7 @@ class SupportIssueService:
             f"提示您登记的问题「{topic}」已经回复，请去支持问题表格查看。\n"
             f"当前进度：{HUMAN_CONFIRMED_PROGRESS_VALUE}\n"
             f"处理结果：{self._short_text(final_summary, limit=180)}\n"
+            f"{self._registrant_notification_reminder()}\n"
             f"飞书表：{agent.feishu_bitable_url}\n"
             f"record_id：{record_id}"
         )
@@ -1272,10 +1376,21 @@ class SupportIssueService:
     ) -> None:
         if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
             return
-        registrant_user_ids = self._extract_registrant_user_ids(
-            fields=fields,
-            registrant_field=resolved_fields["registrant"],
-        )
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(
+                fields=fields,
+                registrant_field=resolved_fields["registrant"],
+            )
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return
         if len(registrant_user_ids) > 0 and all(
             self._has_notification_event_for_recipient(
                 agent_id=agent.id,

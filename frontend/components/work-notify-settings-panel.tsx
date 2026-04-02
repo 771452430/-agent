@@ -7,12 +7,14 @@ import { useModelSettings } from "./model-settings-provider";
 type WorkNotifyDraft = {
   app_key: string;
   app_secret: string;
+  contacts_cookie: string;
 };
 
 function buildDraft(): WorkNotifyDraft {
   return {
     app_key: "",
-    app_secret: ""
+    app_secret: "",
+    contacts_cookie: ""
   };
 }
 
@@ -48,10 +50,14 @@ export function WorkNotifySettingsPanel() {
     setIsSaving(true);
     setStatus({ tone: "neutral", message: "正在保存工作通知配置..." });
     try {
-      await saveWorkNotifySettings({
+      const payload: WorkNotifyDraft = {
         app_key: draft.app_key.trim(),
-        app_secret: draft.app_secret.trim()
-      });
+        app_secret: draft.app_secret.trim(),
+        contacts_cookie: draft.contacts_cookie.trim()
+      };
+      await saveWorkNotifySettings(
+        Object.fromEntries(Object.entries(payload).filter(([, value]) => value !== ""))
+      );
       setDraft(buildDraft());
       setStatus({ tone: "success", message: "工作通知配置已保存。" });
     } catch (cause) {
@@ -73,7 +79,9 @@ export function WorkNotifySettingsPanel() {
               <h3 className="mt-2 text-3xl font-semibold text-slate-50">用友工作通知凭据</h3>
               <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-400">
                 这里统一保存 `AppKey / AppSecret`。支持问题 Agent 的人工通知，以及内置
-                `send_yonyou_work_notify` 工具，都会优先复用这份配置。
+                `send_yonyou_work_notify` 工具，都会优先复用这份配置。登记人邮箱/短账号转 `yhtUserId`
+                的联系人查询，也会复用这里的 Cookie。只更新 Cookie 时，未填写的
+                `AppKey / AppSecret` 不会被清空。
               </p>
             </div>
             <button
@@ -101,6 +109,11 @@ export function WorkNotifySettingsPanel() {
                   ) : (
                     <span className="ml-2 text-slate-500">未完成配置</span>
                   )}
+                  {workNotifySettings?.has_contacts_cookie ? (
+                    <span className="ml-2 text-cyan-300">已配置联系人查询 Cookie</span>
+                  ) : (
+                    <span className="ml-2 text-slate-500">未配置联系人查询 Cookie</span>
+                  )}
                 </div>
 
                 <label className="grid gap-2 text-sm">
@@ -124,6 +137,16 @@ export function WorkNotifySettingsPanel() {
                     placeholder={workNotifySettings?.app_secret_masked || "粘贴工作通知应用的 AppSecret"}
                   />
                 </label>
+
+                <label className="grid gap-2 text-sm">
+                  <span className="text-slate-400">联系人查询 Cookie</span>
+                  <textarea
+                    className="min-h-32 rounded-2xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100 outline-none placeholder:text-slate-600"
+                    value={draft.contacts_cookie}
+                    onChange={(event) => setDraft((current) => ({ ...current, contacts_cookie: event.target.value }))}
+                    placeholder={workNotifySettings?.contacts_cookie_masked || "粘贴联系人查询接口 Cookie，支持问题 Agent 会用它把登记人邮箱或短账号解析成 yhtUserId"}
+                  />
+                </label>
               </div>
             </section>
 
@@ -131,7 +154,8 @@ export function WorkNotifySettingsPanel() {
               <div className="font-medium text-slate-100">使用说明</div>
               <div className="mt-2">- 这份配置会被支持问题 Agent 的人工确认通知直接复用。</div>
               <div>- 内置 `send_yonyou_work_notify` 工具在未显式传 `app_key / app_secret` 时，也会优先读取这里。</div>
-              <div>- `yhtUserId` 仍然属于业务接收人，不在全局设置里保存。</div>
+              <div>- 联系人查询 Cookie 仅用于把登记人邮箱或短账号解析成 `yhtUserId`，不会展示明文。</div>
+              <div>- `yhtUserId` 仍然属于业务接收人，不在全局设置里直接保存。</div>
               <div>- OpenAPI 域名和鉴权域名继续按现有环境变量或工具入参决定，不在这个面板里维护。</div>
             </section>
 

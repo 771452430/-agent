@@ -109,11 +109,14 @@ export type WorkNotifySettings = {
   app_key: string;
   has_app_secret: boolean;
   app_secret_masked?: string | null;
+  has_contacts_cookie: boolean;
+  contacts_cookie_masked?: string | null;
 };
 
 export type UpdateWorkNotifySettingsRequest = Partial<{
   app_key: string;
   app_secret: string;
+  contacts_cookie: string;
 }>;
 
 export type GitLabImportSettings = {

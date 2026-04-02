@@ -41,6 +41,7 @@ class WorkNotifySettingsStore:
                     singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
                     app_key TEXT,
                     app_secret TEXT,
+                    contacts_cookie TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -48,11 +49,13 @@ class WorkNotifySettingsStore:
             )
             self._ensure_column(conn, "work_notify_settings", "app_key", "TEXT")
             self._ensure_column(conn, "work_notify_settings", "app_secret", "TEXT")
+            self._ensure_column(conn, "work_notify_settings", "contacts_cookie", "TEXT")
 
     def _row_to_runtime(self, row: sqlite3.Row) -> WorkNotifyRuntimeSettings:
         return WorkNotifyRuntimeSettings(
             app_key=(row["app_key"] or "").strip() or None,
             app_secret=(row["app_secret"] or "").strip() or None,
+            contacts_cookie=(row["contacts_cookie"] or "").strip() or None,
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -70,18 +73,20 @@ class WorkNotifySettingsStore:
             conn.execute(
                 """
                 INSERT INTO work_notify_settings (
-                    singleton_id, app_key, app_secret, created_at, updated_at
+                    singleton_id, app_key, app_secret, contacts_cookie, created_at, updated_at
                 )
-                VALUES (1, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?)
                 ON CONFLICT(singleton_id) DO UPDATE SET
                     app_key = excluded.app_key,
                     app_secret = excluded.app_secret,
+                    contacts_cookie = excluded.contacts_cookie,
                     created_at = excluded.created_at,
                     updated_at = excluded.updated_at
                 """,
                 (
                     runtime.app_key,
                     runtime.app_secret,
+                    runtime.contacts_cookie,
                     created_at.isoformat(),
                     updated_at.isoformat(),
                 ),

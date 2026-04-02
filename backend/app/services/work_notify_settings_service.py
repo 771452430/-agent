@@ -35,6 +35,7 @@ class WorkNotifySettingsService:
         return WorkNotifyRuntimeSettings(
             app_key=None,
             app_secret=None,
+            contacts_cookie=None,
             created_at=now,
             updated_at=now,
         )
@@ -47,6 +48,8 @@ class WorkNotifySettingsService:
             app_key=app_key,
             has_app_secret=app_secret != "",
             app_secret_masked=self._mask_value(app_secret),
+            has_contacts_cookie=(runtime.contacts_cookie or "").strip() != "",
+            contacts_cookie_masked=self._mask_value(runtime.contacts_cookie),
         )
 
     def get_runtime_settings(self) -> WorkNotifyRuntimeSettings:
@@ -62,14 +65,18 @@ class WorkNotifySettingsService:
         current = self.get_runtime_settings()
         app_key = current.app_key
         app_secret = current.app_secret
+        contacts_cookie = current.contacts_cookie
         if request_data.app_key is not None:
             app_key = request_data.app_key.strip() or None
         if request_data.app_secret is not None:
             app_secret = request_data.app_secret.strip() or None
+        if request_data.contacts_cookie is not None:
+            contacts_cookie = request_data.contacts_cookie.strip() or None
         saved = self.work_notify_store.save_runtime_settings(
             WorkNotifyRuntimeSettings(
                 app_key=app_key,
                 app_secret=app_secret,
+                contacts_cookie=contacts_cookie,
                 created_at=current.created_at,
                 updated_at=_utc_now(),
             )

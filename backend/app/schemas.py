@@ -155,6 +155,8 @@ class WorkNotifySettings(BaseModel):
     app_key: str = ""
     has_app_secret: bool = False
     app_secret_masked: str | None = None
+    has_contacts_cookie: bool = False
+    contacts_cookie_masked: str | None = None
 
 
 class WorkNotifyRuntimeSettings(BaseModel):
@@ -162,6 +164,7 @@ class WorkNotifyRuntimeSettings(BaseModel):
 
     app_key: str | None = None
     app_secret: str | None = None
+    contacts_cookie: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -171,6 +174,7 @@ class UpdateWorkNotifySettingsRequest(BaseModel):
 
     app_key: str | None = None
     app_secret: str | None = None
+    contacts_cookie: str | None = None
 
 
 class MailTestRequest(BaseModel):

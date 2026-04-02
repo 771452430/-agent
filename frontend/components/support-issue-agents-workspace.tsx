@@ -1415,7 +1415,7 @@ export function SupportIssueAgentsWorkspace() {
                 />
               </label>
               <label className="grid gap-1 text-sm">
-                <span className="text-slate-400">登记人列</span>
+                <span className="text-slate-400">登记人列（邮箱/短账号）</span>
                 <input
                   list="support-agent-feishu-fields"
                   className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
@@ -1457,7 +1457,7 @@ export function SupportIssueAgentsWorkspace() {
               <div>
                 <div className="text-sm font-medium text-slate-100">人工确认通知路由</div>
                 <div className="mt-1 text-xs text-slate-500">
-                  按“模块列”当前值匹配负责人 userId；未命中时走兜底负责人。登记人通知会从“登记人列”中提取 userId。
+                  按“模块列”当前值匹配负责人 userId；未命中时走兜底负责人。登记人通知会优先读取“登记人列”，拿不到邮箱/短账号时再自动尝试表内域名/邮箱列。
                 </div>
               </div>
               <button
