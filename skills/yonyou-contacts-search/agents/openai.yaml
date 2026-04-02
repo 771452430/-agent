@@ -1,0 +1,4 @@
+interface:
+  display_name: "用友联系人查询"
+  short_description: "按短账号或邮箱查询用友联系人并返回原始 JSON"
+  default_prompt: "Use $yonyou-contacts-search to ask me for a fresh Cookie, query a Yonyou contact by short account or email, and return the raw JSON response."
