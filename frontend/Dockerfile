@@ -2,6 +2,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
+RUN apk add --no-cache wget
+
 COPY frontend/package.json frontend/package-lock.json ./
 
 RUN npm ci
