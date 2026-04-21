@@ -28,6 +28,18 @@ def _env_csv(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return values or default
 
 
+def _env_optional_str(name: str, default: str | None = None) -> str | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value or None
+
+
+DEFAULT_CORS_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
+DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+
+
 @dataclass(frozen=True)
 class AppSettings:
     """集中定义项目运行期配置。"""
@@ -47,8 +59,8 @@ class AppSettings:
     rag_embedding_provider: str | None = os.getenv("RAG_EMBEDDING_PROVIDER")
     rag_embedding_model: str | None = os.getenv("RAG_EMBEDDING_MODEL")
     rag_embedding_timeout_seconds: int = int(os.getenv("RAG_EMBEDDING_TIMEOUT_SECONDS", "20"))
-    cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
-    cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
+    cors_origins: tuple[str, ...] = _env_csv("APP_CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
+    cors_origin_regex: str | None = _env_optional_str("APP_CORS_ORIGIN_REGEX", DEFAULT_CORS_ORIGIN_REGEX)
     langsmith_project: str | None = os.getenv("LANGSMITH_PROJECT")
     watcher_scheduler_interval_seconds: int = int(os.getenv("WATCHER_SCHEDULER_INTERVAL_SECONDS", "15"))
     support_issue_scheduler_interval_seconds: int = int(
