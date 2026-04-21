@@ -43,6 +43,7 @@ import type {
   SupportIssueCaseCandidate,
   SupportIssueDigestRun,
   SupportIssueFeedbackSyncResponse,
+  SupportIssueGraphTraceEvent,
   SupportIssueInsights,
   SupportIssueOwnerRule,
   SupportIssueRun
@@ -182,6 +183,77 @@ function buildEmptyOwnerRule(): SupportIssueOwnerRule {
     module_value: "",
     yht_user_id: ""
   };
+}
+
+function formatTracePayloadPreview(payloadPreview: Record<string, unknown>) {
+  const entries = Object.entries(payloadPreview);
+  if (entries.length === 0) return "";
+  return entries
+    .map(([key, value]) => {
+      const normalizedValue =
+        typeof value === "string" ? value : value == null ? "-" : JSON.stringify(value);
+      return `${key}=${normalizedValue}`;
+    })
+    .join(" · ");
+}
+
+function traceStatusTone(status: SupportIssueGraphTraceEvent["status"]) {
+  if (status === "failed") return "border-rose-400/30 bg-rose-400/10 text-rose-100";
+  if (status === "skipped") return "border-amber-400/30 bg-amber-400/10 text-amber-100";
+  return "border-emerald-400/30 bg-emerald-400/10 text-emerald-100";
+}
+
+type SupportIssueTraceViewerProps = {
+  title: string;
+  trace: SupportIssueGraphTraceEvent[];
+  emptyText?: string;
+  defaultOpen?: boolean;
+};
+
+function SupportIssueTraceViewer({
+  title,
+  trace,
+  emptyText = "当前还没有执行轨迹。",
+  defaultOpen = false
+}: SupportIssueTraceViewerProps) {
+  if (trace.length === 0) {
+    return (
+      <div className="mt-3 rounded-xl border border-dashed border-slate-700 px-3 py-3 text-xs text-slate-500">
+        {emptyText}
+      </div>
+    );
+  }
+
+  return (
+    <details
+      className="mt-3 rounded-2xl border border-slate-800 bg-slate-950/50"
+      open={defaultOpen}
+    >
+      <summary className="cursor-pointer list-none px-3 py-3 text-xs font-medium text-slate-300">
+        {title} · {trace.length} 个节点
+      </summary>
+      <div className="space-y-2 border-t border-slate-800 px-3 py-3">
+        {trace.map((item, index) => {
+          const payloadText = formatTracePayloadPreview(item.payload_preview);
+          return (
+            <div key={`${item.node}-${item.started_at}-${index}`} className="rounded-xl border border-slate-800 bg-slate-900/70 p-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-medium text-slate-100">{item.node}</span>
+                <span className={`rounded-full border px-2 py-0.5 text-[11px] ${traceStatusTone(item.status)}`}>
+                  {item.status}
+                </span>
+                <span className="text-[11px] text-slate-500">{item.phase}</span>
+                <span className="text-[11px] text-slate-500">{formatDate(item.started_at)}</span>
+              </div>
+              {item.message !== "" && <div className="mt-2 text-xs leading-6 text-slate-300">{item.message}</div>}
+              {item.record_id && <div className="mt-1 text-[11px] text-slate-500">record_id：{item.record_id}</div>}
+              {payloadText !== "" && <div className="mt-2 text-[11px] leading-5 text-slate-500">{payloadText}</div>}
+            </div>
+          );
+        })}
+      </div>
+    </details>
+  );
 }
 
 /** 构造统一的校验失败对象，方便前端复用同一套展示逻辑。 */
@@ -1583,7 +1655,12 @@ export function SupportIssueAgentsWorkspace() {
 
           {feedbackSyncResult != null && (
             <div className="mt-4 rounded-2xl border border-cyan-400/20 bg-cyan-400/10 px-4 py-3 text-sm text-cyan-100">
-              {feedbackSyncResult.summary}
+              <div>{feedbackSyncResult.summary}</div>
+              <SupportIssueTraceViewer
+                title="最近一次同步轨迹"
+                trace={feedbackSyncResult.graph_trace}
+                emptyText="最近一次同步还没有可展示的 trace。"
+              />
             </div>
           )}
 
@@ -1707,6 +1784,7 @@ export function SupportIssueAgentsWorkspace() {
                   <div>失败：{run.failed_count}</div>
                 </div>
                 {run.error_message && <div className="mt-3 text-xs text-rose-300">{run.error_message}</div>}
+                <SupportIssueTraceViewer title="执行轨迹" trace={run.graph_trace} />
 
                 {run.row_results.length > 0 && (
                   <div className="mt-4 space-y-3">
@@ -1718,6 +1796,8 @@ export function SupportIssueAgentsWorkspace() {
                         </div>
                         <div className="mt-2 text-xs leading-6 text-slate-400">{rowResult.message}</div>
                         <div className="mt-2 grid gap-1 text-xs text-slate-500">
+                          <div>来源页签：{rowResult.source_table_name || rowResult.source_table_id || "-"}</div>
+                          <div>原始 record_id：{rowResult.source_record_id || rowResult.record_id || "-"}</div>
                           <div>问题分类：{rowResult.question_category || "-"}</div>
                           <div>命中知识数：{rowResult.retrieval_hit_count}</div>
                           <div>置信度：{formatPercent(rowResult.confidence_score)}</div>
@@ -1741,6 +1821,7 @@ export function SupportIssueAgentsWorkspace() {
                             打开相关链接
                           </a>
                         )}
+                        <SupportIssueTraceViewer title="单行轨迹" trace={rowResult.graph_trace} />
                       </div>
                     ))}
                   </div>
@@ -1791,6 +1872,7 @@ export function SupportIssueAgentsWorkspace() {
                     </div>
                   )}
                   {run.error_message && <div className="mt-3 text-xs text-rose-300">{run.error_message}</div>}
+                  <SupportIssueTraceViewer title="汇总轨迹" trace={run.graph_trace} />
                 </div>
               ))}
               {digestRuns.length === 0 && (

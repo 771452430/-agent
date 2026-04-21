@@ -119,6 +119,24 @@ export type UpdateWorkNotifySettingsRequest = Partial<{
   contacts_cookie: string;
 }>;
 
+export type RagEmbeddingSettings = {
+  configured: boolean;
+  config_source: "environment" | "database" | "fallback";
+  runtime_mode: "provider" | "hashing";
+  provider_id: string;
+  model: string;
+  timeout_seconds: number;
+  preferred_backend: string;
+  indexed_backend: string;
+  reindex_required: boolean;
+};
+
+export type UpdateRagEmbeddingSettingsRequest = Partial<{
+  provider_id: string;
+  model: string;
+  timeout_seconds: number;
+}>;
+
 export type GitLabImportSettings = {
   configured: boolean;
   has_token: boolean;
@@ -224,6 +242,8 @@ export type Citation = {
   tree_path?: string | null;
   relative_path?: string | null;
   source_type?: string | null;
+  heading_path?: string | null;
+  metadata: Record<string, unknown>;
 };
 
 export type ToolEvent = {
@@ -307,6 +327,7 @@ export type KnowledgeDocument = {
   created_at: string;
   error_message?: string | null;
   external_url?: string | null;
+  metadata: Record<string, unknown>;
 };
 
 export type KnowledgeTreeNode = {
@@ -355,6 +376,56 @@ export type GitLabTreeImportResponse = {
   documents: KnowledgeDocument[];
 };
 
+export type RetrievalProfile = "default" | "support_issue";
+
+export type RAGQueryVariant = {
+  label: string;
+  query: string;
+  source: string;
+};
+
+export type RAGQueryBundle = {
+  original_query: string;
+  normalized_query: string;
+  rewritten_query: string;
+  keyword_queries: string[];
+  sub_queries: string[];
+  must_terms: string[];
+  filters: Record<string, string>;
+  query_variants: RAGQueryVariant[];
+};
+
+export type RetrievalCandidateDebug = {
+  chunk_id: string;
+  document_id: string;
+  document_name: string;
+  snippet: string;
+  tree_id?: string | null;
+  tree_path?: string | null;
+  relative_path?: string | null;
+  source_type?: string | null;
+  heading_path?: string | null;
+  metadata: Record<string, unknown>;
+  source_query: string;
+  query_label: string;
+  matched_query_labels: string[];
+  lexical_score: number;
+  vector_score: number;
+  fused_score: number;
+  relevance_score: number;
+  useful_for_answer: boolean;
+  reason: string;
+};
+
+export type RetrievalDebugInfo = {
+  retrieval_profile: RetrievalProfile;
+  query_bundle: RAGQueryBundle;
+  candidate_count: number;
+  selected_count: number;
+  selected_chunks: RetrievalCandidateDebug[];
+  rerank_preview: RetrievalCandidateDebug[];
+};
+
 export type RetrievalResult = {
   query: string;
   scope_type: ScopeType;
@@ -367,6 +438,7 @@ export type RetrievalResult = {
     document_name: string;
     external_url: string;
   }>;
+  debug?: RetrievalDebugInfo | null;
 };
 
 export type AgentConfig = {
@@ -398,12 +470,14 @@ export type WatcherRunStatus = "success" | "no_change" | "baseline_seeded" | "pa
 export type WatcherMatchSource = "rule" | "llm" | "unmatched";
 export type WatcherAssignmentStatus = "pending" | "success" | "failed" | "skipped" | "unmatched";
 export type WatcherRequestMethod = "GET" | "POST";
+export type WatcherMatchMode = "llm_fallback" | "fixed_match";
 
 export type OwnerRule = {
   assignee_code: string;
   services: string[];
   modules: string[];
   keywords: string[];
+  customer_issue_types: string[];
   assignment_payload_template?: Record<string, unknown> | null;
   owner_name?: string | null;
   owner_email?: string | null;
@@ -412,10 +486,14 @@ export type OwnerRule = {
 export type ParsedBug = {
   bug_id: string;
   bug_aid: string;
+  jira_issue_id: string;
+  jira_form_token: string;
+  jira_atl_token: string;
   title: string;
   service: string;
   module: string;
   category: string;
+  customer_issue_type: string;
   status: string;
   assignee: string;
   reporter: string;
@@ -427,6 +505,9 @@ export type ParsedBug = {
 export type WatcherAssignmentResult = {
   bug_id: string;
   bug_aid: string;
+  jira_issue_id: string;
+  jira_form_token: string;
+  jira_atl_token: string;
   title: string;
   service: string;
   module: string;
@@ -449,6 +530,12 @@ export type WatcherAgentConfig = {
   request_method: WatcherRequestMethod;
   request_headers: Record<string, string>;
   request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: WatcherRequestMethod;
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
+  match_mode: WatcherMatchMode;
   poll_interval_minutes: number;
   sender_email: string;
   recipient_emails: string[];
@@ -491,6 +578,7 @@ export type WatcherFetchTestResponse = {
   request_method: WatcherRequestMethod;
   request_headers: Record<string, string>;
   request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
   response_content_type: string;
   response_body_preview: string;
   parsed_item_count: number;
@@ -508,6 +596,8 @@ export type SupportIssueRunStatus = "success" | "no_change" | "partial_success" 
 export type SupportIssueRowResultStatus = "generated" | "manual_review" | "no_hit" | "failed";
 export type SupportIssueCaseCandidateStatus = "pending_review" | "approved";
 export type SupportIssueDigestRunStatus = "success" | "failed";
+export type SupportIssueGraphTracePhase = "run" | "row" | "feedback" | "digest";
+export type SupportIssueGraphTraceStatus = "success" | "skipped" | "failed";
 
 export type SupportIssueFeedbackSnapshot = {
   result: string;
@@ -515,8 +605,54 @@ export type SupportIssueFeedbackSnapshot = {
   comment: string;
 };
 
+export type SupportIssueClassificationResult = {
+  category: string;
+  composed_query: string;
+  reasoning: string;
+  supervisor_notes: string;
+};
+
+export type SupportIssueEvidenceResult = {
+  retrieval_hit_count: number;
+  evidence_summary: string;
+  no_hit: boolean;
+  source_note: string;
+};
+
+export type SupportIssueDraftResult = {
+  solution: string;
+  reasoning: string;
+  used_similar_case_count: number;
+};
+
+export type SupportIssueReviewResult = {
+  judge_status: "pass" | "manual_review";
+  confidence_score: number;
+  judge_reason: string;
+  progress_value: string;
+  reviewer_notes: string;
+};
+
+/**
+ * 轻量执行轨迹：前端只展示节点摘要，不承载整份运行状态。
+ */
+export type SupportIssueGraphTraceEvent = {
+  node: string;
+  phase: SupportIssueGraphTracePhase;
+  status: SupportIssueGraphTraceStatus;
+  started_at: string;
+  ended_at: string;
+  message: string;
+  record_id?: string | null;
+  payload_preview: Record<string, unknown>;
+};
+
 export type SupportIssueRowResult = {
   record_id: string;
+  source_record_id: string;
+  source_table_id: string;
+  source_table_name: string;
+  source_bitable_url: string;
   question: string;
   status: SupportIssueRowResultStatus;
   solution: string;
@@ -529,6 +665,11 @@ export type SupportIssueRowResult = {
   question_category: string;
   similar_case_count: number;
   feedback_snapshot?: SupportIssueFeedbackSnapshot | null;
+  classification_result?: SupportIssueClassificationResult | null;
+  evidence_result?: SupportIssueEvidenceResult | null;
+  draft_result?: SupportIssueDraftResult | null;
+  review_result?: SupportIssueReviewResult | null;
+  graph_trace: SupportIssueGraphTraceEvent[];
 };
 
 export type SupportIssueAgentConfig = {
@@ -590,6 +731,7 @@ export type SupportIssueRun = {
   summary: string;
   error_message?: string | null;
   row_results: SupportIssueRowResult[];
+  graph_trace: SupportIssueGraphTraceEvent[];
 };
 
 export type SupportIssueCategoryStat = {
@@ -646,6 +788,7 @@ export type SupportIssueFeedbackSyncResponse = {
   candidate_created_count: number;
   candidate_updated_count: number;
   summary: string;
+  graph_trace: SupportIssueGraphTraceEvent[];
 };
 
 export type SupportIssueCaseCandidate = {
@@ -704,6 +847,7 @@ export type SupportIssueDigestRun = {
   knowledge_gap_suggestions: string[];
   new_candidate_count: number;
   approved_candidate_count: number;
+  graph_trace: SupportIssueGraphTraceEvent[];
 };
 
 

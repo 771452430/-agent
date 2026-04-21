@@ -44,6 +44,9 @@ class AppSettings:
     default_model: str = "learning-mode"
     default_temperature: float = 0.2
     default_max_tokens: int = 1024
+    rag_embedding_provider: str | None = os.getenv("RAG_EMBEDDING_PROVIDER")
+    rag_embedding_model: str | None = os.getenv("RAG_EMBEDDING_MODEL")
+    rag_embedding_timeout_seconds: int = int(os.getenv("RAG_EMBEDDING_TIMEOUT_SECONDS", "20"))
     cors_origins: tuple[str, ...] = ("http://localhost:3000", "http://127.0.0.1:3000")
     cors_origin_regex: str = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
     langsmith_project: str | None = os.getenv("LANGSMITH_PROJECT")

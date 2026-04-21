@@ -15,6 +15,7 @@ import { GitLabImportSettingsPanel } from "./gitlab-import-settings-panel";
 import { MailSettingsPanel } from "./mail-settings-panel";
 import { ModelSettingsPanel } from "./model-settings-panel";
 import { useModelSettings } from "./model-settings-provider";
+import { RagEmbeddingSettingsPanel } from "./rag-embedding-settings-panel";
 import { WorkNotifySettingsPanel } from "./work-notify-settings-panel";
 
 const NAV_ITEMS = [
@@ -28,7 +29,14 @@ const NAV_ITEMS = [
 export function WorkbenchShell(props: { children: ReactNode }) {
   const pathname = usePathname();
   const [isUtilityMenuOpen, setIsUtilityMenuOpen] = useState(false);
-  const { openFeishuSettings, openGitLabImportSettings, openMailSettings, openModelSettings, openWorkNotifySettings } =
+  const {
+    openFeishuSettings,
+    openGitLabImportSettings,
+    openMailSettings,
+    openModelSettings,
+    openRagEmbeddingSettings,
+    openWorkNotifySettings
+  } =
     useModelSettings();
 
   useEffect(() => {
@@ -123,6 +131,16 @@ export function WorkbenchShell(props: { children: ReactNode }) {
               <button
                   className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
                 onClick={() => {
+                  openRagEmbeddingSettings();
+                  setIsUtilityMenuOpen(false);
+                }}
+              >
+                  <div className="font-medium text-white">RAG Embedding 设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">统一管理知识库向量化使用的 Provider、Model 和索引重建</div>
+              </button>
+              <button
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
+                onClick={() => {
                   openWorkNotifySettings();
                   setIsUtilityMenuOpen(false);
                 }}
@@ -162,6 +180,7 @@ export function WorkbenchShell(props: { children: ReactNode }) {
       <MailSettingsPanel />
       <FeishuSettingsPanel />
       <WorkNotifySettingsPanel />
+      <RagEmbeddingSettingsPanel />
       <GitLabImportSettingsPanel />
     </div>
   );

@@ -44,6 +44,7 @@ from .schemas import (
     MailTestResponse,
     ProviderConfig,
     ProviderTestResponse,
+    RAGEmbeddingSettings,
     RetrievalQueryRequest,
     RetrievalResult,
     RunSupportIssueAgentRequest,
@@ -63,6 +64,7 @@ from .schemas import (
     UpdateKnowledgeDocumentRequest,
     UpdateMailSettingsRequest,
     UpdateProviderRequest,
+    UpdateRAGEmbeddingSettingsRequest,
     UpdateWorkNotifySettingsRequest,
     UpdateSupportIssueAgentRequest,
     UpdateAgentRequest,
@@ -86,6 +88,8 @@ from .services.llm_service import LLMService
 from .services.mail_service import MailService
 from .services.mail_settings_store import MailSettingsStore
 from .services.provider_store import ProviderStore
+from .services.rag_embedding_settings_service import RAGEmbeddingSettingsService
+from .services.rag_embedding_settings_store import RAGEmbeddingSettingsStore
 from .services.support_issue_scheduler import SupportIssueScheduler
 from .services.support_issue_service import SupportIssueService
 from .services.support_issue_store import SupportIssueStore
@@ -108,7 +112,15 @@ provider_store = ProviderStore(settings.sqlite_path)
 mail_store = MailSettingsStore(settings.sqlite_path)
 feishu_store = FeishuSettingsStore(settings.sqlite_path)
 gitlab_settings_store = GitLabSettingsStore(settings.sqlite_path)
-knowledge_store = KnowledgeStore(settings.sqlite_path, settings.chroma_dir)
+rag_embedding_settings_store = RAGEmbeddingSettingsStore(settings.sqlite_path)
+rag_embedding_settings_service = RAGEmbeddingSettingsService(rag_embedding_settings_store, settings)
+knowledge_store = KnowledgeStore(
+    settings.sqlite_path,
+    settings.chroma_dir,
+    provider_store=provider_store,
+    settings=settings,
+    rag_embedding_settings_service=rag_embedding_settings_service,
+)
 watcher_store = WatcherStore(settings.sqlite_path)
 support_issue_store = SupportIssueStore(settings.sqlite_path)
 work_notify_settings_store = WorkNotifySettingsStore(settings.sqlite_path)
@@ -260,6 +272,31 @@ def get_work_notify_settings() -> WorkNotifySettings:
 @app.patch("/api/settings/work-notify", response_model=WorkNotifySettings)
 def update_work_notify_settings(request: UpdateWorkNotifySettingsRequest) -> WorkNotifySettings:
     return yonyou_work_notify_settings_service.update_work_notify_settings(request)
+
+
+@app.get("/api/settings/rag-embedding", response_model=RAGEmbeddingSettings)
+def get_rag_embedding_settings() -> RAGEmbeddingSettings:
+    selection = knowledge_store.embedding_service.describe_runtime_selection()
+    return RAGEmbeddingSettings(
+        configured=selection.source != "fallback",
+        config_source=selection.source,
+        runtime_mode="provider"
+        if selection.preferred_backend != knowledge_store.embedding_service.hashing_model_name
+        else "hashing",
+        provider_id=selection.provider_id,
+        model=selection.model_name,
+        timeout_seconds=selection.timeout_seconds,
+        preferred_backend=selection.preferred_backend,
+        indexed_backend=knowledge_store.indexed_embedding_backend,
+        reindex_required=knowledge_store.indexed_embedding_backend not in {"", selection.preferred_backend},
+    )
+
+
+@app.patch("/api/settings/rag-embedding", response_model=RAGEmbeddingSettings)
+def update_rag_embedding_settings(request: UpdateRAGEmbeddingSettingsRequest) -> RAGEmbeddingSettings:
+    rag_embedding_settings_service.update_rag_embedding_settings(request)
+    knowledge_store.rebuild_vector_index()
+    return get_rag_embedding_settings()
 
 
 @app.get("/api/settings/gitlab-import", response_model=GitLabImportSettings)

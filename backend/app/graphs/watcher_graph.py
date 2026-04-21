@@ -72,6 +72,7 @@ class WatcherAgentGraph:
         *,
         llm_service: LLMService,
         fetch_dashboard_json: Callable[[WatcherAgentConfig], tuple[Any, int]],
+        hydrate_bug_details: Callable[[WatcherAgentConfig, list[ParsedBug]], list[ParsedBug]],
         get_seen_bug_ids: Callable[[str], set[str]],
         call_assignment_api: Callable[[WatcherAgentConfig, list[WatcherAssignmentResult]], list[WatcherAssignmentResult]],
         send_email: Callable[[WatcherAgentConfig, str, str, str | None], None],
@@ -79,6 +80,7 @@ class WatcherAgentGraph:
     ) -> None:
         self.llm_service = llm_service
         self.fetch_dashboard_json_callback = fetch_dashboard_json
+        self.hydrate_bug_details_callback = hydrate_bug_details
         self.get_seen_bug_ids_callback = get_seen_bug_ids
         self.call_assignment_api_callback = call_assignment_api
         self.send_email_callback = send_email
@@ -89,6 +91,7 @@ class WatcherAgentGraph:
         builder = StateGraph(WatcherGraphState)
         builder.add_node("fetch_dashboard_json", self.fetch_dashboard_json)
         builder.add_node("extract_bug_list", self.extract_bug_list)
+        builder.add_node("hydrate_bug_details", self.hydrate_bug_details)
         builder.add_node("detect_new_bugs", self.detect_new_bugs)
         builder.add_node("match_owner_rules", self.match_owner_rules)
         builder.add_node("llm_assign_fallback", self.llm_assign_fallback)
@@ -106,8 +109,9 @@ class WatcherAgentGraph:
         builder.add_conditional_edges(
             "extract_bug_list",
             self._route_after_extract,
-            {"detect": "detect_new_bugs", "persist": "persist_run"},
+            {"hydrate": "hydrate_bug_details", "persist": "persist_run"},
         )
+        builder.add_edge("hydrate_bug_details", "detect_new_bugs")
         builder.add_conditional_edges(
             "detect_new_bugs",
             self._route_after_detect,
@@ -128,8 +132,8 @@ class WatcherAgentGraph:
     def _route_after_fetch(self, state: WatcherGraphState) -> Literal["extract", "persist"]:
         return "persist" if state.get("error_message") else "extract"
 
-    def _route_after_extract(self, state: WatcherGraphState) -> Literal["detect", "persist"]:
-        return "persist" if state.get("error_message") else "detect"
+    def _route_after_extract(self, state: WatcherGraphState) -> Literal["hydrate", "persist"]:
+        return "persist" if state.get("error_message") else "hydrate"
 
     def _route_after_detect(self, state: WatcherGraphState) -> Literal["match", "compose", "persist"]:
         run_status = state.get("run_status")
@@ -143,6 +147,9 @@ class WatcherAgentGraph:
         return "match"
 
     def _route_after_match(self, state: WatcherGraphState) -> Literal["llm", "assign"]:
+        watcher = state["watcher"]
+        if watcher.match_mode == "fixed_match":
+            return "assign"
         return "llm" if len(state.get("unmatched_bugs", [])) > 0 else "assign"
 
     def fetch_dashboard_json(self, state: WatcherGraphState) -> dict[str, Any]:
@@ -161,10 +168,13 @@ class WatcherAgentGraph:
 
     def extract_bug_list(self, state: WatcherGraphState) -> dict[str, Any]:
         watcher = state["watcher"]
-        bugs = self.llm_service.extract_bug_list(
-            dashboard_payload=state.get("raw_dashboard"),
-            model_config=watcher.model_settings,
-        )
+        if watcher.match_mode == "fixed_match":
+            bugs = self.llm_service.preview_bug_list_from_payload(state.get("raw_dashboard"))
+        else:
+            bugs = self.llm_service.extract_bug_list(
+                dashboard_payload=state.get("raw_dashboard"),
+                model_config=watcher.model_settings,
+            )
         if len(bugs) == 0:
             return {
                 "parsed_bugs": [],
@@ -174,9 +184,25 @@ class WatcherAgentGraph:
             }
         return {"parsed_bugs": bugs}
 
+    def hydrate_bug_details(self, state: WatcherGraphState) -> dict[str, Any]:
+        watcher = state["watcher"]
+        parsed_bugs = state.get("parsed_bugs", [])
+        try:
+            return {"parsed_bugs": self.hydrate_bug_details_callback(watcher, parsed_bugs)}
+        except Exception:
+            return {"parsed_bugs": parsed_bugs}
+
     def detect_new_bugs(self, state: WatcherGraphState) -> dict[str, Any]:
         watcher = state["watcher"]
         parsed_bugs = state.get("parsed_bugs", [])
+        if watcher.match_mode == "fixed_match":
+            return {
+                "new_bugs": [],
+                "assignment_bugs": parsed_bugs,
+                "force_assign_snapshot": True,
+                "run_status": "success",
+                "summary": f"固定匹配模式：本轮全量抓取 {len(parsed_bugs)} 个 Bug，准备按规则遍历转派。",
+            }
         seen_bug_ids = self.get_seen_bug_ids_callback(watcher.id)
         force_email_snapshot = bool(state.get("force_email_snapshot"))
         force_assign_snapshot = bool(state.get("force_assign_snapshot"))
@@ -247,14 +273,15 @@ class WatcherAgentGraph:
                 matched.append(term)
         return matched
 
-    def _match_rule(self, bug: ParsedBug, rule: OwnerRule) -> tuple[int, str]:
+    def _match_rule(self, bug: ParsedBug, rule: OwnerRule, *, keyword_haystack: str) -> tuple[int, str]:
         if rule.assignee_code.strip() == "":
             return 0, ""
         service_hits = self._match_terms(bug.service, rule.services)
         module_hits = self._match_terms(bug.module, rule.modules)
-        keyword_hits = self._match_terms(" ".join([bug.title, bug.raw_excerpt, bug.status]), rule.keywords)
+        keyword_hits = self._match_terms(keyword_haystack, rule.keywords)
+        customer_issue_type_hits = self._match_terms(bug.customer_issue_type, rule.customer_issue_types)
 
-        score = len(service_hits) * 3 + len(module_hits) * 3 + len(keyword_hits)
+        score = len(service_hits) * 3 + len(module_hits) * 3 + len(keyword_hits) + len(customer_issue_type_hits) * 3
         reasons: list[str] = []
         if service_hits:
             reasons.append("service 命中：" + "、".join(service_hits))
@@ -262,6 +289,8 @@ class WatcherAgentGraph:
             reasons.append("module 命中：" + "、".join(module_hits))
         if keyword_hits:
             reasons.append("keyword 命中：" + "、".join(keyword_hits))
+        if customer_issue_type_hits:
+            reasons.append("客户问题类型命中：" + "、".join(customer_issue_type_hits))
         return score, "；".join(reasons)
 
     def match_owner_rules(self, state: WatcherGraphState) -> dict[str, Any]:
@@ -273,8 +302,9 @@ class WatcherAgentGraph:
             best_rule: OwnerRule | None = None
             best_score = 0
             best_reason = ""
+            keyword_haystack = bug.title if watcher.match_mode == "fixed_match" else " ".join([bug.title, bug.raw_excerpt, bug.status])
             for rule in watcher.owner_rules:
-                score, reason = self._match_rule(bug, rule)
+                score, reason = self._match_rule(bug, rule, keyword_haystack=keyword_haystack)
                 if score > best_score:
                     best_rule = rule
                     best_score = score
@@ -288,6 +318,9 @@ class WatcherAgentGraph:
                 WatcherAssignmentResult(
                     bug_id=bug.bug_id,
                     bug_aid=bug.bug_aid,
+                    jira_issue_id=bug.jira_issue_id,
+                    jira_form_token=bug.jira_form_token,
+                    jira_atl_token=bug.jira_atl_token,
                     title=bug.title,
                     service=bug.service,
                     module=bug.module,
@@ -317,6 +350,9 @@ class WatcherAgentGraph:
                     WatcherAssignmentResult(
                         bug_id=bug.bug_id,
                         bug_aid=bug.bug_aid,
+                        jira_issue_id=bug.jira_issue_id,
+                        jira_form_token=bug.jira_form_token,
+                        jira_atl_token=bug.jira_atl_token,
                         title=bug.title,
                         service=bug.service,
                         module=bug.module,
@@ -333,6 +369,9 @@ class WatcherAgentGraph:
                     WatcherAssignmentResult(
                         bug_id=bug.bug_id,
                         bug_aid=bug.bug_aid,
+                        jira_issue_id=bug.jira_issue_id,
+                        jira_form_token=bug.jira_form_token,
+                        jira_atl_token=bug.jira_atl_token,
                         title=bug.title,
                         service=bug.service,
                         module=bug.module,
@@ -340,9 +379,9 @@ class WatcherAgentGraph:
                         raw_excerpt=bug.raw_excerpt,
                         assignee_code=None,
                         match_source="unmatched",
-                        match_reason=suggestion.reason or "规则和 LLM 兜底都没有找到经办人编码。",
+                        match_reason=suggestion.reason or "规则和 LLM 兜底都没有找到转派目标。",
                         assignment_status="unmatched",
-                        assignment_message="未匹配经办人编码，未调用分配接口。",
+                        assignment_message="未匹配转派目标，未调用分配接口。",
                     )
                 )
         return {"assignment_results": results, "unmatched_bugs": []}
@@ -381,6 +420,8 @@ class WatcherAgentGraph:
                 f"当前列表分配 {len(assignment_results)} 条"
                 + (f" / 新增 {new_bug_count} 条" if new_bug_count > 0 else "")
             )
+        elif assign_current_list:
+            subject = f"[巡检 Agent] {watcher.name} 立即执行结果：当前列表未命中转派规则"
         elif len(assignment_results) > 0 and len(snapshot_bugs) > 0:
             subject = (
                 f"[巡检 Agent] {watcher.name} 立即执行结果："

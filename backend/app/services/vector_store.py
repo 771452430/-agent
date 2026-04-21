@@ -30,6 +30,8 @@ class ChunkVectorRecord:
     tree_path: str
     relative_path: str
     source_type: str
+    heading_path: str = ""
+    metadata_json: str = "{}"
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ class VectorSearchHit:
     tree_path: str
     relative_path: str
     source_type: str
+    heading_path: str
+    metadata_json: str
     distance: float
 
 
@@ -95,6 +99,8 @@ class KnowledgeVectorStore:
                     "tree_path": record.tree_path,
                     "relative_path": record.relative_path,
                     "source_type": record.source_type,
+                    "heading_path": record.heading_path,
+                    "metadata_json": record.metadata_json,
                 }
                 for record in records
             ],
@@ -140,6 +146,8 @@ class KnowledgeVectorStore:
                     tree_path=str(metadata.get("tree_path") or "/"),
                     relative_path=str(metadata.get("relative_path") or ""),
                     source_type=str(metadata.get("source_type") or "txt"),
+                    heading_path=str(metadata.get("heading_path") or ""),
+                    metadata_json=str(metadata.get("metadata_json") or "{}"),
                     distance=float(distance if distance is not None else 1.0),
                 )
             )

@@ -15,18 +15,20 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
 import subprocess
 import quopri
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from tempfile import NamedTemporaryFile
+from typing import Any
 from uuid import uuid4
 
 from ..schemas import (
@@ -37,9 +39,14 @@ from ..schemas import (
     KnowledgeTreeNode,
     KnowledgeTreeNodeDetail,
     KnowledgeTreeResponse,
+    RetrievalCandidateDebug,
+    RetrievalProfile,
     ScopeType,
 )
+from ..settings import AppSettings
 from .embedding_service import EmbeddingService
+from .provider_store import ProviderStore
+from .rag_embedding_settings_service import RAGEmbeddingSettingsService
 from .vector_store import ChunkVectorRecord, KnowledgeVectorStore, VectorSearchHit
 
 
@@ -62,6 +69,19 @@ class ScoredCitation:
     vector_score: float = 0.0
     lexical_rank: int | None = None
     vector_rank: int | None = None
+
+
+@dataclass(frozen=True)
+class StructuredChunk:
+    """结构化切片结果。
+
+    `heading_path` 表示文档内部的小节路径，
+    后续会用于 lexical 加权、证据卡片展示和 rerank 理由解释。
+    """
+
+    content: str
+    heading_path: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 class _HtmlTextExtractor(HTMLParser):
@@ -123,7 +143,15 @@ class _HtmlTextExtractor(HTMLParser):
 class KnowledgeStore:
     """统一管理知识树、文档入库和检索。"""
 
-    def __init__(self, sqlite_path: Path, chroma_dir: Path) -> None:
+    def __init__(
+        self,
+        sqlite_path: Path,
+        chroma_dir: Path,
+        *,
+        provider_store: ProviderStore | None = None,
+        settings: AppSettings | None = None,
+        rag_embedding_settings_service: RAGEmbeddingSettingsService | None = None,
+    ) -> None:
         # 初始化顺序很重要：
         # 1. 先准备数据库表和旧数据兼容；
         # 2. 再修复历史文档格式；
@@ -131,11 +159,16 @@ class KnowledgeStore:
         # 这样即使向量库不可用，最基础的 lexical 检索仍然可以工作。
         self.sqlite_path = sqlite_path
         self.chroma_dir = chroma_dir
-        self.embedding_service = EmbeddingService()
+        self.embedding_service = EmbeddingService(
+            provider_store=provider_store,
+            settings=settings,
+            rag_embedding_settings_service=rag_embedding_settings_service,
+        )
         self.vector_store: KnowledgeVectorStore | None = None
-        self._embedding_backend = self.embedding_service.model_name
+        self._embedding_backend = self.embedding_service.describe_runtime_selection().preferred_backend
         self._retrieval_backend = "lexical"
         self._init_db()
+        self._embedding_backend = self._load_indexed_embedding_backend() or self._embedding_backend
         self._repair_legacy_doc_documents()
         self._init_vector_store()
 
@@ -191,7 +224,8 @@ class KnowledgeStore:
                     chunk_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     error_message TEXT,
-                    external_url TEXT
+                    external_url TEXT,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
                 );
 
                 CREATE TABLE IF NOT EXISTS knowledge_chunks (
@@ -204,7 +238,15 @@ class KnowledgeStore:
                     tree_path TEXT NOT NULL DEFAULT '/',
                     relative_path TEXT NOT NULL DEFAULT '',
                     source_type TEXT NOT NULL DEFAULT 'txt',
+                    heading_path TEXT NOT NULL DEFAULT '',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS knowledge_runtime_state (
+                    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+                    indexed_embedding_backend TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
                 );
                 """
             )
@@ -212,10 +254,13 @@ class KnowledgeStore:
             self._ensure_column(conn, "knowledge_documents", "node_id", "TEXT NOT NULL DEFAULT 'root'")
             self._ensure_column(conn, "knowledge_documents", "relative_path", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "knowledge_documents", "external_url", "TEXT")
+            self._ensure_column(conn, "knowledge_documents", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "knowledge_chunks", "node_id", "TEXT NOT NULL DEFAULT 'root'")
             self._ensure_column(conn, "knowledge_chunks", "tree_path", "TEXT NOT NULL DEFAULT '/'")
             self._ensure_column(conn, "knowledge_chunks", "relative_path", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(conn, "knowledge_chunks", "source_type", "TEXT NOT NULL DEFAULT 'txt'")
+            self._ensure_column(conn, "knowledge_chunks", "heading_path", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "knowledge_chunks", "metadata_json", "TEXT NOT NULL DEFAULT '{}'")
 
             now = _utc_now().isoformat()
             conn.execute(
@@ -230,8 +275,20 @@ class KnowledgeStore:
             conn.execute(
                 "UPDATE knowledge_documents SET relative_path = name WHERE relative_path IS NULL OR relative_path = ''"
             )
+            conn.execute(
+                "UPDATE knowledge_documents SET metadata_json = '{}' "
+                "WHERE metadata_json IS NULL OR metadata_json = ''"
+            )
             conn.execute("UPDATE knowledge_chunks SET node_id = 'root' WHERE node_id IS NULL OR node_id = ''")
             conn.execute("UPDATE knowledge_chunks SET tree_path = '/' WHERE tree_path IS NULL OR tree_path = ''")
+            conn.execute(
+                "UPDATE knowledge_chunks SET heading_path = '' "
+                "WHERE heading_path IS NULL"
+            )
+            conn.execute(
+                "UPDATE knowledge_chunks SET metadata_json = '{}' "
+                "WHERE metadata_json IS NULL OR metadata_json = ''"
+            )
             conn.execute(
                 """
                 UPDATE knowledge_chunks
@@ -253,10 +310,32 @@ class KnowledgeStore:
                 """
             )
 
+    def _load_indexed_embedding_backend(self) -> str:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT indexed_embedding_backend FROM knowledge_runtime_state WHERE singleton_id = 1"
+            ).fetchone()
+        return str(row["indexed_embedding_backend"] or "").strip() if row is not None else ""
+
+    def _save_indexed_embedding_backend(self, backend_name: str) -> None:
+        normalized = str(backend_name or "").strip()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO knowledge_runtime_state (singleton_id, indexed_embedding_backend, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    indexed_embedding_backend = excluded.indexed_embedding_backend,
+                    updated_at = excluded.updated_at
+                """,
+                (normalized, _utc_now().isoformat()),
+            )
+
     def _load_ready_chunk_records(self, document_id: str | None = None) -> list[ChunkVectorRecord]:
         sql = """
             SELECT kc.id, kc.document_id, kc.node_id, kc.document_name,
-                   kc.content, kc.tree_path, kc.relative_path, kc.source_type
+                   kc.content, kc.tree_path, kc.relative_path, kc.source_type,
+                   kc.heading_path, kc.metadata_json
             FROM knowledge_chunks kc
             JOIN knowledge_documents kd ON kd.id = kc.document_id
             WHERE kd.status = 'ready'
@@ -274,10 +353,14 @@ class KnowledgeStore:
         if self.vector_store is None or not records:
             return
         batch_size = 500
+        last_backend = self.embedding_service.describe_runtime_selection().preferred_backend
         for start in range(0, len(records), batch_size):
             batch_records = records[start : start + batch_size]
             embeddings = self.embedding_service.embed_documents([record.content for record in batch_records])
             self.vector_store.upsert_chunks(batch_records, embeddings)
+            last_backend = self.embedding_service.model_name
+        self._embedding_backend = last_backend
+        self._save_indexed_embedding_backend(last_backend)
 
     def _reconstruct_chunk_text(self, chunks: list[str], max_overlap: int = 200) -> str:
         if not chunks:
@@ -412,9 +495,24 @@ class KnowledgeStore:
         if self.vector_store is None:
             return
         records = self._load_ready_chunk_records()
-        if self.vector_store.count() == len(records):
+        indexed_backend = self._load_indexed_embedding_backend()
+        if self.vector_store.count() == len(records) and indexed_backend != "":
+            self._embedding_backend = indexed_backend
             return
+        self.rebuild_vector_index()
+
+    def rebuild_vector_index(self) -> None:
+        """按当前 embedding 运行时配置全量重建知识库向量索引。"""
+
+        if self.vector_store is None:
+            return
+        records = self._load_ready_chunk_records()
         self.vector_store.reset()
+        if not records:
+            backend = self.embedding_service.describe_runtime_selection().preferred_backend
+            self._embedding_backend = backend
+            self._save_indexed_embedding_backend(backend)
+            return
         self._index_chunk_records(records)
 
     def _normalize_relative_path(self, relative_path: str | None, fallback_name: str) -> str:
@@ -465,6 +563,7 @@ class KnowledgeStore:
         return row
 
     def _row_to_document(self, row: sqlite3.Row) -> KnowledgeDocument:
+        metadata = self._parse_metadata_json(row["metadata_json"] if "metadata_json" in row.keys() else "{}")
         return KnowledgeDocument(
             id=row["id"],
             node_id=row["node_id"],
@@ -476,9 +575,20 @@ class KnowledgeStore:
             created_at=datetime.fromisoformat(row["created_at"]),
             error_message=row["error_message"],
             external_url=row["external_url"],
+            metadata=metadata,
         )
 
+    def _parse_metadata_json(self, raw: str | None) -> dict[str, Any]:
+        if raw is None or raw == "":
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
     def _row_to_citation(self, row: sqlite3.Row) -> Citation:
+        metadata = self._parse_metadata_json(row["metadata_json"] if "metadata_json" in row.keys() else "{}")
         return Citation(
             document_id=row["document_id"],
             document_name=row["document_name"],
@@ -488,9 +598,12 @@ class KnowledgeStore:
             tree_path=row["tree_path"],
             relative_path=row["relative_path"],
             source_type=row["source_type"],
+            heading_path=row["heading_path"] if "heading_path" in row.keys() else "",
+            metadata=metadata,
         )
 
     def _vector_hit_to_citation(self, hit: VectorSearchHit) -> Citation:
+        metadata = self._parse_metadata_json(hit.metadata_json)
         return Citation(
             document_id=hit.document_id,
             document_name=hit.document_name,
@@ -500,6 +613,8 @@ class KnowledgeStore:
             tree_path=hit.tree_path,
             relative_path=hit.relative_path,
             source_type=hit.source_type,
+            heading_path=hit.heading_path,
+            metadata=metadata,
         )
 
     def _row_to_chunk_record(self, row: sqlite3.Row) -> ChunkVectorRecord:
@@ -512,6 +627,8 @@ class KnowledgeStore:
             tree_path=row["tree_path"],
             relative_path=row["relative_path"],
             source_type=row["source_type"],
+            heading_path=row["heading_path"] if "heading_path" in row.keys() else "",
+            metadata_json=row["metadata_json"] if "metadata_json" in row.keys() else "{}",
         )
 
     def _serialize_tree(self) -> KnowledgeTreeResponse:
@@ -824,6 +941,7 @@ class KnowledgeStore:
         *,
         node_id: str | None = None,
         relative_path: str | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> KnowledgeDocument:
         """把单个文件挂到某个知识树节点下，并完成解析、切分和入库。"""
         target_node = self._require_node_row(node_id)
@@ -831,14 +949,15 @@ class KnowledgeStore:
         file_type = Path(filename).suffix.lower().lstrip(".") or "txt"
         created_at = _utc_now().isoformat()
         normalized_relative_path = self._normalize_relative_path(relative_path, filename)
+        document_metadata = dict(metadata or {})
 
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO knowledge_documents (
-                    id, node_id, name, type, relative_path, status, chunk_count, created_at, error_message
+                    id, node_id, name, type, relative_path, status, chunk_count, created_at, error_message, metadata_json
                 )
-                VALUES (?, ?, ?, ?, ?, 'processing', 0, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, 'processing', 0, ?, NULL, ?)
                 """,
                 (
                     document_id,
@@ -847,6 +966,7 @@ class KnowledgeStore:
                     file_type,
                     normalized_relative_path,
                     created_at,
+                    json.dumps(document_metadata, ensure_ascii=False),
                 ),
             )
 
@@ -861,6 +981,7 @@ class KnowledgeStore:
                 tree_path=target_node["path"],
                 source_type=file_type,
                 chunks=chunks,
+                document_metadata=document_metadata,
             )
             vector_warning: str | None = None
             try:
@@ -998,19 +1119,160 @@ class KnowledgeStore:
             raise RuntimeError(f"DOC 解析失败：{message}")
         return self._normalize_legacy_doc_text(result.stdout)
 
-    def _split_text(self, text: str, chunk_size: int = 700, overlap: int = 100) -> list[str]:
-        cleaned = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-        if not cleaned:
-            raise RuntimeError("文档解析后没有可索引内容")
+    def _structured_blocks(self, text: str) -> list[StructuredChunk]:
+        """把原始文本先拆成带标题路径的结构块。"""
+
+        normalized_lines = [line.rstrip() for line in str(text or "").splitlines()]
+        heading_stack: list[str] = []
+        blocks: list[StructuredChunk] = []
+        current_lines: list[str] = []
+        current_heading_path = ""
+        in_code_block = False
+
+        def flush_current_block() -> None:
+            nonlocal current_lines, current_heading_path
+            content = "\n".join(line.strip() for line in current_lines if line.strip() != "").strip()
+            if content == "":
+                current_lines = []
+                return
+            blocks.append(
+                StructuredChunk(
+                    content=content,
+                    heading_path=current_heading_path,
+                    metadata={"heading_path": current_heading_path},
+                )
+            )
+            current_lines = []
+
+        for raw_line in normalized_lines:
+            stripped = raw_line.strip()
+            if stripped.startswith("```"):
+                if not in_code_block:
+                    flush_current_block()
+                    current_heading_path = " / ".join(heading_stack)
+                    current_lines = [raw_line]
+                    in_code_block = True
+                else:
+                    current_lines.append(raw_line)
+                    flush_current_block()
+                    in_code_block = False
+                continue
+
+            if in_code_block:
+                current_lines.append(raw_line)
+                continue
+
+            heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+            if heading_match:
+                flush_current_block()
+                level = len(heading_match.group(1))
+                title = heading_match.group(2).strip()
+                if title != "":
+                    heading_stack = heading_stack[: level - 1]
+                    heading_stack.append(title)
+                current_heading_path = " / ".join(heading_stack)
+                continue
+
+            if stripped == "":
+                flush_current_block()
+                current_heading_path = " / ".join(heading_stack)
+                continue
+
+            if re.match(r"^([-*]|\d+\.)\s+", stripped):
+                flush_current_block()
+                blocks.append(
+                    StructuredChunk(
+                        content=stripped,
+                        heading_path=" / ".join(heading_stack),
+                        metadata={"heading_path": " / ".join(heading_stack), "block_type": "list_item"},
+                    )
+                )
+                current_heading_path = " / ".join(heading_stack)
+                continue
+
+            current_heading_path = " / ".join(heading_stack)
+            current_lines.append(raw_line)
+
+        flush_current_block()
+        return blocks
+
+    def _sliding_window_text(self, text: str, *, chunk_size: int, overlap: int) -> list[str]:
         chunks: list[str] = []
         start = 0
-        while start < len(cleaned):
-            end = min(len(cleaned), start + chunk_size)
-            chunks.append(cleaned[start:end])
-            if end >= len(cleaned):
+        while start < len(text):
+            end = min(len(text), start + chunk_size)
+            chunks.append(text[start:end])
+            if end >= len(text):
                 break
             start = max(0, end - overlap)
         return chunks
+
+    def _split_text(self, text: str, chunk_size: int = 520, overlap: int = 80) -> list[StructuredChunk]:
+        """按标题、段落、列表和代码块做结构化切片。"""
+
+        blocks = self._structured_blocks(text)
+        if not blocks:
+            raise RuntimeError("文档解析后没有可索引内容")
+
+        chunks: list[StructuredChunk] = []
+        current_parts: list[str] = []
+        current_heading_path = ""
+        for block in blocks:
+            block_text = block.content.strip()
+            if block_text == "":
+                continue
+
+            # 如果单个结构块过长，单独按滑窗切开，避免标题路径丢失。
+            if len(block_text) > chunk_size:
+                if current_parts:
+                    merged = "\n\n".join(current_parts).strip()
+                    chunks.append(
+                        StructuredChunk(
+                            content=merged,
+                            heading_path=current_heading_path,
+                            metadata={"heading_path": current_heading_path},
+                        )
+                    )
+                    current_parts = []
+                for window in self._sliding_window_text(block_text, chunk_size=chunk_size, overlap=overlap):
+                    chunks.append(
+                        StructuredChunk(
+                            content=window.strip(),
+                            heading_path=block.heading_path,
+                            metadata=dict(block.metadata),
+                        )
+                    )
+                current_heading_path = ""
+                continue
+
+            candidate_parts = [*current_parts, block_text]
+            candidate_text = "\n\n".join(candidate_parts).strip()
+            if current_parts and (
+                len(candidate_text) > chunk_size or block.heading_path != current_heading_path
+            ):
+                merged = "\n\n".join(current_parts).strip()
+                chunks.append(
+                    StructuredChunk(
+                        content=merged,
+                        heading_path=current_heading_path,
+                        metadata={"heading_path": current_heading_path},
+                    )
+                )
+                overlap_seed = merged[-overlap:].strip()
+                current_parts = [overlap_seed] if overlap_seed != "" else []
+
+            current_heading_path = block.heading_path
+            current_parts.append(block_text)
+
+        if current_parts:
+            chunks.append(
+                StructuredChunk(
+                    content="\n\n".join(current_parts).strip(),
+                    heading_path=current_heading_path,
+                    metadata={"heading_path": current_heading_path},
+                )
+            )
+        return [chunk for chunk in chunks if chunk.content.strip() != ""]
 
     def _store_chunks(
         self,
@@ -1021,10 +1283,12 @@ class KnowledgeStore:
         relative_path: str,
         tree_path: str,
         source_type: str,
-        chunks: list[str],
+        chunks: list[StructuredChunk],
+        document_metadata: dict[str, Any] | None = None,
     ) -> list[ChunkVectorRecord]:
         now = _utc_now().isoformat()
         records: list[ChunkVectorRecord] = []
+        base_metadata = dict(document_metadata or {})
         rows = [
             (
                 chunk_id,
@@ -1032,13 +1296,21 @@ class KnowledgeStore:
                 node_id,
                 document_name,
                 index,
-                content,
+                chunk.content,
                 tree_path,
                 relative_path,
                 source_type,
+                chunk.heading_path,
+                json.dumps(
+                    {
+                        **base_metadata,
+                        **chunk.metadata,
+                    },
+                    ensure_ascii=False,
+                ),
                 now,
             )
-            for index, content in enumerate(chunks)
+            for index, chunk in enumerate(chunks)
             for chunk_id in [str(uuid4())]
         ]
         for row in rows:
@@ -1052,6 +1324,8 @@ class KnowledgeStore:
                     tree_path=row[6],
                     relative_path=row[7],
                     source_type=row[8],
+                    heading_path=row[9],
+                    metadata_json=row[10],
                 )
             )
         with self._connect() as conn:
@@ -1059,9 +1333,9 @@ class KnowledgeStore:
                 """
                 INSERT INTO knowledge_chunks (
                     id, document_id, node_id, document_name, chunk_index, content,
-                    tree_path, relative_path, source_type, created_at
+                    tree_path, relative_path, source_type, heading_path, metadata_json, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1104,6 +1378,153 @@ class KnowledgeStore:
                 tokens.update(part[index : index + 2] for index in range(0, len(part) - 1))
         return [token for token in tokens if token]
 
+    def _is_identifier_token(self, token: str) -> bool:
+        normalized = token.strip().lower()
+        if normalized == "":
+            return False
+        return bool(re.search(r"\d", normalized) or re.search(r"[._:/-]", normalized) or len(normalized) >= 8)
+
+    def _score_text_matches(self, *, text: str, tokens: list[str], exact_query: str, base_weight: float) -> float:
+        lowered = text.lower()
+        if lowered == "":
+            return 0.0
+
+        score = 0.0
+        if exact_query != "" and exact_query in lowered:
+            score += base_weight * 3.0
+        for token in tokens:
+            if token not in lowered:
+                continue
+            token_weight = base_weight * (2.0 if self._is_identifier_token(token) else 1.0)
+            score += token_weight
+        return score
+
+    def _profile_priority_boost(
+        self,
+        *,
+        retrieval_profile: RetrievalProfile,
+        query: str,
+        candidate: RetrievalCandidateDebug,
+    ) -> float:
+        if retrieval_profile != "support_issue":
+            return 0.0
+
+        metadata = candidate.metadata
+        boost = 0.0
+        if metadata.get("source") == "approved_case" or (candidate.relative_path or "").startswith("支持案例库/"):
+            boost += 0.18
+
+        normalized_query = query.lower().strip()
+        identifier_terms = [token for token in self._query_tokens(query) if self._is_identifier_token(token)]
+        title_text = " ".join(
+            [
+                candidate.document_name or "",
+                candidate.relative_path or "",
+                candidate.heading_path or "",
+            ]
+        ).lower()
+        for token in identifier_terms:
+            if token in title_text:
+                boost += 0.08
+        if normalized_query != "" and normalized_query in title_text:
+            boost += 0.05
+        return min(boost, 0.35)
+
+    def _row_to_candidate(self, row: sqlite3.Row) -> RetrievalCandidateDebug:
+        citation = self._row_to_citation(row)
+        return RetrievalCandidateDebug(
+            chunk_id=citation.chunk_id,
+            document_id=citation.document_id,
+            document_name=citation.document_name,
+            snippet=citation.snippet,
+            tree_id=citation.tree_id,
+            tree_path=citation.tree_path,
+            relative_path=citation.relative_path,
+            source_type=citation.source_type,
+            heading_path=citation.heading_path,
+            metadata=citation.metadata,
+        )
+
+    def _vector_hit_to_candidate(self, hit: VectorSearchHit) -> RetrievalCandidateDebug:
+        citation = self._vector_hit_to_citation(hit)
+        return RetrievalCandidateDebug(
+            chunk_id=citation.chunk_id,
+            document_id=citation.document_id,
+            document_name=citation.document_name,
+            snippet=citation.snippet,
+            tree_id=citation.tree_id,
+            tree_path=citation.tree_path,
+            relative_path=citation.relative_path,
+            source_type=citation.source_type,
+            heading_path=citation.heading_path,
+            metadata=citation.metadata,
+        )
+
+    def search_candidates(
+        self,
+        query: str,
+        *,
+        limit: int = 6,
+        scope_type: ScopeType = "global",
+        scope_id: str | None = None,
+        retrieval_profile: RetrievalProfile = "default",
+    ) -> list[RetrievalCandidateDebug]:
+        """返回带打分信息的候选片段，供上层做多 query 合并和 rerank。"""
+
+        lexical_hits = self._lexical_search(
+            query,
+            limit=max(limit * 3, 12),
+            scope_type=scope_type,
+            scope_id=scope_id,
+            retrieval_profile=retrieval_profile,
+        )
+        vector_hits = self._vector_search(
+            query,
+            limit=max(limit * 3, 12),
+            scope_type=scope_type,
+            scope_id=scope_id,
+            retrieval_profile=retrieval_profile,
+        )
+
+        if lexical_hits and vector_hits:
+            return self._fuse_search_results(query, lexical_hits, vector_hits, limit, retrieval_profile=retrieval_profile)
+        if vector_hits:
+            candidates: list[RetrievalCandidateDebug] = []
+            for rank, hit in enumerate(vector_hits[:limit], start=1):
+                candidate = self._vector_hit_to_candidate(hit)
+                vector_score = self._vector_score_from_distance(hit.distance)
+                fused_score = self._rrf_score(rank) + self._profile_priority_boost(
+                    retrieval_profile=retrieval_profile,
+                    query=query,
+                    candidate=candidate,
+                )
+                candidates.append(
+                    candidate.model_copy(
+                        update={
+                            "vector_score": vector_score,
+                            "fused_score": fused_score,
+                        }
+                    )
+                )
+            return candidates
+        candidates = []
+        for rank, (lexical_score, row) in enumerate(lexical_hits[:limit], start=1):
+            candidate = self._row_to_candidate(row)
+            fused_score = self._rrf_score(rank) + self._profile_priority_boost(
+                retrieval_profile=retrieval_profile,
+                query=query,
+                candidate=candidate,
+            )
+            candidates.append(
+                candidate.model_copy(
+                    update={
+                        "lexical_score": float(lexical_score),
+                        "fused_score": fused_score,
+                    }
+                )
+            )
+        return candidates
+
     def search(
         self,
         query: str,
@@ -1111,6 +1532,7 @@ class KnowledgeStore:
         limit: int = 6,
         scope_type: ScopeType = "global",
         scope_id: str | None = None,
+        retrieval_profile: RetrievalProfile = "default",
     ) -> list[Citation]:
         """执行按范围过滤后的 Hybrid 检索。
 
@@ -1118,26 +1540,28 @@ class KnowledgeStore:
         先根据 scope_type / scope_id 算出允许命中的 node 集合，
         再在这些节点下分别做 lexical / vector 召回，并最终融合排序。
         """
-        # 两路召回都会放大到 `limit` 的数倍，原因是：
-        # 先各自多拿一些候选，再做融合排序，通常比“每路只拿很少几个”更稳。
-        lexical_hits = self._lexical_search(
+        candidates = self.search_candidates(
             query,
-            limit=max(limit * 3, 12),
+            limit=limit,
             scope_type=scope_type,
             scope_id=scope_id,
+            retrieval_profile=retrieval_profile,
         )
-        vector_hits = self._vector_search(
-            query,
-            limit=max(limit * 3, 12),
-            scope_type=scope_type,
-            scope_id=scope_id,
-        )
-
-        if lexical_hits and vector_hits:
-            return self._fuse_search_results(lexical_hits, vector_hits, limit)
-        if vector_hits:
-            return [self._vector_hit_to_citation(hit) for hit in vector_hits[:limit]]
-        return [self._row_to_citation(row) for _, row in lexical_hits[:limit]]
+        return [
+            Citation(
+                document_id=item.document_id,
+                document_name=item.document_name,
+                chunk_id=item.chunk_id,
+                snippet=item.snippet,
+                tree_id=item.tree_id,
+                tree_path=item.tree_path,
+                relative_path=item.relative_path,
+                source_type=item.source_type,
+                heading_path=item.heading_path,
+                metadata=item.metadata,
+            )
+            for item in candidates
+        ]
 
     def _lexical_search(
         self,
@@ -1146,12 +1570,13 @@ class KnowledgeStore:
         limit: int,
         scope_type: ScopeType,
         scope_id: str | None,
+        retrieval_profile: RetrievalProfile,
     ) -> list[tuple[float, sqlite3.Row]]:
         """保留原有 lexical 检索，作为 Hybrid 的一个召回来源。"""
 
         sql = """
             SELECT kc.id, kc.document_id, kc.node_id, kc.document_name, kc.content,
-                   kc.tree_path, kc.relative_path, kc.source_type
+                   kc.tree_path, kc.relative_path, kc.source_type, kc.heading_path, kc.metadata_json
             FROM knowledge_chunks kc
             JOIN knowledge_documents kd ON kd.id = kc.document_id
             WHERE kd.status = 'ready'
@@ -1169,23 +1594,25 @@ class KnowledgeStore:
             rows = conn.execute(sql, params).fetchall()
 
         tokens = self._query_tokens(query)
-        scored: list[tuple[int, sqlite3.Row]] = []
+        exact_query = query.strip().lower()
+        scored: list[tuple[float, sqlite3.Row]] = []
         for row in rows:
-            haystack = " ".join(
-                [
-                    row["document_name"] or "",
-                    row["relative_path"] or "",
-                    row["tree_path"] or "",
-                    row["content"] or "",
-                ]
+            title_text = " ".join(
+                [row["document_name"] or "", row["heading_path"] or ""]
             ).lower()
-            score = 0
-            for token in tokens:
-                if token in haystack:
-                    score += 3 if token == query.lower().strip() else 1
-            if query.strip() and query.strip().lower() in haystack:
-                score += 4
+            path_text = " ".join([row["relative_path"] or "", row["tree_path"] or ""]).lower()
+            body_text = str(row["content"] or "").lower()
+            score = 0.0
+            score += self._score_text_matches(text=title_text, tokens=tokens, exact_query=exact_query, base_weight=2.6)
+            score += self._score_text_matches(text=path_text, tokens=tokens, exact_query=exact_query, base_weight=1.8)
+            score += self._score_text_matches(text=body_text, tokens=tokens, exact_query=exact_query, base_weight=0.9)
             if score > 0:
+                candidate = self._row_to_candidate(row)
+                score += self._profile_priority_boost(
+                    retrieval_profile=retrieval_profile,
+                    query=query,
+                    candidate=candidate,
+                )
                 scored.append((score, row))
 
         scored.sort(key=lambda item: item[0], reverse=True)
@@ -1198,6 +1625,7 @@ class KnowledgeStore:
         limit: int,
         scope_type: ScopeType,
         scope_id: str | None,
+        retrieval_profile: RetrievalProfile,
     ) -> list[VectorSearchHit]:
         """向量召回：先做 scope 过滤，再做 Chroma 相似度查询。"""
 
@@ -1210,6 +1638,16 @@ class KnowledgeStore:
                 return []
         try:
             query_embedding = self.embedding_service.embed_query(query)
+            indexed_backend = self._load_indexed_embedding_backend()
+            query_backend = self.embedding_service.model_name
+            if indexed_backend != "" and query_backend != indexed_backend:
+                # 查询侧如果因为 provider 不可用回退成 hashing，就不要拿它去查
+                # 另一套 embedding 建出来的向量索引，否则分数会失真。
+                return []
+            if indexed_backend != "":
+                self._embedding_backend = indexed_backend
+            else:
+                self._embedding_backend = query_backend
             return self.vector_store.query(query_embedding=query_embedding, limit=limit, node_ids=scope_node_ids)
         except Exception:
             return []
@@ -1222,56 +1660,70 @@ class KnowledgeStore:
 
     def _fuse_search_results(
         self,
+        query: str,
         lexical_hits: list[tuple[float, sqlite3.Row]],
         vector_hits: list[VectorSearchHit],
         limit: int,
-    ) -> list[Citation]:
+        *,
+        retrieval_profile: RetrievalProfile,
+    ) -> list[RetrievalCandidateDebug]:
         """用 RRF 融合 lexical 和 vector 两个召回列表。"""
 
         # `merged` 以 chunk_id 为键，表示“同一个片段无论被哪一路命中，最终都汇总到一起打分”。
-        merged: dict[str, ScoredCitation] = {}
+        merged: dict[str, RetrievalCandidateDebug] = {}
 
         for rank, (lexical_score, row) in enumerate(lexical_hits, start=1):
-            citation = self._row_to_citation(row)
-            merged[citation.chunk_id] = ScoredCitation(
-                citation=citation,
-                fused_score=self._rrf_score(rank),
-                lexical_score=float(lexical_score),
-                lexical_rank=rank,
+            candidate = self._row_to_candidate(row)
+            merged[candidate.chunk_id] = candidate.model_copy(
+                update={
+                    "lexical_score": float(lexical_score),
+                    "fused_score": self._rrf_score(rank),
+                }
             )
 
         for rank, hit in enumerate(vector_hits, start=1):
-            citation = self._vector_hit_to_citation(hit)
+            candidate = self._vector_hit_to_candidate(hit)
             vector_score = self._vector_score_from_distance(hit.distance)
-            existing = merged.get(citation.chunk_id)
+            existing = merged.get(candidate.chunk_id)
             if existing is None:
-                merged[citation.chunk_id] = ScoredCitation(
-                    citation=citation,
-                    fused_score=self._rrf_score(rank),
-                    vector_score=vector_score,
-                    vector_rank=rank,
+                merged[candidate.chunk_id] = candidate.model_copy(
+                    update={
+                        "vector_score": vector_score,
+                        "fused_score": self._rrf_score(rank),
+                    }
                 )
                 continue
-            merged[citation.chunk_id] = ScoredCitation(
-                citation=existing.citation,
-                fused_score=existing.fused_score + self._rrf_score(rank) + 0.02,
-                lexical_score=existing.lexical_score,
-                vector_score=vector_score,
-                lexical_rank=existing.lexical_rank,
-                vector_rank=rank,
+            merged[candidate.chunk_id] = existing.model_copy(
+                update={
+                    "vector_score": max(existing.vector_score, vector_score),
+                    "fused_score": existing.fused_score + self._rrf_score(rank) + 0.02,
+                }
             )
 
+        boosted: list[RetrievalCandidateDebug] = []
+        for candidate in merged.values():
+            boost = self._profile_priority_boost(
+                retrieval_profile=retrieval_profile,
+                query=query,
+                candidate=candidate,
+            )
+            boosted.append(candidate.model_copy(update={"fused_score": candidate.fused_score + boost}))
+
         ranked = sorted(
-            merged.values(),
+            boosted,
             key=lambda item: (
                 item.fused_score,
                 item.lexical_score + item.vector_score,
-                1 if item.lexical_rank is not None and item.vector_rank is not None else 0,
+                item.metadata.get("source") == "approved_case",
             ),
             reverse=True,
         )
-        return [item.citation for item in ranked[:limit]]
+        return ranked[:limit]
 
     @property
     def backend_name(self) -> str:
         return f"{self._retrieval_backend}:{self._embedding_backend}"
+
+    @property
+    def indexed_embedding_backend(self) -> str:
+        return self._load_indexed_embedding_backend() or self._embedding_backend

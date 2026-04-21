@@ -27,6 +27,7 @@ import type {
   ModelConfig,
   ProviderConfig,
   ProviderTestResponse,
+  RagEmbeddingSettings,
   RetrievalResult,
   ScopeType,
   SupportIssueAgentConfig,
@@ -41,6 +42,7 @@ import type {
   ThreadSummary,
   UpdateMailSettingsRequest,
   UpdateProviderRequest,
+  UpdateRagEmbeddingSettingsRequest,
   UpdateWorkNotifySettingsRequest,
   WatcherAgentConfig,
   WatcherFetchTestResponse,
@@ -161,6 +163,22 @@ export async function updateWorkNotifySettings(input: UpdateWorkNotifySettingsRe
     body: JSON.stringify(input)
   });
   return parseJson<WorkNotifySettings>(response);
+}
+
+export async function getRagEmbeddingSettings(): Promise<RagEmbeddingSettings> {
+  const response = await fetch(API_BASE + "/api/settings/rag-embedding", { cache: "no-store" });
+  return parseJson<RagEmbeddingSettings>(response);
+}
+
+export async function updateRagEmbeddingSettings(
+  input: UpdateRagEmbeddingSettingsRequest
+): Promise<RagEmbeddingSettings> {
+  const response = await fetch(API_BASE + "/api/settings/rag-embedding", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<RagEmbeddingSettings>(response);
 }
 
 export async function getGitLabImportSettings(): Promise<GitLabImportSettings> {
@@ -429,6 +447,7 @@ export async function queryRetrieval(input: {
   query: string;
   scope_type: ScopeType;
   scope_id?: string | null;
+  retrieval_profile?: "default" | "support_issue";
   model_config?: ModelConfig;
 }): Promise<RetrievalResult> {
   const response = await fetch(API_BASE + "/api/retrieval/query", {
@@ -518,6 +537,12 @@ export async function createWatcher(input: {
   request_method: "GET" | "POST";
   request_headers: Record<string, string>;
   request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: "GET" | "POST";
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
+  match_mode: "llm_fallback" | "fixed_match";
   poll_interval_minutes: number;
   sender_email: string;
   recipient_emails: string[];
@@ -528,6 +553,7 @@ export async function createWatcher(input: {
     services: string[];
     modules: string[];
     keywords: string[];
+    customer_issue_types: string[];
     assignment_payload_template?: Record<string, unknown> | null;
   }>;
 }): Promise<WatcherAgentConfig> {
@@ -548,6 +574,12 @@ export async function updateWatcher(
     request_method: "GET" | "POST";
     request_headers: Record<string, string>;
     request_body_json?: Record<string, unknown> | null;
+    request_body_text?: string | null;
+    detail_url_template?: string | null;
+    detail_request_method: "GET" | "POST";
+    detail_request_headers: Record<string, string>;
+    detail_request_body_text?: string | null;
+    match_mode: "llm_fallback" | "fixed_match";
     poll_interval_minutes: number;
     sender_email: string;
     recipient_emails: string[];
@@ -558,6 +590,7 @@ export async function updateWatcher(
       services: string[];
       modules: string[];
       keywords: string[];
+      customer_issue_types: string[];
       assignment_payload_template?: Record<string, unknown> | null;
     }>;
   }>
@@ -575,6 +608,11 @@ export async function testWatcherFetch(input: {
   request_method: "GET" | "POST";
   request_headers: Record<string, string>;
   request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: "GET" | "POST";
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
 }): Promise<WatcherFetchTestResponse> {
   const response = await fetch(API_BASE + "/api/watchers/test-fetch", {
     method: "POST",

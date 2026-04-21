@@ -23,6 +23,7 @@ import type {
   WatcherAgentConfig,
   WatcherAssignmentResult,
   WatcherFetchTestResponse,
+  WatcherMatchMode,
   WatcherRequestMethod,
   WatcherRun
 } from "../lib/types";
@@ -43,6 +44,7 @@ type OwnerRuleFormState = {
   services_text: string;
   modules_text: string;
   keywords_text: string;
+  customer_issue_types_text: string;
 };
 
 type WatcherFormState = {
@@ -54,6 +56,12 @@ type WatcherFormState = {
   request_cookie: string;
   request_extra_headers_text: string;
   request_body_text: string;
+  detail_url_template: string;
+  detail_request_method: WatcherRequestMethod;
+  detail_request_cookie: string;
+  detail_request_extra_headers_text: string;
+  detail_request_body_text: string;
+  match_mode: WatcherMatchMode;
   poll_interval_minutes: number;
   recipient_emails_text: string;
   model_config: ModelConfig;
@@ -70,7 +78,7 @@ function formatDate(value?: string | null) {
 /** 把逗号、换行等分隔文本解析成字符串数组。 */
 function parseCommaList(value: string): string[] {
   return value
-    .split(/[\n,，;]/)
+    .split(/[\n,，;、]/)
     .map((item) => item.trim())
     .filter((item) => item !== "");
 }
@@ -117,6 +125,102 @@ function stripCookieHeader(headers: Record<string, string>): Record<string, stri
   );
 }
 
+/** 按不区分大小写的方式读取某个请求头。 */
+function readHeaderValue(headers: Record<string, string>, name: string): string {
+  const normalizedName = name.trim().toLowerCase();
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.trim().toLowerCase() === normalizedName) {
+      return String(value ?? "").trim();
+    }
+  }
+  return "";
+}
+
+function looksLikeFormUrlEncodedBody(bodyText: string): boolean {
+  const normalized = bodyText.trim();
+  if (normalized === "" || normalized.startsWith("{") || normalized.startsWith("[")) return false;
+  return normalized.includes("=") && (normalized.includes("&") || normalized.includes("%") || normalized.includes("+"));
+}
+
+/** 判断当前请求体应按 JSON 还是原始文本发送。 */
+function resolveRequestBodyMode(headers: Record<string, string>, bodyText: string): "json" | "raw" {
+  const contentType = readHeaderValue(headers, "content-type").toLowerCase();
+  if (contentType.includes("application/x-www-form-urlencoded")) return "raw";
+  if (contentType.includes("multipart/form-data")) return "raw";
+  if (contentType.includes("text/plain")) return "raw";
+  if (contentType.includes("application/json") || contentType.includes("+json")) return "json";
+
+  const normalizedBody = bodyText.trim();
+  if (normalizedBody === "") return "raw";
+  if (looksLikeFormUrlEncodedBody(normalizedBody)) return "raw";
+  try {
+    parseJsonObjectInput(normalizedBody, "请求体 JSON");
+    return "json";
+  } catch {
+    return "raw";
+  }
+}
+
+/** 把 curl 里的 $'...' ANSI-C 引号解码成普通引号，兼容 Jira 复制出来的 URL。 */
+function decodeAnsiCStringQuotedSegments(command: string): string {
+  let result = "";
+  let index = 0;
+
+  while (index < command.length) {
+    if (command[index] === "$" && command[index + 1] === "'") {
+      index += 2;
+      let segment = "";
+      while (index < command.length) {
+        const char = command[index];
+        if (char === "'") {
+          index += 1;
+          break;
+        }
+        if (char === "\\" && index + 1 < command.length) {
+          const next = command[index + 1];
+          if (next === "u" && /^[0-9a-fA-F]{4}$/.test(command.slice(index + 2, index + 6))) {
+            segment += String.fromCharCode(Number.parseInt(command.slice(index + 2, index + 6), 16));
+            index += 6;
+            continue;
+          }
+          if (next === "x" && /^[0-9a-fA-F]{2}$/.test(command.slice(index + 2, index + 4))) {
+            segment += String.fromCharCode(Number.parseInt(command.slice(index + 2, index + 4), 16));
+            index += 4;
+            continue;
+          }
+          if (next === "n") {
+            segment += "\n";
+            index += 2;
+            continue;
+          }
+          if (next === "t") {
+            segment += "\t";
+            index += 2;
+            continue;
+          }
+          if (next === "r") {
+            segment += "\r";
+            index += 2;
+            continue;
+          }
+          segment += next;
+          index += 2;
+          continue;
+        }
+        segment += char;
+        index += 1;
+      }
+      const escaped = segment.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+      result += `"${escaped}"`;
+      continue;
+    }
+    result += command[index];
+    index += 1;
+  }
+
+  return result;
+}
+
 /** 统一规范 HTTP 方法大小写。 */
 function normalizeMethod(value?: string | null): WatcherRequestMethod {
   return value?.toUpperCase() === "POST" ? "POST" : "GET";
@@ -125,7 +229,7 @@ function normalizeMethod(value?: string | null): WatcherRequestMethod {
 /** 对 curl 命令做轻量切词，为后续解析表单字段做准备。 */
 function shellTokenize(command: string): string[] {
   const tokens: string[] = [];
-  const normalized = command.replace(/\\\r?\n/g, " ");
+  const normalized = decodeAnsiCStringQuotedSegments(command).replace(/\\\r?\n/g, " ");
   let current = "";
   let quote: "'" | '"' | null = null;
   let escaping = false;
@@ -248,14 +352,6 @@ function parseCurlCommand(command: string): {
     throw new Error("没有从 curl 里解析到 URL。");
   }
 
-  if (sawData && requestBodyText.trim() !== "") {
-    try {
-      JSON.parse(requestBodyText);
-    } catch (cause) {
-      throw new Error(`curl 里的请求体不是合法 JSON：${cause instanceof Error ? cause.message : String(cause)}`);
-    }
-  }
-
   return {
     dashboard_url: dashboardUrl.trim(),
     request_method: requestMethod,
@@ -272,7 +368,14 @@ function emptyRule(): OwnerRuleFormState {
     services_text: "",
     modules_text: "",
     keywords_text: "",
+    customer_issue_types_text: "",
   };
+}
+
+function normalizeDetailTemplateText(value: string): string {
+  return value
+    .replace(/\b[A-Z][A-Z0-9]+-\d+\b/g, "{{bug_id}}")
+    .replace(/([?&]_)=\d{8,}/g, "$1={{timestamp_ms}}");
 }
 
 function buildEmptyForm(): WatcherFormState {
@@ -284,6 +387,12 @@ function buildEmptyForm(): WatcherFormState {
     request_cookie: "",
     request_extra_headers_text: "",
     request_body_text: "",
+    detail_url_template: "",
+    detail_request_method: "GET",
+    detail_request_cookie: "",
+    detail_request_extra_headers_text: "",
+    detail_request_body_text: "",
+    match_mode: "llm_fallback",
     poll_interval_minutes: 30,
     recipient_emails_text: "",
     model_config: DEFAULT_MODEL,
@@ -298,6 +407,7 @@ function ownerRuleToForm(rule: OwnerRule): OwnerRuleFormState {
     services_text: rule.services.join(", "),
     modules_text: rule.modules.join(", "),
     keywords_text: rule.keywords.join(", "),
+    customer_issue_types_text: rule.customer_issue_types.join("、"),
   };
 }
 
@@ -313,7 +423,21 @@ function watcherToForm(watcher: WatcherAgentConfig): WatcherFormState {
       Object.keys(stripCookieHeader(watcher.request_headers)).length > 0
         ? stringifyJson(stripCookieHeader(watcher.request_headers))
         : "",
-    request_body_text: watcher.request_body_json ? stringifyJson(watcher.request_body_json) : "",
+    request_body_text:
+      watcher.request_body_text != null && watcher.request_body_text.trim() !== ""
+        ? watcher.request_body_text
+        : watcher.request_body_json
+          ? stringifyJson(watcher.request_body_json)
+          : "",
+    detail_url_template: watcher.detail_url_template ?? "",
+    detail_request_method: watcher.detail_request_method ?? "GET",
+    detail_request_cookie: readCookieHeader(watcher.detail_request_headers),
+    detail_request_extra_headers_text:
+      Object.keys(stripCookieHeader(watcher.detail_request_headers)).length > 0
+        ? stringifyJson(stripCookieHeader(watcher.detail_request_headers))
+        : "",
+    detail_request_body_text: watcher.detail_request_body_text ?? "",
+    match_mode: watcher.match_mode ?? "llm_fallback",
     poll_interval_minutes: watcher.poll_interval_minutes,
     recipient_emails_text: watcher.recipient_emails.join(", "),
     model_config: watcher.model_config,
@@ -327,18 +451,26 @@ function normalizeOwnerRule(rule: OwnerRuleFormState): OwnerRule | null {
   const services = parseCommaList(rule.services_text);
   const modules = parseCommaList(rule.modules_text);
   const keywords = parseCommaList(rule.keywords_text);
+  const customerIssueTypes = parseCommaList(rule.customer_issue_types_text);
 
-  if (assigneeCode === "" && services.length === 0 && modules.length === 0 && keywords.length === 0) {
+  if (
+    assigneeCode === "" &&
+    services.length === 0 &&
+    modules.length === 0 &&
+    keywords.length === 0 &&
+    customerIssueTypes.length === 0
+  ) {
     return null;
   }
   if (assigneeCode === "") {
-    throw new Error("负责人规则里的经办人编码不能为空。");
+    throw new Error("负责人规则里的转派目标不能为空。");
   }
   return {
     assignee_code: assigneeCode,
     services,
     modules,
     keywords,
+    customer_issue_types: customerIssueTypes,
   };
 }
 
@@ -376,6 +508,7 @@ export function WatchersWorkspace() {
   const [runs, setRuns] = useState<WatcherRun[]>([]);
   const [form, setForm] = useState<WatcherFormState>(buildEmptyForm());
   const [curlDraft, setCurlDraft] = useState("");
+  const [detailCurlDraft, setDetailCurlDraft] = useState("");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [isSaving, setIsSaving] = useState(false);
@@ -385,6 +518,7 @@ export function WatchersWorkspace() {
   const [testResult, setTestResult] = useState<WatcherFetchTestResponse | null>(null);
   const [isBootstrapping, setIsBootstrapping] = useState(true);
   const modelValidation = validateModelConfig(form.model_config);
+  const requiresRunnableModel = form.match_mode !== "fixed_match";
 
   const selectedRun = useMemo(
     () => runs.find((item) => item.id === selectedRunId) ?? runs[0] ?? null,
@@ -445,25 +579,72 @@ export function WatchersWorkspace() {
     setTestResult(null);
   }
 
-  function buildFetchRequest() {
-    // 巡检抓取配置最终要还原成一个 HTTP 请求：
-    // URL、方法、Headers、Body 都从表单草稿拼出来。
+  function buildRequestHeaders(headersText: string, cookieText: string, label: string): Record<string, string> {
     const requestHeaders = Object.fromEntries(
-      Object.entries(parseJsonObjectInput(form.request_extra_headers_text, "附加请求头 JSON")).map(([key, value]) => [
+      Object.entries(parseJsonObjectInput(headersText, label)).map(([key, value]) => [
         key,
         String(value)
       ])
     );
-    if (form.request_cookie.trim() !== "") {
-      requestHeaders.Cookie = form.request_cookie.trim();
+    if (cookieText.trim() !== "") {
+      requestHeaders.Cookie = cookieText.trim();
+    }
+    return requestHeaders;
+  }
+
+  function buildMainFetchRequest() {
+    // 巡检抓取配置最终要还原成一个 HTTP 请求：
+    // URL、方法、Headers、Body 都从表单草稿拼出来。
+    const requestHeaders = buildRequestHeaders(form.request_extra_headers_text, form.request_cookie, "附加请求头 JSON");
+    const normalizedRequestBodyText = form.request_body_text.trim();
+    const requestBodyMode =
+      form.request_method === "POST"
+        ? resolveRequestBodyMode(requestHeaders, normalizedRequestBodyText)
+        : "raw";
+    let requestBodyJson: Record<string, unknown> | null = null;
+    if (form.request_method === "POST" && normalizedRequestBodyText !== "" && requestBodyMode === "json") {
+      try {
+        requestBodyJson = parseJsonObjectInput(normalizedRequestBodyText, "请求体 JSON");
+      } catch (cause) {
+        if (!looksLikeFormUrlEncodedBody(normalizedRequestBodyText)) {
+          throw cause;
+        }
+      }
     }
     return {
       dashboard_url: form.dashboard_url.trim(),
       request_method: form.request_method,
       request_headers: requestHeaders,
-      request_body_json:
-        form.request_method === "POST"
-          ? parseJsonObjectInput(form.request_body_text, "请求体 JSON")
+      request_body_json: requestBodyJson,
+      request_body_text:
+        form.request_method === "POST" && normalizedRequestBodyText !== ""
+          ? normalizedRequestBodyText
+          : null
+    };
+  }
+
+  function buildDetailRequest() {
+    const detailUrlTemplate = form.detail_url_template.trim();
+    if (detailUrlTemplate === "") {
+      return {
+        detail_url_template: null,
+        detail_request_method: "GET" as WatcherRequestMethod,
+        detail_request_headers: {},
+        detail_request_body_text: null
+      };
+    }
+    const detailRequestHeaders = buildRequestHeaders(
+      form.detail_request_extra_headers_text,
+      form.detail_request_cookie,
+      "详情附加请求头 JSON"
+    );
+    return {
+      detail_url_template: detailUrlTemplate,
+      detail_request_method: form.detail_request_method,
+      detail_request_headers: detailRequestHeaders,
+      detail_request_body_text:
+        form.detail_request_method === "POST" && form.detail_request_body_text.trim() !== ""
+          ? form.detail_request_body_text.trim()
           : null
     };
   }
@@ -486,12 +667,41 @@ export function WatchersWorkspace() {
     }
   }
 
+  function handleParseDetailCurl() {
+    try {
+      const parsed = parseCurlCommand(detailCurlDraft);
+      setForm((current) => ({
+        ...current,
+        detail_url_template: normalizeDetailTemplateText(parsed.dashboard_url),
+        detail_request_method: parsed.request_method,
+        detail_request_cookie: normalizeDetailTemplateText(parsed.request_cookie),
+        detail_request_extra_headers_text:
+          parsed.request_extra_headers_text.trim() !== ""
+            ? stringifyJson(
+                Object.fromEntries(
+                  Object.entries(parseJsonObjectInput(parsed.request_extra_headers_text, "详情附加请求头 JSON")).map(
+                    ([key, value]) => [key, normalizeDetailTemplateText(String(value))]
+                  )
+                )
+              )
+            : "",
+        detail_request_body_text: normalizeDetailTemplateText(parsed.request_body_text)
+      }));
+      setError("");
+      setTestResult(null);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   function buildPayload() {
     // 保存到后端前，把前端表单状态转换成后端 schema 需要的结构。
     return {
       name: form.name.trim(),
       description: form.description.trim(),
-      ...buildFetchRequest(),
+      ...buildMainFetchRequest(),
+      ...buildDetailRequest(),
+      match_mode: form.match_mode,
       poll_interval_minutes: Number(form.poll_interval_minutes),
       sender_email: mailSettings?.sender_email ?? "",
       recipient_emails: parseCommaList(form.recipient_emails_text),
@@ -506,7 +716,7 @@ export function WatchersWorkspace() {
       setError("名称和面板 URL 不能为空。");
       return null;
     }
-    if (!modelValidation.isRunnable) {
+    if (requiresRunnableModel && !modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
       return null;
@@ -536,7 +746,7 @@ export function WatchersWorkspace() {
   async function handleRun(mode: "snapshot" | "assign_current" = "snapshot") {
     // 运行前先强制保存，是为了保证：
     // “你刚刚在界面上改的配置”和“后端真正执行的配置”始终是一致的。
-    if (!modelValidation.isRunnable) {
+    if (requiresRunnableModel && !modelValidation.isRunnable) {
       setError(modelValidation.message);
       openModelSettings(form.model_config.provider);
       return;
@@ -572,7 +782,10 @@ export function WatchersWorkspace() {
     setError("");
     setIsTesting(true);
     try {
-      const result = await testWatcherFetch(buildFetchRequest());
+      const result = await testWatcherFetch({
+        ...buildMainFetchRequest(),
+        ...buildDetailRequest(),
+      });
       setTestResult(result);
     } catch (cause) {
       setError(String(cause));
@@ -605,8 +818,8 @@ export function WatchersWorkspace() {
   }
 
   return (
-    <div className="grid min-h-full grid-cols-1 overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)_420px]">
-      <aside className="min-h-0 overflow-y-auto border-b border-slate-800 bg-slate-900/50 p-5 xl:border-b-0 xl:border-r">
+    <div className="grid min-h-full grid-cols-1 xl:h-full xl:min-h-0 xl:overflow-hidden xl:grid-cols-[320px_minmax(0,1fr)_420px]">
+      <aside className="border-b border-slate-800 bg-slate-900/50 p-5 xl:flex xl:min-h-0 xl:flex-col xl:overflow-hidden xl:border-b-0 xl:border-r">
         <div className="flex items-center justify-between">
           <div>
             <div className="text-xs uppercase tracking-[0.35em] text-amber-300">巡检 Agent</div>
@@ -619,6 +832,8 @@ export function WatchersWorkspace() {
               setRuns([]);
               setSelectedRunId(null);
               setTestResult(null);
+              setCurlDraft("");
+              setDetailCurlDraft("");
               setError("");
             }}
           >
@@ -626,83 +841,85 @@ export function WatchersWorkspace() {
           </button>
         </div>
 
-        <div className="mt-5 space-y-3">
-          {isBootstrapping && (
-            <div className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm text-slate-400">
-              正在加载巡检 Agent...
-            </div>
-          )}
-          {watchers.map((watcher) => (
-            <div
-              key={watcher.id}
-              role="button"
-              tabIndex={0}
-              className={
-                "w-full rounded-2xl border p-4 text-left transition " +
-                (form.id === watcher.id
-                  ? "border-amber-300/60 bg-amber-300/10"
-                  : "border-slate-800 bg-slate-900 hover:border-slate-700")
-              }
-              onClick={() => {
-                void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
-              }}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter" && event.key !== " ") return;
-                event.preventDefault();
-                void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
-              }}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">{watcher.name}</div>
-                  <div className={"mt-1 text-xs " + watcherEnabledTone(watcher)}>
-                    {watcherEnabledLabel(watcher)}
+        <div className="mt-5 xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:pr-1">
+          <div className="space-y-3">
+            {isBootstrapping && (
+              <div className="rounded-2xl border border-slate-800 bg-slate-900 px-4 py-4 text-sm text-slate-400">
+                正在加载巡检 Agent...
+              </div>
+            )}
+            {watchers.map((watcher) => (
+              <div
+                key={watcher.id}
+                role="button"
+                tabIndex={0}
+                className={
+                  "w-full rounded-2xl border p-4 text-left transition " +
+                  (form.id === watcher.id
+                    ? "border-amber-300/60 bg-amber-300/10"
+                    : "border-slate-800 bg-slate-900 hover:border-slate-700")
+                }
+                onClick={() => {
+                  void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== "Enter" && event.key !== " ") return;
+                  event.preventDefault();
+                  void loadWatcherDetail(watcher.id).catch((cause) => setError(String(cause)));
+                }}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="font-medium">{watcher.name}</div>
+                    <div className={"mt-1 text-xs " + watcherEnabledTone(watcher)}>
+                      {watcherEnabledLabel(watcher)}
+                    </div>
                   </div>
+                  <button
+                    className={
+                      "shrink-0 rounded-full border px-3 py-1 text-xs transition " +
+                      (watcher.enabled
+                        ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400"
+                        : "border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500")
+                    }
+                    disabled={togglingWatcherId === watcher.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void handleToggleWatcherEnabled(watcher, !watcher.enabled);
+                    }}
+                    type="button"
+                  >
+                    {togglingWatcherId === watcher.id ? "切换中..." : watcher.enabled ? "停用" : "启用"}
+                  </button>
                 </div>
-                <button
-                  className={
-                    "shrink-0 rounded-full border px-3 py-1 text-xs transition " +
-                    (watcher.enabled
-                      ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-200 hover:border-emerald-400"
-                      : "border-slate-700 bg-slate-950 text-slate-300 hover:border-slate-500")
-                  }
-                  disabled={togglingWatcherId === watcher.id}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void handleToggleWatcherEnabled(watcher, !watcher.enabled);
-                  }}
-                  type="button"
-                >
-                  {togglingWatcherId === watcher.id ? "切换中..." : watcher.enabled ? "停用" : "启用"}
-                </button>
+                <div className="mt-2 line-clamp-2 text-sm text-slate-400">{watcher.description || watcher.dashboard_url}</div>
+                <div className="mt-3 grid gap-1 text-xs text-slate-500">
+                  <div>轮巡：{watcher.poll_interval_minutes} 分钟</div>
+                  <div>最近运行：{formatDate(watcher.last_run_at)}</div>
+                  <div className={statusTone(watcher.last_run_status)}>最近状态：{watcher.last_run_status ?? "-"}</div>
+                  <div>最近新增：{watcher.last_new_bug_count}</div>
+                  <div>连续失败：{watcher.consecutive_failure_count}</div>
+                  {watcher.auto_disabled_at && <div className="text-rose-300">自动停用：{formatDate(watcher.auto_disabled_at)}</div>}
+                </div>
               </div>
-              <div className="mt-2 line-clamp-2 text-sm text-slate-400">{watcher.description || watcher.dashboard_url}</div>
-              <div className="mt-3 grid gap-1 text-xs text-slate-500">
-                <div>轮巡：{watcher.poll_interval_minutes} 分钟</div>
-                <div>最近运行：{formatDate(watcher.last_run_at)}</div>
-                <div className={statusTone(watcher.last_run_status)}>最近状态：{watcher.last_run_status ?? "-"}</div>
-                <div>最近新增：{watcher.last_new_bug_count}</div>
-                <div>连续失败：{watcher.consecutive_failure_count}</div>
-                {watcher.auto_disabled_at && <div className="text-rose-300">自动停用：{formatDate(watcher.auto_disabled_at)}</div>}
-              </div>
-            </div>
-          ))}
-          {watchers.length === 0 && <div className="text-sm text-slate-500">还没有巡检 Agent，可以先新建一个。</div>}
-          {error !== "" && !isBootstrapping && (
-            <button
-              className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-500"
-              onClick={() => {
-                void bootstrap().catch((cause) => setError(String(cause)));
-              }}
-              type="button"
-            >
-              重新加载
-            </button>
-          )}
+            ))}
+            {watchers.length === 0 && <div className="text-sm text-slate-500">还没有巡检 Agent，可以先新建一个。</div>}
+            {error !== "" && !isBootstrapping && (
+              <button
+                className="w-full rounded-xl border border-slate-700 px-3 py-2 text-sm text-slate-200 hover:border-slate-500"
+                onClick={() => {
+                  void bootstrap().catch((cause) => setError(String(cause)));
+                }}
+                type="button"
+              >
+                重新加载
+              </button>
+            )}
+          </div>
         </div>
       </aside>
 
-      <main className="min-h-0 min-w-0 overflow-y-auto border-b border-slate-800 px-6 py-6 xl:border-b-0 xl:border-r">
+      <main className="min-w-0 border-b border-slate-800 px-6 py-6 xl:min-h-0 xl:overflow-y-auto xl:border-b-0 xl:border-r">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="flex items-center justify-between gap-4">
             <div>
@@ -755,7 +972,7 @@ export function WatchersWorkspace() {
                 <div>
                   <div className="text-sm font-medium text-slate-200">粘贴 curl 自动解析</div>
                   <div className="mt-1 text-xs text-slate-500">
-                    支持自动回填 URL、方法、Cookie、附加请求头、请求体 JSON。
+                    支持自动回填 URL、方法、Cookie、附加请求头、请求体。
                   </div>
                 </div>
                 <button
@@ -771,6 +988,31 @@ export function WatchersWorkspace() {
                 value={curlDraft}
                 onChange={(event) => setCurlDraft(event.target.value)}
                 placeholder={"curl 'https://example.com/api' \\\n  -H 'origin: https://pm.example.com' \\\n  -b 'tenant=xxx' \\\n  --data-raw '{\"pageNumber\":1}'"}
+              />
+            </div>
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4 lg:col-span-2">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-medium text-slate-200">详情 curl 自动解析（可选）</div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    列表接口解析出每条 `bug_id / issueKey` 后，会逐条替换详情模板里的占位符去抓工单详情。
+                  </div>
+                </div>
+                <button
+                  className="rounded-xl border border-sky-500/50 px-3 py-2 text-sm text-sky-200 hover:border-sky-400"
+                  onClick={handleParseDetailCurl}
+                  type="button"
+                >
+                  解析详情 curl
+                </button>
+              </div>
+              <textarea
+                className="mt-4 min-h-32 rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 font-mono text-xs leading-6"
+                value={detailCurlDraft}
+                onChange={(event) => setDetailCurlDraft(event.target.value)}
+                placeholder={
+                  "curl $'https://gfjira.yyrd.com/secure/AjaxIssueAction\\u0021default.jspa?issueKey=YYZJ-138373&decorator=none&_=1776688309654' \\\n  -b 'tenant_info=...' \\\n  -H 'x-requested-with: XMLHttpRequest'"
+                }
               />
             </div>
             <label className="grid gap-1 text-sm">
@@ -885,20 +1127,131 @@ export function WatchersWorkspace() {
             </label>
             {form.request_method === "POST" && (
               <label className="grid gap-1 text-sm lg:col-span-2">
-                <span className="text-slate-400">请求体 JSON</span>
+                <span className="text-slate-400">请求体</span>
                 <textarea
                   className="min-h-40 rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 font-mono text-xs leading-6"
                   value={form.request_body_text}
                   onChange={(event) => setForm((current) => ({ ...current, request_body_text: event.target.value }))}
-                  placeholder='{"pageNumber":1,"pageSize":30}'
+                  placeholder={'{"pageNumber":1,"pageSize":30}\n\n或\n\nstartIndex=0&filterId=-1&jql=...'}
+                />
+                <div className="text-xs leading-6 text-slate-500">
+                  如果 `Content-Type` 是 `application/json`，这里会按 JSON 对象校验；如果是 `application/x-www-form-urlencoded` 等类型，会按原始文本直接发送。
+                </div>
+              </label>
+            )}
+            <div className="rounded-2xl border border-slate-800 bg-slate-950/40 px-4 py-4 text-sm text-slate-400 lg:col-span-2">
+              <div className="font-medium text-slate-200">详情请求模板（可选）</div>
+              <div className="mt-2 text-xs leading-6 text-slate-500">
+                如果这里配置了详情接口，巡检会在主列表解析完成后，按每条 Bug 的 `bug_id` 逐条请求详情。
+                支持占位符：<code>{'{{bug_id}}'}</code>、<code>{'{{issue_key}}'}</code>、<code>{'{{timestamp_ms}}'}</code>。Jira 自动转派会先从详情接口提取 `issue id / atl_token`，如果缺少 `formToken` 会再自动补抓一次 `AssignIssue` 页面。
+              </div>
+            </div>
+            <label className="grid gap-1 text-sm lg:col-span-2">
+              <span className="text-slate-400">详情 URL 模板</span>
+              <input
+                className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs"
+                value={form.detail_url_template}
+                onChange={(event) => setForm((current) => ({ ...current, detail_url_template: event.target.value }))}
+                placeholder="https://gfjira.yyrd.com/secure/AjaxIssueAction!default.jspa?issueKey={{bug_id}}&decorator=none&_={{timestamp_ms}}"
+              />
+            </label>
+            <label className="grid gap-1 text-sm">
+              <span className="text-slate-400">详情请求方法</span>
+              <select
+                className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                value={form.detail_request_method}
+                onChange={(event) =>
+                  setForm((current) => ({
+                    ...current,
+                    detail_request_method: event.target.value as WatcherRequestMethod,
+                  }))
+                }
+              >
+                <option value="GET">GET</option>
+                <option value="POST">POST</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-sm">
+              <span className="text-slate-400">详情 Cookie</span>
+              <input
+                className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2 font-mono text-xs"
+                value={form.detail_request_cookie}
+                onChange={(event) => setForm((current) => ({ ...current, detail_request_cookie: event.target.value }))}
+                placeholder="留空则不额外附带 Cookie"
+              />
+            </label>
+            <label className="grid gap-1 text-sm lg:col-span-2">
+              <span className="text-slate-400">详情附加请求头 JSON</span>
+              <textarea
+                className="min-h-28 rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 font-mono text-xs leading-6"
+                value={form.detail_request_extra_headers_text}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, detail_request_extra_headers_text: event.target.value }))
+                }
+                placeholder='{"Referer":"https://gfjira.yyrd.com/browse/{{bug_id}}","x-requested-with":"XMLHttpRequest"}'
+              />
+            </label>
+            {form.detail_request_method === "POST" && (
+              <label className="grid gap-1 text-sm lg:col-span-2">
+                <span className="text-slate-400">详情请求体</span>
+                <textarea
+                  className="min-h-28 rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 font-mono text-xs leading-6"
+                  value={form.detail_request_body_text}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, detail_request_body_text: event.target.value }))
+                  }
+                  placeholder="issueKey={{bug_id}}"
                 />
               </label>
             )}
             <div className="lg:col-span-2">
-              <ModelSelector
-                value={form.model_config}
-                onChange={(nextModelConfig) => setForm((current) => ({ ...current, model_config: nextModelConfig }))}
-              />
+              <div className="rounded-2xl border border-slate-800 bg-slate-950/40 px-4 py-4">
+                <div className="text-sm font-medium text-slate-200">运行模式</div>
+                <div className="mt-2 grid gap-3 md:grid-cols-2">
+                  <button
+                    type="button"
+                    className={
+                      "rounded-2xl border px-4 py-4 text-left transition " +
+                      (form.match_mode === "llm_fallback"
+                        ? "border-amber-300/60 bg-amber-300/10"
+                        : "border-slate-700 bg-slate-950 hover:border-slate-500")
+                    }
+                    onClick={() => setForm((current) => ({ ...current, match_mode: "llm_fallback" }))}
+                  >
+                    <div className="font-medium text-slate-100">规则 + LLM 兜底</div>
+                    <div className="mt-1 text-xs leading-6 text-slate-400">
+                      先按服务、模块、标题关键词、客户问题类型命中规则；没命中时再进入大模型兜底。
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    className={
+                      "rounded-2xl border px-4 py-4 text-left transition " +
+                      (form.match_mode === "fixed_match"
+                        ? "border-sky-300/60 bg-sky-300/10"
+                        : "border-slate-700 bg-slate-950 hover:border-slate-500")
+                    }
+                    onClick={() => setForm((current) => ({ ...current, match_mode: "fixed_match" }))}
+                  >
+                    <div className="font-medium text-slate-100">固定匹配</div>
+                    <div className="mt-1 text-xs leading-6 text-slate-400">
+                      只用列表 + 详情数据做规则命中，不调用大模型。关键词只匹配标题，客户问题类型直接读取详情数据。
+                    </div>
+                  </button>
+                </div>
+                {form.match_mode === "llm_fallback" ? (
+                  <div className="mt-4">
+                    <ModelSelector
+                      value={form.model_config}
+                      onChange={(nextModelConfig) => setForm((current) => ({ ...current, model_config: nextModelConfig }))}
+                    />
+                  </div>
+                ) : (
+                  <div className="mt-4 rounded-2xl border border-sky-400/20 bg-sky-400/5 px-4 py-3 text-xs leading-6 text-sky-100">
+                    当前为固定匹配模式，保存和运行时不会校验模型配置，也不会调用大模型解析或兜底分配。
+                  </div>
+                )}
+              </div>
             </div>
           </div>
 
@@ -927,7 +1280,11 @@ export function WatchersWorkspace() {
             <div className="flex items-center justify-between">
               <div>
                 <div className="text-sm font-medium text-slate-200">经办人规则</div>
-                <div className="mt-1 text-xs text-slate-500">规则优先，未命中时才进入 LLM 兜底分配。</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {form.match_mode === "fixed_match"
+                    ? "固定匹配模式下，只按服务、模块、标题关键词、客户问题类型命中规则。"
+                    : "规则优先，未命中时才进入 LLM 兜底分配。"}
+                </div>
               </div>
               <button
                 className="rounded-xl border border-slate-700 px-3 py-2 text-sm hover:border-amber-300"
@@ -959,7 +1316,7 @@ export function WatchersWorkspace() {
 
                   <div className="mt-4 grid gap-3 lg:grid-cols-2">
                     <label className="grid gap-1 text-sm">
-                      <span className="text-slate-400">经办人编码</span>
+                      <span className="text-slate-400">转派目标</span>
                       <input
                         className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
                         value={rule.assignee_code}
@@ -971,7 +1328,7 @@ export function WatchersWorkspace() {
                             )
                           }))
                         }
-                        placeholder="0000140558"
+                        placeholder="qiangxiao 或 0000140558"
                       />
                     </label>
                     <label className="grid gap-1 text-sm">
@@ -1006,6 +1363,22 @@ export function WatchersWorkspace() {
                         placeholder="工作台, dashboard"
                       />
                     </label>
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-slate-400">客户问题类型</span>
+                      <input
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                        value={rule.customer_issue_types_text}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            owner_rules: current.owner_rules.map((item, ruleIndex) =>
+                              ruleIndex === index ? { ...item, customer_issue_types_text: event.target.value } : item
+                            )
+                          }))
+                        }
+                        placeholder="性能问题、数据异常"
+                      />
+                    </label>
                     <label className="grid gap-1 text-sm lg:col-span-2">
                       <span className="text-slate-400">关键词</span>
                       <input
@@ -1023,7 +1396,7 @@ export function WatchersWorkspace() {
                       />
                     </label>
                     <div className="rounded-2xl border border-slate-800 bg-slate-950/50 px-3 py-3 text-xs leading-6 text-slate-500 lg:col-span-2">
-                      命中规则后，会自动调用 PM 的 `PUT /defect/update`，使用当前 Bug 的 `aid` 和这里填写的经办人编码完成分配。
+                      命中规则后，会自动把当前 Bug 转派给这里填写的目标。Jira 场景请直接填写用户名，例如 `qiangxiao`；PM 场景仍可填写经办人编码。客户问题类型支持按 `、`、中文逗号或英文逗号分隔。
                     </div>
                   </div>
                 </div>
@@ -1035,7 +1408,7 @@ export function WatchersWorkspace() {
         {error !== "" && <div className="mt-6 text-sm text-rose-300 whitespace-pre-wrap">{error}</div>}
       </main>
 
-      <aside className="min-h-0 overflow-y-auto bg-slate-900/60 p-5">
+      <aside className="bg-slate-900/60 p-5 xl:min-h-0 xl:overflow-y-auto">
         <div className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
           <div className="text-sm text-slate-400">接口检查与最近运行记录</div>
           <h3 className="mt-1 text-xl font-semibold">巡检结果</h3>
@@ -1072,7 +1445,8 @@ export function WatchersWorkspace() {
                           [{bug.bug_id}] {bug.title || "(无标题)"}
                         </div>
                         <div className="mt-1 text-slate-400">
-                          PM aid：{bug.bug_aid || "-"} · 服务模块：{bug.service || "-"} / {bug.module || "-"} · 状态：{bug.status || "-"} · 经办人：{bug.assignee || "-"}
+                          辅助 ID：{bug.jira_issue_id || bug.bug_aid || "-"} · 服务模块：{bug.service || "-"} / {bug.module || "-"} · 客户问题类型：
+                          {bug.customer_issue_type || "-"} · 状态：{bug.status || "-"} · 经办人：{bug.assignee || "-"}
                         </div>
                       </div>
                     ))}
@@ -1091,7 +1465,11 @@ export function WatchersWorkspace() {
                 <>
                   <div className="mt-3 text-xs font-medium text-slate-300">请求体预览</div>
                   <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-3 text-xs leading-6 text-slate-400">
-                    {testResult.request_body_json ? stringifyJson(testResult.request_body_json) : "(空请求体)"}
+                    {testResult.request_body_text?.trim()
+                      ? testResult.request_body_text
+                      : testResult.request_body_json
+                        ? stringifyJson(testResult.request_body_json)
+                        : "(空请求体)"}
                   </pre>
                 </>
               )}
@@ -1165,7 +1543,7 @@ export function WatchersWorkspace() {
                         {item.service || "-"} / {item.module || "-"} / {item.status || "-"}
                       </div>
                       <div className="mt-2 text-xs text-slate-400">
-                        PM aid：{item.bug_aid || "-"} · 经办人编码：{item.assignee_code || "未匹配"}
+                        辅助 ID：{item.jira_issue_id || item.bug_aid || "-"} · 转派目标：{item.assignee_code || "未匹配"}
                       </div>
                       <div className="mt-1 text-xs text-slate-400">
                         来源：{item.match_source} · 原因：{item.match_reason || "-"}

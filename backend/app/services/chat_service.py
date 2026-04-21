@@ -84,7 +84,9 @@ class ChatService:
         self.agent_store = agent_store
         self.provider_store = provider_store
         self.gitlab_import_service = gitlab_import_service
-        self.rag_pipeline = RAGPipeline(knowledge_store)
+        # RAGPipeline 现在依赖 LLMService 做 query bundle 与 rerank，
+        # 这里需要把 llm_service 一起注入，不能再沿用旧的一参构造方式。
+        self.rag_pipeline = RAGPipeline(knowledge_store, llm_service)
         self.retrieval_service = RetrievalService(knowledge_store, llm_service)
         self.chat_graph = LearningChatGraph(skill_registry, self.rag_pipeline, llm_service)
 
@@ -271,6 +273,7 @@ class ChatService:
             scope_type=scope_type,
             scope_id=scope_id,
             model_config=model_config,
+            retrieval_profile=request.retrieval_profile,
         )
 
     def _normalize_agent_scope(self, scope_type: ScopeType, scope_id: str | None) -> tuple[ScopeType, str | None]:

@@ -13,6 +13,7 @@ import {
   getFeishuSettings,
   getGitLabImportSettings,
   getMailSettings,
+  getRagEmbeddingSettings,
   getWorkNotifySettings,
   listProviders,
   testMailSettings,
@@ -20,6 +21,7 @@ import {
   updateFeishuSettings,
   updateGitLabImportSettings,
   updateMailSettings,
+  updateRagEmbeddingSettings,
   updateWorkNotifySettings,
   updateProvider
 } from "../lib/api";
@@ -33,8 +35,10 @@ import type {
   ProviderConfig,
   ProviderModel,
   ProviderTestResponse,
+  RagEmbeddingSettings,
   UpdateMailSettingsRequest,
   UpdateProviderRequest,
+  UpdateRagEmbeddingSettingsRequest,
   UpdateWorkNotifySettingsRequest,
   WorkNotifySettings
 } from "../lib/types";
@@ -59,6 +63,9 @@ type ModelSettingsContextValue = {
   workNotifySettings: WorkNotifySettings | null;
   isWorkNotifySettingsLoading: boolean;
   workNotifyError: string;
+  ragEmbeddingSettings: RagEmbeddingSettings | null;
+  isRagEmbeddingSettingsLoading: boolean;
+  ragEmbeddingError: string;
   gitlabImportSettings: GitLabImportSettings | null;
   isGitLabImportSettingsLoading: boolean;
   gitlabImportError: string;
@@ -66,22 +73,26 @@ type ModelSettingsContextValue = {
   isMailSettingsOpen: boolean;
   isFeishuSettingsOpen: boolean;
   isWorkNotifySettingsOpen: boolean;
+  isRagEmbeddingSettingsOpen: boolean;
   isGitLabImportSettingsOpen: boolean;
   selectedProviderId: string;
   refreshProviders: () => Promise<void>;
   refreshMailSettings: () => Promise<void>;
   refreshFeishuSettings: () => Promise<void>;
   refreshWorkNotifySettings: () => Promise<void>;
+  refreshRagEmbeddingSettings: () => Promise<void>;
   refreshGitLabImportSettings: () => Promise<void>;
   openModelSettings: (providerId?: string) => void;
   openMailSettings: () => void;
   openFeishuSettings: () => void;
   openWorkNotifySettings: () => void;
+  openRagEmbeddingSettings: () => void;
   openGitLabImportSettings: () => void;
   closeModelSettings: () => void;
   closeMailSettings: () => void;
   closeFeishuSettings: () => void;
   closeWorkNotifySettings: () => void;
+  closeRagEmbeddingSettings: () => void;
   closeGitLabImportSettings: () => void;
   setSelectedProviderId: (providerId: string) => void;
   saveProvider: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderConfig>;
@@ -90,6 +101,7 @@ type ModelSettingsContextValue = {
   runMailTest: (input: MailTestRequest) => Promise<MailTestResponse>;
   saveFeishuSettings: (input: { app_id?: string; app_secret?: string }) => Promise<FeishuSettings>;
   saveWorkNotifySettings: (input: UpdateWorkNotifySettingsRequest) => Promise<WorkNotifySettings>;
+  saveRagEmbeddingSettings: (input: UpdateRagEmbeddingSettingsRequest) => Promise<RagEmbeddingSettings>;
   saveGitLabImportSettings: (input: {
     token?: string;
     clear_token?: boolean;
@@ -123,6 +135,9 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   const [workNotifySettings, setWorkNotifySettings] = useState<WorkNotifySettings | null>(null);
   const [isWorkNotifySettingsLoading, setIsWorkNotifySettingsLoading] = useState(true);
   const [workNotifyError, setWorkNotifyError] = useState("");
+  const [ragEmbeddingSettings, setRagEmbeddingSettings] = useState<RagEmbeddingSettings | null>(null);
+  const [isRagEmbeddingSettingsLoading, setIsRagEmbeddingSettingsLoading] = useState(true);
+  const [ragEmbeddingError, setRagEmbeddingError] = useState("");
   const [gitlabImportSettings, setGitlabImportSettings] = useState<GitLabImportSettings | null>(null);
   const [isGitLabImportSettingsLoading, setIsGitLabImportSettingsLoading] = useState(true);
   const [gitlabImportError, setGitlabImportError] = useState("");
@@ -130,6 +145,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   const [isMailSettingsOpen, setIsMailSettingsOpen] = useState(false);
   const [isFeishuSettingsOpen, setIsFeishuSettingsOpen] = useState(false);
   const [isWorkNotifySettingsOpen, setIsWorkNotifySettingsOpen] = useState(false);
+  const [isRagEmbeddingSettingsOpen, setIsRagEmbeddingSettingsOpen] = useState(false);
   const [isGitLabImportSettingsOpen, setIsGitLabImportSettingsOpen] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState("");
 
@@ -162,6 +178,11 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setWorkNotifySettings(await getWorkNotifySettings());
   }
 
+  async function refreshRagEmbeddingSettings() {
+    setRagEmbeddingError("");
+    setRagEmbeddingSettings(await getRagEmbeddingSettings());
+  }
+
   async function refreshGitLabImportSettings() {
     setGitlabImportError("");
     setGitlabImportSettings(await getGitLabImportSettings());
@@ -182,6 +203,9 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     refreshWorkNotifySettings()
       .catch((cause) => setWorkNotifyError(String(cause)))
       .finally(() => setIsWorkNotifySettingsLoading(false));
+    refreshRagEmbeddingSettings()
+      .catch((cause) => setRagEmbeddingError(String(cause)))
+      .finally(() => setIsRagEmbeddingSettingsLoading(false));
     refreshGitLabImportSettings()
       .catch((cause) => setGitlabImportError(String(cause)))
       .finally(() => setIsGitLabImportSettingsLoading(false));
@@ -201,6 +225,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
     setIsWorkNotifySettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     if (providerId != null && providerId !== "") {
       setSelectedProviderId(providerId);
@@ -214,6 +239,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsModelSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
     setIsWorkNotifySettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     setIsMailSettingsOpen(true);
   }
@@ -222,6 +248,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsModelSettingsOpen(false);
     setIsMailSettingsOpen(false);
     setIsWorkNotifySettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     setIsFeishuSettingsOpen(true);
   }
@@ -230,8 +257,18 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsModelSettingsOpen(false);
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
     setIsWorkNotifySettingsOpen(true);
+  }
+
+  function openRagEmbeddingSettings() {
+    setIsModelSettingsOpen(false);
+    setIsMailSettingsOpen(false);
+    setIsFeishuSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(true);
   }
 
   function openGitLabImportSettings() {
@@ -239,6 +276,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsMailSettingsOpen(false);
     setIsFeishuSettingsOpen(false);
     setIsWorkNotifySettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(true);
   }
 
@@ -256,6 +294,10 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
 
   function closeWorkNotifySettings() {
     setIsWorkNotifySettingsOpen(false);
+  }
+
+  function closeRagEmbeddingSettings() {
+    setIsRagEmbeddingSettingsOpen(false);
   }
 
   function closeGitLabImportSettings() {
@@ -293,6 +335,12 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   async function saveWorkNotifySettings(input: UpdateWorkNotifySettingsRequest) {
     const saved = await updateWorkNotifySettings(input);
     setWorkNotifySettings(saved);
+    return saved;
+  }
+
+  async function saveRagEmbeddingSettings(input: UpdateRagEmbeddingSettingsRequest) {
+    const saved = await updateRagEmbeddingSettings(input);
+    setRagEmbeddingSettings(saved);
     return saved;
   }
 
@@ -369,41 +417,49 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
         feishuSettings,
         isFeishuSettingsLoading,
         feishuError,
-        workNotifySettings,
-        isWorkNotifySettingsLoading,
-        workNotifyError,
-        gitlabImportSettings,
-        isGitLabImportSettingsLoading,
-        gitlabImportError,
-        isModelSettingsOpen,
-        isMailSettingsOpen,
-        isFeishuSettingsOpen,
-        isWorkNotifySettingsOpen,
-        isGitLabImportSettingsOpen,
+      workNotifySettings,
+      isWorkNotifySettingsLoading,
+      workNotifyError,
+      ragEmbeddingSettings,
+      isRagEmbeddingSettingsLoading,
+      ragEmbeddingError,
+      gitlabImportSettings,
+      isGitLabImportSettingsLoading,
+      gitlabImportError,
+      isModelSettingsOpen,
+      isMailSettingsOpen,
+      isFeishuSettingsOpen,
+      isWorkNotifySettingsOpen,
+      isRagEmbeddingSettingsOpen,
+      isGitLabImportSettingsOpen,
         selectedProviderId,
         refreshProviders,
         refreshMailSettings,
-        refreshFeishuSettings,
-        refreshWorkNotifySettings,
-        refreshGitLabImportSettings,
-        openModelSettings,
-        openMailSettings,
-        openFeishuSettings,
-        openWorkNotifySettings,
-        openGitLabImportSettings,
-        closeModelSettings,
-        closeMailSettings,
-        closeFeishuSettings,
-        closeWorkNotifySettings,
-        closeGitLabImportSettings,
+      refreshFeishuSettings,
+      refreshWorkNotifySettings,
+      refreshRagEmbeddingSettings,
+      refreshGitLabImportSettings,
+      openModelSettings,
+      openMailSettings,
+      openFeishuSettings,
+      openWorkNotifySettings,
+      openRagEmbeddingSettings,
+      openGitLabImportSettings,
+      closeModelSettings,
+      closeMailSettings,
+      closeFeishuSettings,
+      closeWorkNotifySettings,
+      closeRagEmbeddingSettings,
+      closeGitLabImportSettings,
         setSelectedProviderId,
         saveProvider,
         runProviderTest,
         saveMailSettings,
         runMailTest,
-        saveFeishuSettings,
-        saveWorkNotifySettings,
-        saveGitLabImportSettings,
+      saveFeishuSettings,
+      saveWorkNotifySettings,
+      saveRagEmbeddingSettings,
+      saveGitLabImportSettings,
         validateModelConfig,
         getProvider,
         getEnabledProviders

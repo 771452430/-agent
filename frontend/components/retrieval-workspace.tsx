@@ -490,13 +490,57 @@ export function RetrievalWorkspace() {
                   <pre className="mt-3 whitespace-pre-wrap text-xs leading-6 text-slate-400">{result.retrieval_context}</pre>
                 </div>
 
+                {result.debug != null && (
+                  <div className="apple-panel-subtle rounded-[24px] p-4">
+                    <div className="text-sm font-medium text-white">检索调试</div>
+                    <div className="mt-3 grid gap-3 text-xs text-slate-300 lg:grid-cols-3">
+                      <div>Profile：{result.debug.retrieval_profile}</div>
+                      <div>候选数：{result.debug.candidate_count}</div>
+                      <div>入选证据：{result.debug.selected_count}</div>
+                    </div>
+
+                    <div className="mt-4">
+                      <div className="text-xs font-medium text-sky-200">Query Bundle</div>
+                      <div className="mt-2 space-y-2">
+                        {result.debug.query_bundle.query_variants.map((item) => (
+                          <div key={item.label + item.query} className="rounded-2xl border border-white/10 px-3 py-2">
+                            <div className="text-[11px] uppercase tracking-[0.12em] text-slate-500">{item.label}</div>
+                            <div className="mt-1 whitespace-pre-wrap text-sm text-slate-100">{item.query}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    {result.debug.rerank_preview.length > 0 && (
+                      <div className="mt-4">
+                        <div className="text-xs font-medium text-amber-200">Rerank Preview</div>
+                        <div className="mt-2 space-y-3">
+                          {result.debug.rerank_preview.slice(0, 6).map((item) => (
+                            <div key={item.chunk_id} className="rounded-2xl border border-white/10 px-3 py-3">
+                              <div className="flex items-center justify-between gap-3">
+                                <div className="text-sm font-medium text-slate-100">{item.document_name}</div>
+                                <div className="text-[11px] text-slate-500">
+                                  score {item.relevance_score.toFixed(2)} / fused {item.fused_score.toFixed(2)}
+                                </div>
+                              </div>
+                              <div className="mt-1 text-[11px] text-slate-500">{item.heading_path || item.tree_path || "/"}</div>
+                              <div className="mt-2 whitespace-pre-wrap text-xs leading-6 text-slate-400">{item.snippet}</div>
+                              <div className="mt-2 text-xs text-emerald-200">{item.reason || "无 rerank 原因"}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 <div className="space-y-3">
                   <div className="text-sm font-medium text-white">引用片段</div>
                   {result.citations.map((citation) => (
                     <div key={citation.chunk_id} className="apple-panel-subtle rounded-[24px] p-4">
                       <div className="flex items-center justify-between gap-3">
                         <div className="font-medium text-amber-200">{citation.document_name}</div>
-                        <div className="text-xs text-slate-500">{citation.tree_path || "/"}</div>
+                        <div className="text-xs text-slate-500">{citation.heading_path || citation.tree_path || "/"}</div>
                       </div>
                       <div className="mt-2 text-xs text-slate-500">{citation.relative_path || citation.document_name}</div>
                       <div className="mt-3 whitespace-pre-wrap text-sm text-slate-300">{citation.snippet}</div>

@@ -41,6 +41,13 @@ from ..schemas import (
     ProviderProtocol,
     ProviderRuntimeConfig,
     ProviderTestResponse,
+    RAGQueryBundle,
+    RAGQueryVariant,
+    RetrievalCandidateDebug,
+    RetrievalProfile,
+    SupportIssueClassificationResult,
+    SupportIssueDraftResult,
+    SupportIssueReviewResult,
     UpdateProviderRequest,
     WatcherOwnerSuggestion,
 )
@@ -51,6 +58,21 @@ class ParsedBugBatch(BaseModel):
     """用于结构化输出的 bug 列表包装器。"""
 
     bugs: list[ParsedBug] = Field(default_factory=list)
+
+
+class RetrievalRerankItem(BaseModel):
+    """单条候选的 rerank 结果。"""
+
+    chunk_id: str
+    relevance_score: float = 0.0
+    useful_for_answer: bool = False
+    reason: str = ""
+
+
+class RetrievalRerankBatch(BaseModel):
+    """候选 rerank 批量结果。"""
+
+    items: list[RetrievalRerankItem] = Field(default_factory=list)
 
 
 DEFAULT_SYSTEM_PROMPT = (
@@ -771,26 +793,629 @@ class LLMService:
             time.sleep(1.0 * (retry_index + 1))
         return result
 
+    def _dedupe_strings(self, values: list[str], *, limit: int | None = None) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = " ".join(str(value or "").split()).strip()
+            if normalized == "":
+                continue
+            lowered = normalized.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(normalized)
+            if limit is not None and len(deduped) >= limit:
+                break
+        return deduped
+
+    def _identifier_terms(self, text: str) -> list[str]:
+        values = re.findall(r"[A-Za-z][A-Za-z0-9._:/-]{2,}", text or "")
+        values.extend(re.findall(r"[A-Z]{2,}[-_ ]?\d{2,}", text or ""))
+        return self._dedupe_strings(values, limit=8)
+
+    def _chinese_terms(self, text: str) -> list[str]:
+        values = re.findall(r"[\u4e00-\u9fff]{2,8}", text or "")
+        # 过滤掉太泛的提示语，避免 query 扩写被噪音词污染。
+        ignored = {"问题", "请问", "帮忙", "说明", "处理", "目前", "这个", "那个"}
+        return [item for item in self._dedupe_strings(values, limit=8) if item not in ignored]
+
+    def _normalize_query_text(self, text: str) -> str:
+        normalized = str(text or "").replace("请根据文档", "").replace("请参考资料", "")
+        normalized = normalized.replace("请帮我", "").replace("帮我看下", "")
+        return " ".join(normalized.split()).strip()
+
+    def _build_query_variants(
+        self,
+        *,
+        original_query: str,
+        normalized_query: str,
+        rewritten_query: str,
+        keyword_queries: list[str],
+        sub_queries: list[str],
+    ) -> list[RAGQueryVariant]:
+        variants: list[RAGQueryVariant] = []
+        variants.append(RAGQueryVariant(label="original", query=original_query, source="original"))
+        if normalized_query.lower() != original_query.lower():
+            variants.append(RAGQueryVariant(label="canonical", query=normalized_query, source="normalized"))
+        if rewritten_query.strip() != "" and rewritten_query.strip().lower() not in {
+            original_query.lower(),
+            normalized_query.lower(),
+        }:
+            variants.append(RAGQueryVariant(label="rewritten", query=rewritten_query, source="rewrite"))
+        for index, item in enumerate(keyword_queries, start=1):
+            variants.append(RAGQueryVariant(label=f"keyword_{index}", query=item, source="keyword"))
+        for index, item in enumerate(sub_queries, start=1):
+            variants.append(RAGQueryVariant(label=f"sub_{index}", query=item, source="sub_query"))
+        deduped: list[RAGQueryVariant] = []
+        seen: set[str] = set()
+        for item in variants:
+            lowered = item.query.strip().lower()
+            if lowered == "" or lowered in seen:
+                continue
+            seen.add(lowered)
+            deduped.append(item)
+            if len(deduped) >= 4:
+                break
+        return deduped
+
+    def _fallback_query_bundle(
+        self,
+        *,
+        query: str,
+        retrieval_profile: RetrievalProfile,
+        context: dict[str, Any] | None,
+    ) -> RAGQueryBundle:
+        normalized_query = self._normalize_query_text(query) or query.strip()
+        context_text = self._normalize_query_text(json.dumps(context or {}, ensure_ascii=False))
+        question = self._normalize_query_text(str((context or {}).get("question") or query))
+        module_value = self._normalize_query_text(str((context or {}).get("module_value") or ""))
+        category = self._normalize_query_text(str((context or {}).get("category") or ""))
+        must_terms = self._dedupe_strings(
+            self._identifier_terms(query + "\n" + context_text) + self._chinese_terms(question),
+            limit=6,
+        )
+        keyword_queries = self._dedupe_strings(
+            [
+                " ".join(must_terms[:4]),
+                f"{module_value} {question}".strip(),
+                f"{category} {question}".strip(),
+            ],
+            limit=3,
+        )
+        sub_queries = self._dedupe_strings(
+            [
+                normalized_query,
+                f"{question} 报错 失败 异常".strip() if any(token in question for token in ("报错", "失败", "异常", "无法")) else "",
+                f"{module_value} {normalized_query}".strip() if module_value != "" else "",
+                f"{category} {normalized_query}".strip() if category != "" else "",
+            ],
+            limit=4,
+        )
+        rewritten_query = sub_queries[0] if sub_queries else normalized_query
+        filters: dict[str, str] = {}
+        if retrieval_profile == "support_issue" and module_value != "":
+            filters["module"] = module_value
+        if category != "":
+            filters["category"] = category
+        return RAGQueryBundle(
+            original_query=query.strip(),
+            normalized_query=normalized_query,
+            rewritten_query=rewritten_query,
+            keyword_queries=keyword_queries,
+            sub_queries=sub_queries,
+            must_terms=must_terms,
+            filters=filters,
+            query_variants=self._build_query_variants(
+                original_query=query.strip(),
+                normalized_query=normalized_query,
+                rewritten_query=rewritten_query,
+                keyword_queries=keyword_queries,
+                sub_queries=sub_queries,
+            ),
+        )
+
+    def build_rag_query_bundle(
+        self,
+        *,
+        query: str,
+        retrieval_profile: RetrievalProfile,
+        context: dict[str, Any] | None,
+        model_config: ModelConfig,
+    ) -> RAGQueryBundle:
+        """构建 query bundle，支持真实模型改写和 learning mode 回退。"""
+
+        fallback = self._fallback_query_bundle(query=query, retrieval_profile=retrieval_profile, context=context)
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是 RAG Query Rewrite 子 agent。"
+                    "请基于原始问题和上下文，输出更适合检索的 query bundle。"
+                    "要求：保留原问题事实，不得虚构。"
+                    "你只能做规整、扩写、拆分、关键词抽取。"
+                    "query_variants 留空也可以，系统会自行补齐。",
+                ),
+                (
+                    "human",
+                    "检索场景：{retrieval_profile}\n"
+                    "原始问题：{query}\n\n"
+                    "补充上下文：\n{context}",
+                ),
+            ]
+        )
+        structured = RAGQueryBundle.model_validate(
+            self._invoke_structured_output_with_fallback(
+                prompt=prompt,
+                prompt_variables={
+                    "retrieval_profile": retrieval_profile,
+                    "query": query,
+                    "context": self._json_preview(context or {}, max_chars=2400),
+                },
+                response_model=RAGQueryBundle,
+                model_config=model_config,
+                fallback_result=fallback,
+            )
+        )
+        normalized_query = structured.normalized_query.strip() or fallback.normalized_query
+        rewritten_query = structured.rewritten_query.strip() or structured.normalized_query.strip() or fallback.rewritten_query
+        keyword_queries = self._dedupe_strings(structured.keyword_queries or fallback.keyword_queries, limit=3)
+        sub_queries = self._dedupe_strings(structured.sub_queries or fallback.sub_queries, limit=4)
+        must_terms = self._dedupe_strings(structured.must_terms or fallback.must_terms, limit=6)
+        filters = dict(fallback.filters)
+        filters.update({key: str(value) for key, value in structured.filters.items() if str(value).strip() != ""})
+        return structured.model_copy(
+            update={
+                "original_query": query.strip(),
+                "normalized_query": normalized_query,
+                "rewritten_query": rewritten_query,
+                "keyword_queries": keyword_queries,
+                "sub_queries": sub_queries,
+                "must_terms": must_terms,
+                "filters": filters,
+                "query_variants": self._build_query_variants(
+                    original_query=query.strip(),
+                    normalized_query=normalized_query,
+                    rewritten_query=rewritten_query,
+                    keyword_queries=keyword_queries,
+                    sub_queries=sub_queries,
+                ),
+            }
+        )
+
+    def _fallback_rerank_candidates(
+        self,
+        *,
+        query: str,
+        candidates: list[RetrievalCandidateDebug],
+        retrieval_profile: RetrievalProfile,
+    ) -> list[RetrievalCandidateDebug]:
+        tokens = set(self._dedupe_strings(self._identifier_terms(query) + self._chinese_terms(query), limit=8))
+        reranked: list[RetrievalCandidateDebug] = []
+        for candidate in candidates:
+            haystack = " ".join(
+                [
+                    candidate.document_name or "",
+                    candidate.relative_path or "",
+                    candidate.heading_path or "",
+                    candidate.snippet or "",
+                ]
+            ).lower()
+            overlap = 0.0
+            if tokens:
+                overlap = len([token for token in tokens if token.lower() in haystack]) / len(tokens)
+            score = 0.18 + min(0.42, overlap * 0.5) + min(0.25, candidate.fused_score * 6.0)
+            if retrieval_profile == "support_issue" and candidate.metadata.get("source") == "approved_case":
+                score += 0.08
+            useful_for_answer = score >= 0.38
+            reason = "关键词与标题/片段匹配度较高。" if overlap > 0 else "主要依赖 hybrid 融合分进入候选。"
+            reranked.append(
+                candidate.model_copy(
+                    update={
+                        "relevance_score": round(max(0.0, min(1.0, score)), 4),
+                        "useful_for_answer": useful_for_answer,
+                        "reason": reason,
+                    }
+                )
+            )
+        reranked.sort(key=lambda item: (item.relevance_score, item.fused_score), reverse=True)
+        return reranked
+
+    def rerank_retrieval_candidates(
+        self,
+        *,
+        query: str,
+        candidates: list[RetrievalCandidateDebug],
+        retrieval_profile: RetrievalProfile,
+        model_config: ModelConfig,
+    ) -> list[RetrievalCandidateDebug]:
+        """对候选片段做结构化 rerank。"""
+
+        if not candidates:
+            return []
+
+        top_candidates = candidates[:12]
+        fallback = self._fallback_rerank_candidates(
+            query=query,
+            candidates=top_candidates,
+            retrieval_profile=retrieval_profile,
+        )
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是 RAG Rerank 子 agent。"
+                    "请判断每个候选片段是否足以支撑回答当前问题。"
+                    "只允许基于候选本身做相关性判断，不允许编造内容。",
+                ),
+                (
+                    "human",
+                    "检索场景：{retrieval_profile}\n"
+                    "问题：{query}\n\n"
+                    "候选片段：\n{candidates}",
+                ),
+            ]
+        )
+        structured = RetrievalRerankBatch.model_validate(
+            self._invoke_structured_output_with_fallback(
+                prompt=prompt,
+                prompt_variables={
+                    "retrieval_profile": retrieval_profile,
+                    "query": query,
+                    "candidates": self._json_preview(
+                        [
+                            {
+                                "chunk_id": item.chunk_id,
+                                "document_name": item.document_name,
+                                "relative_path": item.relative_path,
+                                "heading_path": item.heading_path,
+                                "snippet": item.snippet,
+                                "fused_score": item.fused_score,
+                            }
+                            for item in top_candidates
+                        ],
+                        max_chars=6000,
+                    ),
+                },
+                response_model=RetrievalRerankBatch,
+                model_config=model_config,
+                fallback_result=RetrievalRerankBatch(
+                    items=[
+                        RetrievalRerankItem(
+                            chunk_id=item.chunk_id,
+                            relevance_score=item.relevance_score,
+                            useful_for_answer=item.useful_for_answer,
+                            reason=item.reason,
+                        )
+                        for item in fallback
+                    ]
+                ),
+            )
+        )
+        rerank_map = {
+            item.chunk_id: item
+            for item in structured.items
+            if item.chunk_id.strip() != ""
+        }
+        reranked: list[RetrievalCandidateDebug] = []
+        for fallback_item in fallback:
+            rerank_item = rerank_map.get(fallback_item.chunk_id)
+            if rerank_item is None:
+                reranked.append(fallback_item)
+                continue
+            reranked.append(
+                fallback_item.model_copy(
+                    update={
+                        "relevance_score": round(max(0.0, min(1.0, rerank_item.relevance_score)), 4),
+                        "useful_for_answer": bool(rerank_item.useful_for_answer),
+                        "reason": rerank_item.reason.strip() or fallback_item.reason,
+                    }
+                )
+            )
+        reranked.sort(key=lambda item: (item.relevance_score, item.fused_score), reverse=True)
+        return reranked
+
+    def _format_evidence_cards(self, evidence_cards: list[RetrievalCandidateDebug]) -> str:
+        lines: list[str] = []
+        for index, item in enumerate(evidence_cards, start=1):
+            lines.extend(
+                [
+                    f"[{index}] {item.document_name}",
+                    f"标题路径：{item.heading_path or item.tree_path or '/'}",
+                    f"文件路径：{item.relative_path or item.document_name}",
+                    f"命中原因：{item.reason or 'Hybrid 检索命中'}",
+                    f"片段：{item.snippet}",
+                    "",
+                ]
+            )
+        return "\n".join(lines).strip()
+
     def summarize_retrieval(
         self,
         *,
         query: str,
         citations: list[Citation],
         retrieval_context: str,
+        evidence_cards: list[RetrievalCandidateDebug] | None = None,
         model_config: ModelConfig,
         system_prompt: str | None = None,
     ) -> str:
+        normalized_cards = evidence_cards or []
+        if len(citations) == 0 and len(normalized_cards) == 0:
+            return "未检索到足够相关的证据片段。"
+        formatted_context = (
+            self._format_evidence_cards(normalized_cards)
+            if len(normalized_cards) > 0
+            else retrieval_context
+        )
         result = self.generate_response(
             query=query,
             messages=[],
             tool_outputs={},
             citations=citations,
-            retrieval_context=retrieval_context,
+            retrieval_context=formatted_context,
             model_config=model_config,
             system_prompt=system_prompt
-            or "你是检索工作台助手。请根据检索命中的片段做单次总结，说明依据来自哪些文档。",
+            or "你是检索工作台助手。请只根据已筛选的证据卡片做总结，明确说明依据来自哪些文档。"
+               "如果证据不足，要直接说明限制，不要编造答案。",
         )
         return result.answer
+
+    def _invoke_structured_output_with_fallback(
+        self,
+        *,
+        prompt: ChatPromptTemplate,
+        prompt_variables: dict[str, Any],
+        response_model: type[BaseModel],
+        model_config: ModelConfig,
+        fallback_result: BaseModel,
+    ) -> BaseModel:
+        """统一执行结构化输出，并在 learning mode / 调用失败时回退。
+
+        支持问题 Agent 的多子 agent 都走这条辅助逻辑，避免每个方法都重复：
+        - 解析 provider
+        - learning mode 兜底
+        - provider 不可用兜底
+        - 结构化输出失败兜底
+        """
+
+        normalized_config, provider = self.ensure_model_config_runnable(model_config)
+        if normalized_config.mode == "learning" or not self._provider_available(provider.protocol):
+            return fallback_result
+
+        try:
+            model = init_chat_model(**self._build_model_kwargs(provider, normalized_config))
+            prompt_value = prompt.invoke(prompt_variables)
+            result = model.with_structured_output(response_model).invoke(prompt_value.to_messages())
+            return response_model.model_validate(result)
+        except Exception:
+            return fallback_result
+
+    def classify_support_issue(
+        self,
+        *,
+        question: str,
+        composed_query: str,
+        module_value: str,
+        fallback_category: str,
+        similar_case_context: str,
+        model_config: ModelConfig,
+    ) -> SupportIssueClassificationResult:
+        """支持问题分类子 agent。
+
+        这里允许模型在固定类别集合内给出更贴近上下文的判断，
+        但如果结果异常、为空或超出允许集合，就严格回退到已有规则分类。
+        """
+
+        normalized_query = composed_query.strip() or question.strip()
+        allowed_categories = {"SQL排查", "配置排查", "环境差异", "需升级人工", "FAQ"}
+        fallback = SupportIssueClassificationResult(
+            category=fallback_category.strip() or "FAQ",
+            composed_query=normalized_query,
+            reasoning="已回退到内置规则分类结果。",
+            supervisor_notes="优先保持现有分类语义稳定。",
+        )
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是支持问题 Row Graph 的分类子 agent。"
+                    "你只能从以下类别中选择一个：SQL排查、配置排查、环境差异、需升级人工、FAQ。"
+                    "请同时返回适合检索的 composed_query，但不要捏造原问题中不存在的事实。",
+                ),
+                (
+                    "human",
+                    "模块：{module_value}\n"
+                    "原始问题：{question}\n\n"
+                    "当前组合查询：\n{composed_query}\n\n"
+                    "历史案例参考：\n{similar_case_context}",
+                ),
+            ]
+        )
+        structured = SupportIssueClassificationResult.model_validate(
+            self._invoke_structured_output_with_fallback(
+                prompt=prompt,
+                prompt_variables={
+                    "module_value": module_value or "未填写",
+                    "question": question or "未填写",
+                    "composed_query": normalized_query or "未填写",
+                    "similar_case_context": similar_case_context or "无",
+                },
+                response_model=SupportIssueClassificationResult,
+                model_config=model_config,
+                fallback_result=fallback,
+            )
+        )
+        category = structured.category.strip()
+        if category not in allowed_categories:
+            return fallback
+        return structured.model_copy(
+            update={
+                "category": category,
+                "composed_query": structured.composed_query.strip() or normalized_query,
+                "reasoning": structured.reasoning.strip() or fallback.reasoning,
+                "supervisor_notes": structured.supervisor_notes.strip() or fallback.supervisor_notes,
+            }
+        )
+
+    def draft_support_solution(
+        self,
+        *,
+        question: str,
+        category: str,
+        retrieval_summary: str,
+        retrieval_hit_count: int,
+        similar_case_context: str,
+        similar_case_count: int,
+        model_config: ModelConfig,
+    ) -> SupportIssueDraftResult:
+        """支持问题草稿子 agent。
+
+        真实模型可把检索总结整理成更像“支持答复”的格式；
+        但默认仍保留原有的“直接采用 retrieval summary”语义作为兜底。
+        """
+
+        fallback = SupportIssueDraftResult(
+            solution=retrieval_summary.strip(),
+            reasoning="已直接采用检索总结作为草稿答案。",
+            used_similar_case_count=similar_case_count,
+        )
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是支持问题 Row Graph 的草稿子 agent。"
+                    "请根据检索总结整理成可直接回写到飞书表的中文答复。"
+                    "要求：保留步骤化结构，不要编造检索结果中没有的信息。",
+                ),
+                (
+                    "human",
+                    "问题：{question}\n"
+                    "分类：{category}\n"
+                    "命中知识数：{retrieval_hit_count}\n\n"
+                    "检索总结：\n{retrieval_summary}\n\n"
+                    "历史案例参考：\n{similar_case_context}",
+                ),
+            ]
+        )
+        structured = SupportIssueDraftResult.model_validate(
+            self._invoke_structured_output_with_fallback(
+                prompt=prompt,
+                prompt_variables={
+                    "question": question or "未填写",
+                    "category": category or "FAQ",
+                    "retrieval_hit_count": retrieval_hit_count,
+                    "retrieval_summary": retrieval_summary or "无",
+                    "similar_case_context": similar_case_context or "无",
+                },
+                response_model=SupportIssueDraftResult,
+                model_config=model_config,
+                fallback_result=fallback,
+            )
+        )
+        return structured.model_copy(
+            update={
+                "solution": structured.solution.strip() or fallback.solution,
+                "reasoning": structured.reasoning.strip() or fallback.reasoning,
+                "used_similar_case_count": (
+                    structured.used_similar_case_count
+                    if structured.used_similar_case_count >= 0
+                    else similar_case_count
+                ),
+            }
+        )
+
+    def review_support_solution(
+        self,
+        *,
+        question: str,
+        category: str,
+        draft_solution: str,
+        retrieval_hit_count: int,
+        evidence_summary: str,
+        fallback_judge_status: str,
+        fallback_confidence_score: float,
+        fallback_reason: str,
+        model_config: ModelConfig,
+    ) -> SupportIssueReviewResult:
+        """支持问题复核子 agent。
+
+        这里使用“安全合并”策略：
+        - 现有规则判断仍然是保底基线；
+        - 模型只能把结果进一步降级为 `manual_review`，不能把原本应转人工的记录强行提升为 `pass`。
+        """
+
+        normalized_fallback_status = "pass" if fallback_judge_status == "pass" else "manual_review"
+        fallback = SupportIssueReviewResult(
+            judge_status=normalized_fallback_status,
+            confidence_score=max(0.0, min(1.0, fallback_confidence_score)),
+            judge_reason=fallback_reason.strip() or "已回退到内置复核结果。",
+            progress_value="AI分析完成" if normalized_fallback_status == "pass" else "待人工确认",
+            reviewer_notes="优先保留既有复核语义。",
+        )
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "system",
+                    "你是支持问题 Row Graph 的复核子 agent。"
+                    "请判断当前草稿是否足以直接交付，或应转人工确认。"
+                    "judge_status 只能是 pass 或 manual_review，confidence_score 取 0 到 1。",
+                ),
+                (
+                    "human",
+                    "问题：{question}\n"
+                    "分类：{category}\n"
+                    "命中知识数：{retrieval_hit_count}\n\n"
+                    "证据总结：\n{evidence_summary}\n\n"
+                    "草稿答案：\n{draft_solution}\n\n"
+                    "当前规则基线：status={fallback_judge_status}, confidence={fallback_confidence_score}, reason={fallback_reason}",
+                ),
+            ]
+        )
+        structured = SupportIssueReviewResult.model_validate(
+            self._invoke_structured_output_with_fallback(
+                prompt=prompt,
+                prompt_variables={
+                    "question": question or "未填写",
+                    "category": category or "FAQ",
+                    "retrieval_hit_count": retrieval_hit_count,
+                    "evidence_summary": evidence_summary or "无",
+                    "draft_solution": draft_solution or "无",
+                    "fallback_judge_status": normalized_fallback_status,
+                    "fallback_confidence_score": round(max(0.0, min(1.0, fallback_confidence_score)), 4),
+                    "fallback_reason": fallback.judge_reason,
+                },
+                response_model=SupportIssueReviewResult,
+                model_config=model_config,
+                fallback_result=fallback,
+            )
+        )
+        candidate_status = "pass" if structured.judge_status == "pass" else "manual_review"
+        candidate_confidence = max(0.0, min(1.0, structured.confidence_score))
+        candidate_reason = structured.judge_reason.strip() or fallback.judge_reason
+
+        if normalized_fallback_status != "pass":
+            final_status = "manual_review"
+            final_confidence = min(fallback.confidence_score, candidate_confidence)
+            final_reason = candidate_reason if candidate_status == "manual_review" else fallback.judge_reason
+        elif candidate_status != "pass":
+            final_status = "manual_review"
+            final_confidence = min(fallback.confidence_score, candidate_confidence)
+            final_reason = candidate_reason
+        else:
+            final_status = "pass"
+            final_confidence = max(fallback.confidence_score, candidate_confidence)
+            final_reason = candidate_reason or fallback.judge_reason
+
+        return structured.model_copy(
+            update={
+                "judge_status": final_status,
+                "confidence_score": round(max(0.0, min(1.0, final_confidence)), 4),
+                "judge_reason": final_reason,
+                "progress_value": "AI分析完成" if final_status == "pass" else "待人工确认",
+                "reviewer_notes": structured.reviewer_notes.strip() or fallback.reviewer_notes,
+            }
+        )
 
     def _json_preview(self, payload: Any, *, max_chars: int = 12000) -> str:
         try:
@@ -884,6 +1509,14 @@ class LLMService:
         bug_id = bug_code or bug_aid
         if bug_id == "":
             return None
+        jira_issue_id = (
+            self._field_cell_text(field_map.get("id", {}))
+            or self._field_cell_text(field_map.get("issueId", {}))
+            or self._pick_first_string(
+                {k: v for k, v in field_map.items()},
+                ("id", "issueId", "issue_id"),
+            )
+        )
 
         title = self._field_cell_text(field_map.get("title", {}))
         service_module_text = (
@@ -893,20 +1526,28 @@ class LLMService:
             or self._field_cell_text(field_map.get("productId", {}))
         )
         service, module = self._split_service_module(service_module_text)
+        customer_issue_type = (
+            self._field_cell_text(field_map.get("customerIssueType", {}))
+            or self._field_cell_text(field_map.get("customer_problem_type", {}))
+            or self._field_cell_text(field_map.get("customerProblemType", {}))
+            or self._field_cell_text(field_map.get("problemType", {}))
+        )
         status = self._field_cell_text(field_map.get("status", {}))
         assignee = self._field_cell_text(field_map.get("assignee", {}))
         reporter = self._field_cell_text(field_map.get("reporter", {}))
         priority = self._field_cell_text(field_map.get("priority", {}))
         created_at = self._field_cell_text(field_map.get("ctime", {}))
 
-        if title == "" and service == "" and module == "" and status == "":
+        if title == "" and service == "" and module == "" and status == "" and customer_issue_type == "":
             return None
 
         excerpt_payload = {
             "code": bug_code,
             "aid": bug_aid,
+            "jira_issue_id": jira_issue_id,
             "title": title,
             "category": service_module_text,
+            "customer_issue_type": customer_issue_type,
             "status": status,
             "assignee": self._field_cell_text(field_map.get("assignee", {})),
             "reporter": self._field_cell_text(field_map.get("reporter", {})),
@@ -914,10 +1555,12 @@ class LLMService:
         return ParsedBug(
             bug_id=bug_id,
             bug_aid=bug_aid,
+            jira_issue_id=jira_issue_id,
             title=title,
             service=service,
             module=module,
             category=service_module_text,
+            customer_issue_type=customer_issue_type,
             status=status,
             assignee=assignee,
             reporter=reporter,
@@ -960,7 +1603,7 @@ class LLMService:
     def _looks_like_bug_item(self, item: dict[str, Any]) -> bool:
         bug_id = self._pick_first_string(
             item,
-            ("bug_id", "id", "issue_id", "ticket_id", "work_item_id", "defect_id", "key"),
+            ("bug_id", "key", "id", "issue_id", "ticket_id", "work_item_id", "defect_id"),
         )
         if bug_id == "":
             return False
@@ -976,6 +1619,55 @@ class LLMService:
         )
         return supporting_score >= 1
 
+    def _extract_jira_issue_table_rows(self, payload: Any) -> list[ParsedBug]:
+        issue_table = payload.get("issueTable") if isinstance(payload, dict) and isinstance(payload.get("issueTable"), dict) else payload
+        if not isinstance(issue_table, dict):
+            return []
+
+        table = issue_table.get("table")
+        if not isinstance(table, list):
+            return []
+
+        results: list[ParsedBug] = []
+        seen: set[str] = set()
+        for index, row in enumerate(table):
+            if not isinstance(row, dict):
+                continue
+            bug_id = self._pick_first_string(row, ("key", "issuekey", "bug_id", "id"))
+            if bug_id == "":
+                issue_keys = issue_table.get("issueKeys")
+                if isinstance(issue_keys, list) and index < len(issue_keys):
+                    candidate = issue_keys[index]
+                    if isinstance(candidate, (str, int)) and str(candidate).strip() != "":
+                        bug_id = str(candidate).strip()
+            if bug_id == "":
+                continue
+
+            jira_issue_id = self._pick_first_string(row, ("id", "issueId", "issue_id", "jira_issue_id"))
+            if jira_issue_id == "":
+                issue_ids = issue_table.get("issueIds")
+                if isinstance(issue_ids, list) and index < len(issue_ids):
+                    candidate = issue_ids[index]
+                    if isinstance(candidate, (str, int)) and str(candidate).strip() != "":
+                        jira_issue_id = str(candidate).strip()
+
+            title = self._pick_first_string(row, ("summary", "title", "subject", "name"))
+            status = self._pick_first_string(row, ("status", "state", "bug_status", "workflow_status"))
+            if title == "" and status == "":
+                continue
+
+            bug = ParsedBug(
+                bug_id=bug_id,
+                jira_issue_id=jira_issue_id,
+                title=title,
+                status=status,
+                raw_excerpt=self._json_preview(row, max_chars=600),
+            )
+            if bug.bug_id not in seen:
+                seen.add(bug.bug_id)
+                results.append(bug)
+        return results
+
     def _heuristic_extract_bugs(self, payload: Any) -> list[ParsedBug]:
         """本地启发式抽取。
 
@@ -987,7 +1679,7 @@ class LLMService:
         results: list[ParsedBug] = []
         seen: set[str] = set()
 
-        table_results = self._extract_bug_rows_from_payload(payload)
+        table_results = self._extract_jira_issue_table_rows(payload) + self._extract_bug_rows_from_payload(payload)
         for bug in table_results:
             if bug.bug_id not in seen:
                 results.append(bug)
@@ -1005,15 +1697,20 @@ class LLMService:
                 bug = ParsedBug(
                     bug_id=self._pick_first_string(
                         node,
-                        ("bug_id", "id", "issue_id", "ticket_id", "work_item_id", "defect_id", "key"),
+                        ("bug_id", "key", "id", "issue_id", "ticket_id", "work_item_id", "defect_id"),
                     ),
                     bug_aid=self._pick_first_string(node, ("aid",)),
+                    jira_issue_id=self._pick_first_string(node, ("issueId", "issue_id", "jira_issue_id", "id")),
                     title=self._pick_first_string(node, ("title", "summary", "subject", "name", "bug_title")),
                     service=self._pick_first_string(
                         node,
                         ("service", "service_name", "app", "application", "system", "domain"),
                     ),
                     module=self._pick_first_string(node, ("module", "feature", "component", "area", "node", "function")),
+                    customer_issue_type=self._pick_first_string(
+                        node,
+                        ("customer_issue_type", "customerIssueType", "customer_problem_type", "customerProblemType"),
+                    ),
                     status=self._pick_first_string(node, ("status", "state", "bug_status", "workflow_status")),
                     raw_excerpt=self._json_preview(node, max_chars=600),
                 )
@@ -1036,9 +1733,16 @@ class LLMService:
         - Watcher 侧更关注把原始 JSON 归一成稳定业务对象。
         """
 
-        table_results = self._extract_bug_rows_from_payload(dashboard_payload)
+        table_results = self._extract_jira_issue_table_rows(dashboard_payload) + self._extract_bug_rows_from_payload(dashboard_payload)
         if len(table_results) > 0:
-            return table_results
+            deduped: list[ParsedBug] = []
+            seen: set[str] = set()
+            for item in table_results:
+                if item.bug_id in seen:
+                    continue
+                seen.add(item.bug_id)
+                deduped.append(item)
+            return deduped
 
         normalized_config, provider = self.ensure_model_config_runnable(model_config)
         fallback = self._heuristic_extract_bugs(dashboard_payload)
@@ -1082,14 +1786,16 @@ class LLMService:
         return self._heuristic_extract_bugs(dashboard_payload)
 
     def _fallback_owner_suggestion(self, bug: ParsedBug, owner_rules: list[OwnerRule]) -> WatcherOwnerSuggestion:
-        combined_text = " ".join([bug.title, bug.service, bug.module, bug.status, bug.raw_excerpt]).lower()
+        combined_text = " ".join(
+            [bug.title, bug.service, bug.module, bug.customer_issue_type, bug.status, bug.raw_excerpt]
+        ).lower()
         best_rule: OwnerRule | None = None
         best_score = 0
         best_terms: list[str] = []
 
         for rule in owner_rules:
             matched_terms: list[str] = []
-            for term in rule.services + rule.modules + rule.keywords:
+            for term in rule.services + rule.modules + rule.keywords + rule.customer_issue_types:
                 normalized = term.strip().lower()
                 if normalized == "":
                     continue
@@ -1121,7 +1827,7 @@ class LLMService:
 
         valid_rules = [rule for rule in owner_rules if rule.assignee_code.strip() != ""]
         if len(valid_rules) == 0:
-            return WatcherOwnerSuggestion(matched=False, match_source="unmatched", reason="没有可用的经办人编码规则。")
+            return WatcherOwnerSuggestion(matched=False, match_source="unmatched", reason="没有可用的转派目标规则。")
 
         normalized_config, provider = self.ensure_model_config_runnable(model_config)
         fallback = self._fallback_owner_suggestion(bug, valid_rules)
@@ -1134,14 +1840,14 @@ class LLMService:
                 [
                     (
                         "system",
-                        "你是 Bug 经办人归属助手。"
+                        "你是 Bug 转派归属助手。"
                         "请根据 bug 的 service/module/title/raw_excerpt，在候选规则中选出最可能的一条。"
-                        "若命中，返回 matched=true 且只填写 assignee_code；"
+                        "若命中，返回 matched=true 且只填写 assignee_code（这里表示最终转派目标）；"
                         "只有当你有足够依据时才 matched=true；否则返回 unmatched。",
                     ),
                     (
                         "human",
-                        "Bug 信息：\n{bug}\n\n候选经办人规则：\n{owner_rules}",
+                        "Bug 信息：\n{bug}\n\n候选转派规则：\n{owner_rules}",
                     ),
                 ]
             )
@@ -1151,10 +1857,11 @@ class LLMService:
                     "owner_rules": self._json_preview(
                         [
                             {
-                                "assignee_code": rule.assignee_code,
-                                "services": rule.services,
-                                "modules": rule.modules,
-                                "keywords": rule.keywords,
+                "assignee_code": rule.assignee_code,
+                "customer_issue_types": rule.customer_issue_types,
+                "services": rule.services,
+                "modules": rule.modules,
+                "keywords": rule.keywords,
                             }
                             for rule in valid_rules
                         ],
@@ -1205,7 +1912,7 @@ class LLMService:
                 lines.extend(
                     [
                         f"{index}. [{item.bug_id}] {item.title}",
-                        f"   PM aid：{item.bug_aid or '-'}",
+                        f"   辅助 ID：{item.jira_issue_id or item.bug_aid or '-'}",
                         f"   服务模块：{item.service or '-'} / {item.module or '-'}",
                         f"   状态优先级：{item.status or '-'} / {item.priority or '-'}",
                         f"   经办人：{item.assignee or '-'}",
@@ -1234,17 +1941,19 @@ class LLMService:
             lines.extend(
                 [
                     f"{index}. [{item.bug_id}] {item.title}",
-                    f"   PM aid：{item.bug_aid or '-'}",
+                    f"   辅助 ID：{item.jira_issue_id or item.bug_aid or '-'}",
                     f"   服务模块：{item.service or '-'} / {item.module or '-'}",
-                    f"   状态：{item.status or '-'}",
-                    f"   经办人编码：{item.assignee_code or '未匹配'}",
-                    f"   匹配来源：{item.match_source}",
-                    f"   匹配原因：{item.match_reason or '-'}",
-                    f"   分配结果：{item.assignment_status} {item.assignment_message or ''}".rstrip(),
+                        f"   状态：{item.status or '-'}",
+                        f"   转派目标：{item.assignee_code or '未匹配'}",
+                        f"   匹配来源：{item.match_source}",
+                        f"   匹配原因：{item.match_reason or '-'}",
+                        f"   分配结果：{item.assignment_status} {item.assignment_message or ''}".rstrip(),
                     "",
                 ]
             )
-        if not assignment_results and normalized_snapshot_bugs:
+        if not assignment_results and assign_current_list:
+            lines.append("当前列表没有命中可转派规则的 Bug。")
+        elif not assignment_results and normalized_snapshot_bugs:
             lines.append("本次邮件用于确认立即执行链路已跑通；当前没有新增 Bug 需要分配。")
         return "\n".join(lines).strip()
 
@@ -1286,7 +1995,7 @@ class LLMService:
                 rows.append(
                     "<tr>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.bug_id)}</td>"
-                    f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.bug_aid or '-')}</td>"
+                    f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.jira_issue_id or item.bug_aid or '-')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.title or '-')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.service or '-')} / {html.escape(item.module or '-')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.status or '-')}</td>"
@@ -1300,7 +2009,7 @@ class LLMService:
                 "<table style='width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;'>"
                 "<thead><tr style='background:#0f172a;'>"
                 "<th style='padding:10px 12px;text-align:left;'>Bug 编号</th>"
-                "<th style='padding:10px 12px;text-align:left;'>PM aid</th>"
+                "<th style='padding:10px 12px;text-align:left;'>辅助 ID</th>"
                 "<th style='padding:10px 12px;text-align:left;'>标题</th>"
                 "<th style='padding:10px 12px;text-align:left;'>服务 / 模块</th>"
                 "<th style='padding:10px 12px;text-align:left;'>状态</th>"
@@ -1317,7 +2026,7 @@ class LLMService:
                 rows.append(
                     "<tr>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.bug_id)}</td>"
-                    f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.bug_aid or '-')}</td>"
+                    f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.jira_issue_id or item.bug_aid or '-')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.title or '-')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.assignee_code or '未匹配')}</td>"
                     f"<td style='padding:10px 12px;border-bottom:1px solid #1e293b;'>{html.escape(item.assignment_status)}</td>"
@@ -1330,13 +2039,19 @@ class LLMService:
                 "<table style='width:100%;border-collapse:collapse;font-size:13px;color:#e2e8f0;'>"
                 "<thead><tr style='background:#0f172a;'>"
                 "<th style='padding:10px 12px;text-align:left;'>Bug 编号</th>"
-                "<th style='padding:10px 12px;text-align:left;'>PM aid</th>"
+                "<th style='padding:10px 12px;text-align:left;'>辅助 ID</th>"
                 "<th style='padding:10px 12px;text-align:left;'>标题</th>"
-                "<th style='padding:10px 12px;text-align:left;'>经办人编码</th>"
+                "<th style='padding:10px 12px;text-align:left;'>转派目标</th>"
                 "<th style='padding:10px 12px;text-align:left;'>分配结果</th>"
                 "<th style='padding:10px 12px;text-align:left;'>匹配原因</th>"
                 "</tr></thead>"
                 f"<tbody>{''.join(rows)}</tbody></table></div>"
+            )
+        elif assign_current_list:
+            assignment_html = (
+                "<div style='margin-top:16px;background:#111827;border:1px solid #334155;border-radius:16px;padding:20px;color:#cbd5e1;'>"
+                "当前列表没有命中可转派规则的 Bug。"
+                "</div>"
             )
         elif normalized_snapshot_bugs:
             assignment_html = (

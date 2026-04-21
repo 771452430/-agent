@@ -177,6 +177,44 @@ class UpdateWorkNotifySettingsRequest(BaseModel):
     contacts_cookie: str | None = None
 
 
+class RAGEmbeddingSettings(BaseModel):
+    """返回给前端的 RAG embedding 设置。
+
+    这里同时区分三层概念：
+    - `config_source`：配置来自环境变量、数据库，还是根本没配；
+    - `runtime_mode`：当前按配置解析后，最终会走 provider 还是 hashing fallback；
+    - `indexed_backend`：知识库里现有向量索引实际是按哪个 backend 建出来的。
+    """
+
+    configured: bool = False
+    config_source: Literal["environment", "database", "fallback"] = "fallback"
+    runtime_mode: Literal["provider", "hashing"] = "hashing"
+    provider_id: str = ""
+    model: str = ""
+    timeout_seconds: int = 20
+    preferred_backend: str = ""
+    indexed_backend: str = ""
+    reindex_required: bool = False
+
+
+class RAGEmbeddingRuntimeSettings(BaseModel):
+    """服务内部使用的真实 RAG embedding 配置。"""
+
+    provider_id: str | None = None
+    model: str | None = None
+    timeout_seconds: int = Field(default=20, ge=5, le=120)
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateRAGEmbeddingSettingsRequest(BaseModel):
+    """更新 RAG embedding 设置。"""
+
+    provider_id: str | None = None
+    model: str | None = None
+    timeout_seconds: int | None = Field(default=None, ge=5, le=120)
+
+
 class MailTestRequest(BaseModel):
     """测试发信请求。"""
 
@@ -398,6 +436,8 @@ class Citation(BaseModel):
     tree_path: str | None = None
     relative_path: str | None = None
     source_type: str | None = None
+    heading_path: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class FinalResponse(BaseModel):
@@ -457,6 +497,7 @@ class KnowledgeDocument(BaseModel):
     created_at: datetime
     error_message: str | None = None
     external_url: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class KnowledgeTreeNode(BaseModel):
@@ -560,6 +601,65 @@ class UpdateKnowledgeDocumentRequest(BaseModel):
     external_url: str | None = None
 
 
+RetrievalProfile = Literal["default", "support_issue"]
+
+
+class RAGQueryVariant(BaseModel):
+    """Query bundle 里的单条检索变体。"""
+
+    label: str
+    query: str
+    source: str = ""
+
+
+class RAGQueryBundle(BaseModel):
+    """一次检索使用的 query bundle。"""
+
+    original_query: str
+    normalized_query: str
+    rewritten_query: str = ""
+    keyword_queries: list[str] = Field(default_factory=list)
+    sub_queries: list[str] = Field(default_factory=list)
+    must_terms: list[str] = Field(default_factory=list)
+    filters: dict[str, str] = Field(default_factory=dict)
+    query_variants: list[RAGQueryVariant] = Field(default_factory=list)
+
+
+class RetrievalCandidateDebug(BaseModel):
+    """检索候选或 rerank 结果的调试结构。"""
+
+    chunk_id: str
+    document_id: str
+    document_name: str
+    snippet: str
+    tree_id: str | None = None
+    tree_path: str | None = None
+    relative_path: str | None = None
+    source_type: str | None = None
+    heading_path: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    source_query: str = ""
+    query_label: str = ""
+    matched_query_labels: list[str] = Field(default_factory=list)
+    lexical_score: float = 0.0
+    vector_score: float = 0.0
+    fused_score: float = 0.0
+    relevance_score: float = 0.0
+    useful_for_answer: bool = False
+    reason: str = ""
+
+
+class RetrievalDebugInfo(BaseModel):
+    """检索链路的最小必要调试信息。"""
+
+    retrieval_profile: RetrievalProfile = "default"
+    query_bundle: RAGQueryBundle
+    candidate_count: int = 0
+    selected_count: int = 0
+    selected_chunks: list[RetrievalCandidateDebug] = Field(default_factory=list)
+    rerank_preview: list[RetrievalCandidateDebug] = Field(default_factory=list)
+
+
 class RetrievalQueryRequest(BaseModel):
     """检索模式请求。"""
 
@@ -568,6 +668,7 @@ class RetrievalQueryRequest(BaseModel):
     query: str = Field(min_length=1)
     scope_type: ScopeType = "global"
     scope_id: str | None = None
+    retrieval_profile: RetrievalProfile = "default"
     model_settings: ModelConfig | None = Field(default=None, alias="model_config")
 
 
@@ -581,6 +682,7 @@ class RetrievalResult(BaseModel):
     retrieval_context: str = ""
     summary: str = ""
     related_document_links: list["RelatedDocumentLink"] = Field(default_factory=list)
+    debug: RetrievalDebugInfo | None = None
 
 
 class RelatedDocumentLink(BaseModel):
@@ -706,6 +808,7 @@ WatcherRunStatus = Literal["success", "no_change", "baseline_seeded", "partial_s
 WatcherMatchSource = Literal["rule", "llm", "unmatched"]
 WatcherAssignmentStatus = Literal["pending", "success", "failed", "skipped", "unmatched"]
 WatcherRequestMethod = Literal["GET", "POST"]
+WatcherMatchMode = Literal["llm_fallback", "fixed_match"]
 
 # -----------------------------
 # 巡检 Agent 相关模型
@@ -716,7 +819,7 @@ class OwnerRule(BaseModel):
 
     这里把“规则分配”单独建模，是为了让你能直观看到：
     - service / module / keyword 是确定性规则；
-    - assignee_code 是 PM 经办人编码；
+    - assignee_code 统一保存分配目标，既可以是 PM 经办人编码，也可以是 Jira 转派人；
     - LLM 兜底只在规则没命中时才会介入。
     """
 
@@ -726,6 +829,7 @@ class OwnerRule(BaseModel):
     services: list[str] = Field(default_factory=list)
     modules: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
+    customer_issue_types: list[str] = Field(default_factory=list)
     owner_name: str | None = None
     owner_email: str | None = None
     assignment_payload_template: dict[str, Any] | None = None
@@ -748,10 +852,14 @@ class ParsedBug(BaseModel):
 
     bug_id: str = Field(min_length=1)
     bug_aid: str = ""
+    jira_issue_id: str = ""
+    jira_form_token: str = ""
+    jira_atl_token: str = ""
     title: str = ""
     service: str = ""
     module: str = ""
     category: str = ""
+    customer_issue_type: str = ""
     status: str = ""
     assignee: str = ""
     reporter: str = ""
@@ -780,6 +888,9 @@ class WatcherAssignmentResult(BaseModel):
 
     bug_id: str
     bug_aid: str = ""
+    jira_issue_id: str = ""
+    jira_form_token: str = ""
+    jira_atl_token: str = ""
     title: str = ""
     service: str = ""
     module: str = ""
@@ -827,6 +938,12 @@ class WatcherAgentConfig(BaseModel):
     request_method: WatcherRequestMethod = "GET"
     request_headers: dict[str, str] = Field(default_factory=dict)
     request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
+    match_mode: WatcherMatchMode = "llm_fallback"
     poll_interval_minutes: int = Field(default=30, ge=1, le=24 * 60)
     sender_email: str = ""
     recipient_emails: list[str] = Field(default_factory=list)
@@ -856,6 +973,12 @@ class CreateWatcherRequest(BaseModel):
     request_method: WatcherRequestMethod = "GET"
     request_headers: dict[str, str] = Field(default_factory=dict)
     request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
+    match_mode: WatcherMatchMode = "llm_fallback"
     poll_interval_minutes: int = Field(default=30, ge=1, le=24 * 60)
     sender_email: str = ""
     recipient_emails: list[str] = Field(default_factory=list)
@@ -875,6 +998,12 @@ class UpdateWatcherRequest(BaseModel):
     request_method: WatcherRequestMethod | None = None
     request_headers: dict[str, str] | None = None
     request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod | None = None
+    detail_request_headers: dict[str, str] | None = None
+    detail_request_body_text: str | None = None
+    match_mode: WatcherMatchMode | None = None
     poll_interval_minutes: int | None = Field(default=None, ge=1, le=24 * 60)
     sender_email: str | None = None
     recipient_emails: list[str] | None = None
@@ -890,6 +1019,11 @@ class WatcherFetchTestRequest(BaseModel):
     request_method: WatcherRequestMethod = "GET"
     request_headers: dict[str, str] = Field(default_factory=dict)
     request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
 
 
 class RunWatcherRequest(BaseModel):
@@ -908,6 +1042,11 @@ class WatcherFetchTestResponse(BaseModel):
     request_method: WatcherRequestMethod
     request_headers: dict[str, str] = Field(default_factory=dict)
     request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
     response_content_type: str = ""
     response_body_preview: str = ""
     parsed_item_count: int = 0
@@ -942,6 +1081,8 @@ SupportIssueDigestRunStatus = Literal["success", "failed"]
 SupportIssueDigestTriggerSource = Literal["manual", "scheduled"]
 SupportIssueNotificationEventType = Literal["manual_review_assigned", "registrant_confirmed"]
 SupportIssueNotificationEventStatus = Literal["sent", "skipped", "failed"]
+SupportIssueGraphTracePhase = Literal["run", "row", "feedback", "digest"]
+SupportIssueGraphTraceStatus = Literal["success", "skipped", "failed"]
 
 # -----------------------------
 # 支持问题 Agent 相关模型
@@ -955,6 +1096,25 @@ class SupportIssueFeedbackSnapshot(BaseModel):
     comment: str = ""
 
 
+class SupportIssueGraphTraceEvent(BaseModel):
+    """支持问题 Agent 的轻量执行轨迹事件。
+
+    这份结构专门服务于 LangGraph 学习场景：
+    - `node` / `phase` 让你能看清楚当前节点属于哪条图；
+    - `status` / `message` 让你知道节点是成功、跳过还是失败；
+    - `payload_preview` 只保留调试摘要，避免把整份大状态直接塞到前端。
+    """
+
+    node: str
+    phase: SupportIssueGraphTracePhase
+    status: SupportIssueGraphTraceStatus
+    started_at: datetime
+    ended_at: datetime
+    message: str = ""
+    record_id: str | None = None
+    payload_preview: dict[str, object] = Field(default_factory=dict)
+
+
 class SupportIssueOwnerRule(BaseModel):
     """按业务模块匹配人工确认负责人。"""
 
@@ -962,10 +1122,50 @@ class SupportIssueOwnerRule(BaseModel):
     yht_user_id: str = ""
 
 
+class SupportIssueClassificationResult(BaseModel):
+    """分类子 agent 的结构化输出。"""
+
+    category: str = ""
+    composed_query: str = ""
+    reasoning: str = ""
+    supervisor_notes: str = ""
+
+
+class SupportIssueEvidenceResult(BaseModel):
+    """证据子 agent 的结构化输出。"""
+
+    retrieval_hit_count: int = 0
+    evidence_summary: str = ""
+    no_hit: bool = False
+    source_note: str = ""
+
+
+class SupportIssueDraftResult(BaseModel):
+    """草稿子 agent 的结构化输出。"""
+
+    solution: str = ""
+    reasoning: str = ""
+    used_similar_case_count: int = 0
+
+
+class SupportIssueReviewResult(BaseModel):
+    """复核子 agent 的结构化输出。"""
+
+    judge_status: Literal["pass", "manual_review"] = "manual_review"
+    confidence_score: float = 0.0
+    judge_reason: str = ""
+    progress_value: str = ""
+    reviewer_notes: str = ""
+
+
 class SupportIssueRowResult(BaseModel):
     """支持问题 Agent 的单行处理结果。"""
 
     record_id: str
+    source_record_id: str = ""
+    source_table_id: str = ""
+    source_table_name: str = ""
+    source_bitable_url: str = ""
     question: str = ""
     status: SupportIssueRowResultStatus
     solution: str = ""
@@ -978,6 +1178,11 @@ class SupportIssueRowResult(BaseModel):
     question_category: str = ""
     similar_case_count: int = 0
     feedback_snapshot: SupportIssueFeedbackSnapshot | None = None
+    classification_result: SupportIssueClassificationResult | None = None
+    evidence_result: SupportIssueEvidenceResult | None = None
+    draft_result: SupportIssueDraftResult | None = None
+    review_result: SupportIssueReviewResult | None = None
+    graph_trace: list[SupportIssueGraphTraceEvent] = Field(default_factory=list)
 
 
 class SupportIssueAgentConfig(BaseModel):
@@ -1110,6 +1315,7 @@ class SupportIssueRun(BaseModel):
     summary: str = ""
     error_message: str | None = None
     row_results: list[SupportIssueRowResult] = Field(default_factory=list)
+    graph_trace: list[SupportIssueGraphTraceEvent] = Field(default_factory=list)
 
 
 class SupportIssueCategoryStat(BaseModel):
@@ -1180,6 +1386,7 @@ class SupportIssueFeedbackSyncResponse(BaseModel):
     candidate_created_count: int = 0
     candidate_updated_count: int = 0
     summary: str = ""
+    graph_trace: list[SupportIssueGraphTraceEvent] = Field(default_factory=list)
 
 
 class SupportIssueCaseCandidate(BaseModel):
@@ -1266,6 +1473,7 @@ class SupportIssueDigestRun(BaseModel):
     knowledge_gap_suggestions: list[str] = Field(default_factory=list)
     new_candidate_count: int = 0
     approved_candidate_count: int = 0
+    graph_trace: list[SupportIssueGraphTraceEvent] = Field(default_factory=list)
 
 
 class SupportIssueNotificationEvent(BaseModel):

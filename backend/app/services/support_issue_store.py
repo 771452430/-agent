@@ -27,6 +27,7 @@ from ..schemas import (
     SupportIssueCategoryStat,
     SupportIssueDigestRun,
     SupportIssueFeedbackFact,
+    SupportIssueGraphTraceEvent,
     SupportIssueNotificationEvent,
     SupportIssueOwnerRule,
     SupportIssueRowResult,
@@ -220,7 +221,8 @@ class SupportIssueStore:
                     failed_count INTEGER NOT NULL,
                     summary TEXT NOT NULL,
                     error_message TEXT,
-                    row_results_json TEXT NOT NULL
+                    row_results_json TEXT NOT NULL,
+                    graph_trace_json TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE TABLE IF NOT EXISTS support_issue_feedback_facts (
@@ -308,7 +310,8 @@ class SupportIssueStore:
                     highlight_samples_json TEXT NOT NULL DEFAULT '[]',
                     knowledge_gap_suggestions_json TEXT NOT NULL DEFAULT '[]',
                     new_candidate_count INTEGER NOT NULL DEFAULT 0,
-                    approved_candidate_count INTEGER NOT NULL DEFAULT 0
+                    approved_candidate_count INTEGER NOT NULL DEFAULT 0,
+                    graph_trace_json TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE TABLE IF NOT EXISTS support_issue_notification_events (
@@ -426,9 +429,21 @@ class SupportIssueStore:
             )
             self._ensure_column(
                 conn,
+                "support_issue_runs",
+                "graph_trace_json",
+                "TEXT NOT NULL DEFAULT '[]'",
+            )
+            self._ensure_column(
+                conn,
                 "support_issue_digest_runs",
                 "trigger_source",
                 "TEXT NOT NULL DEFAULT 'manual'",
+            )
+            self._ensure_column(
+                conn,
+                "support_issue_digest_runs",
+                "graph_trace_json",
+                "TEXT NOT NULL DEFAULT '[]'",
             )
 
             # 把新增列的空值补齐为默认值，保证旧数据读取稳定。
@@ -480,6 +495,14 @@ class SupportIssueStore:
                 "UPDATE support_issue_agents SET case_review_enabled = 1 "
                 "WHERE case_review_enabled IS NULL"
             )
+            conn.execute(
+                "UPDATE support_issue_runs SET graph_trace_json = '[]' "
+                "WHERE graph_trace_json IS NULL OR graph_trace_json = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_digest_runs SET graph_trace_json = '[]' "
+                "WHERE graph_trace_json IS NULL OR graph_trace_json = ''"
+            )
 
             # 案例候选池两态化迁移：
             # 历史版本里存在 `returned / rejected / analysis_only` 三种状态。
@@ -499,6 +522,12 @@ class SupportIssueStore:
     def _parse_row_results(self, raw: str | None) -> list[SupportIssueRowResult]:
         items = _safe_load_json_list(raw)
         return [SupportIssueRowResult.model_validate(item) for item in items if isinstance(item, dict)]
+
+    def _parse_graph_trace(self, raw: str | None) -> list[SupportIssueGraphTraceEvent]:
+        """解析运行轨迹 JSON，并对旧数据做安全兜底。"""
+
+        items = _safe_load_json_list(raw)
+        return [SupportIssueGraphTraceEvent.model_validate(item) for item in items if isinstance(item, dict)]
 
     def _parse_category_stats(self, raw: str | None) -> list[SupportIssueCategoryStat]:
         items = _safe_load_json_list(raw)
@@ -567,6 +596,7 @@ class SupportIssueStore:
             summary=row["summary"] or "",
             error_message=row["error_message"],
             row_results=self._parse_row_results(row["row_results_json"]),
+            graph_trace=self._parse_graph_trace(row["graph_trace_json"]),
         )
 
     def _row_to_feedback_fact(self, row: sqlite3.Row) -> SupportIssueFeedbackFact:
@@ -661,6 +691,7 @@ class SupportIssueStore:
             ],
             new_candidate_count=int(row["new_candidate_count"] or 0),
             approved_candidate_count=int(row["approved_candidate_count"] or 0),
+            graph_trace=self._parse_graph_trace(row["graph_trace_json"]),
         )
 
     def _row_to_notification_event(self, row: sqlite3.Row) -> SupportIssueNotificationEvent:
@@ -988,9 +1019,10 @@ class SupportIssueStore:
                 INSERT INTO support_issue_runs (
                     id, agent_id, status, started_at, ended_at,
                     fetched_row_count, processed_row_count, generated_count,
-                    manual_review_count, no_hit_count, failed_count, summary, error_message, row_results_json
+                    manual_review_count, no_hit_count, failed_count, summary, error_message, row_results_json,
+                    graph_trace_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -1007,6 +1039,7 @@ class SupportIssueStore:
                     run.summary,
                     run.error_message,
                     json.dumps([item.model_dump(mode="json") for item in run.row_results], ensure_ascii=False),
+                    json.dumps([item.model_dump(mode="json") for item in run.graph_trace], ensure_ascii=False),
                 ),
             )
             conn.execute(
@@ -1459,9 +1492,9 @@ class SupportIssueStore:
                     acceptance_count, revised_acceptance_count, rejected_count,
                     acceptance_rate, rejection_rate, low_confidence_rate, no_hit_rate, manual_rewrite_rate,
                     top_categories_json, top_no_hit_topics_json, highlight_samples_json, knowledge_gap_suggestions_json,
-                    new_candidate_count, approved_candidate_count
+                    new_candidate_count, approved_candidate_count, graph_trace_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run.id,
@@ -1496,6 +1529,7 @@ class SupportIssueStore:
                     json.dumps(run.knowledge_gap_suggestions, ensure_ascii=False),
                     run.new_candidate_count,
                     run.approved_candidate_count,
+                    json.dumps([item.model_dump(mode="json") for item in run.graph_trace], ensure_ascii=False),
                 ),
             )
 

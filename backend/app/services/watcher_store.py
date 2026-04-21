@@ -64,6 +64,12 @@ class WatcherStore:
                     request_method TEXT NOT NULL DEFAULT 'GET',
                     request_headers_json TEXT NOT NULL,
                     request_body_json TEXT NOT NULL DEFAULT 'null',
+                    request_body_text TEXT,
+                    detail_url_template TEXT,
+                    detail_request_method TEXT NOT NULL DEFAULT 'GET',
+                    detail_request_headers_json TEXT NOT NULL DEFAULT '{}',
+                    detail_request_body_text TEXT,
+                    match_mode TEXT NOT NULL DEFAULT 'llm_fallback',
                     poll_interval_minutes INTEGER NOT NULL,
                     sender_email TEXT NOT NULL,
                     recipient_emails_json TEXT NOT NULL,
@@ -109,6 +115,12 @@ class WatcherStore:
             )
             self._ensure_column(conn, "watcher_agents", "request_method", "TEXT NOT NULL DEFAULT 'GET'")
             self._ensure_column(conn, "watcher_agents", "request_body_json", "TEXT NOT NULL DEFAULT 'null'")
+            self._ensure_column(conn, "watcher_agents", "request_body_text", "TEXT")
+            self._ensure_column(conn, "watcher_agents", "detail_url_template", "TEXT")
+            self._ensure_column(conn, "watcher_agents", "detail_request_method", "TEXT NOT NULL DEFAULT 'GET'")
+            self._ensure_column(conn, "watcher_agents", "detail_request_headers_json", "TEXT NOT NULL DEFAULT '{}'")
+            self._ensure_column(conn, "watcher_agents", "detail_request_body_text", "TEXT")
+            self._ensure_column(conn, "watcher_agents", "match_mode", "TEXT NOT NULL DEFAULT 'llm_fallback'")
             self._ensure_column(conn, "watcher_agents", "consecutive_failure_count", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(conn, "watcher_agents", "auto_disabled_at", "TEXT")
             self._ensure_column(conn, "watcher_agents", "auto_disabled_reason", "TEXT")
@@ -136,6 +148,12 @@ class WatcherStore:
             request_method=row["request_method"] or "GET",
             request_headers=json.loads(row["request_headers_json"] or "{}"),
             request_body_json=json.loads(row["request_body_json"] or "null"),
+            request_body_text=row["request_body_text"],
+            detail_url_template=row["detail_url_template"],
+            detail_request_method=row["detail_request_method"] or "GET",
+            detail_request_headers=json.loads(row["detail_request_headers_json"] or "{}"),
+            detail_request_body_text=row["detail_request_body_text"],
+            match_mode=row["match_mode"] or "llm_fallback",
             poll_interval_minutes=int(row["poll_interval_minutes"]),
             sender_email=row["sender_email"] or "",
             recipient_emails=json.loads(row["recipient_emails_json"] or "[]"),
@@ -209,13 +227,14 @@ class WatcherStore:
             conn.execute(
                 """
                 INSERT INTO watcher_agents (
-                    id, name, description, dashboard_url, request_method, request_headers_json, request_body_json,
+                    id, name, description, dashboard_url, request_method, request_headers_json, request_body_json, request_body_text,
+                    detail_url_template, detail_request_method, detail_request_headers_json, detail_request_body_text, match_mode,
                     poll_interval_minutes, sender_email, recipient_emails_json,
                     model_config_json, enabled, owner_rules_json,
                     created_at, updated_at, last_run_at, next_run_at,
                     consecutive_failure_count, auto_disabled_at, auto_disabled_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     watcher_id,
@@ -225,6 +244,12 @@ class WatcherStore:
                     request.request_method,
                     json.dumps(request.request_headers, ensure_ascii=False),
                     json.dumps(request.request_body_json, ensure_ascii=False),
+                    request.request_body_text.strip() if request.request_body_text else None,
+                    request.detail_url_template.strip() if request.detail_url_template else None,
+                    request.detail_request_method,
+                    json.dumps(request.detail_request_headers, ensure_ascii=False),
+                    request.detail_request_body_text.strip() if request.detail_request_body_text else None,
+                    request.match_mode,
                     request.poll_interval_minutes,
                     request.sender_email,
                     json.dumps(request.recipient_emails, ensure_ascii=False),
@@ -276,16 +301,46 @@ class WatcherStore:
         next_request_method = request.request_method if request.request_method is not None else current.request_method
         if next_request_method == "GET":
             next_request_body_json = None
-        elif request.request_body_json is not None:
+            next_request_body_text = None
+        elif "request_body_json" in request.model_fields_set:
             next_request_body_json = request.request_body_json
         else:
             next_request_body_json = current.request_body_json
+        if next_request_method == "GET":
+            next_request_body_text = None
+        elif "request_body_text" in request.model_fields_set:
+            next_request_body_text = request.request_body_text.strip() if request.request_body_text else None
+        else:
+            next_request_body_text = current.request_body_text
+        if "detail_url_template" in request.model_fields_set:
+            next_detail_url_template = request.detail_url_template.strip() if request.detail_url_template else None
+        else:
+            next_detail_url_template = current.detail_url_template
+        next_match_mode = request.match_mode if request.match_mode is not None else current.match_mode
+        next_detail_request_method = (
+            request.detail_request_method if request.detail_request_method is not None else current.detail_request_method
+        )
+        if next_detail_url_template is None:
+            next_detail_request_method = "GET"
+            next_detail_request_headers: dict[str, str] = {}
+            next_detail_request_body_text = None
+        else:
+            next_detail_request_headers = (
+                request.detail_request_headers if request.detail_request_headers is not None else current.detail_request_headers
+            )
+            if next_detail_request_method == "GET":
+                next_detail_request_body_text = None
+            elif "detail_request_body_text" in request.model_fields_set:
+                next_detail_request_body_text = request.detail_request_body_text.strip() if request.detail_request_body_text else None
+            else:
+                next_detail_request_body_text = current.detail_request_body_text
 
         with self._connect() as conn:
             conn.execute(
                 """
                 UPDATE watcher_agents
-                SET name = ?, description = ?, dashboard_url = ?, request_method = ?, request_headers_json = ?, request_body_json = ?,
+                SET name = ?, description = ?, dashboard_url = ?, request_method = ?, request_headers_json = ?, request_body_json = ?, request_body_text = ?,
+                    detail_url_template = ?, detail_request_method = ?, detail_request_headers_json = ?, detail_request_body_text = ?, match_mode = ?,
                     poll_interval_minutes = ?, sender_email = ?, recipient_emails_json = ?,
                     model_config_json = ?, enabled = ?, owner_rules_json = ?, updated_at = ?, next_run_at = ?,
                     consecutive_failure_count = ?, auto_disabled_at = ?, auto_disabled_reason = ?
@@ -301,6 +356,12 @@ class WatcherStore:
                         ensure_ascii=False,
                     ),
                     json.dumps(next_request_body_json, ensure_ascii=False),
+                    next_request_body_text,
+                    next_detail_url_template,
+                    next_detail_request_method,
+                    json.dumps(next_detail_request_headers, ensure_ascii=False),
+                    next_detail_request_body_text,
+                    next_match_mode,
                     next_poll_interval,
                     request.sender_email if request.sender_email is not None else current.sender_email,
                     json.dumps(

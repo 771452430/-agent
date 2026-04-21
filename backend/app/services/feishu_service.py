@@ -268,6 +268,9 @@ class FeishuService:
     def _fields_base_url(self, *, app_token: str, table_id: str) -> str:
         return f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
 
+    def _tables_base_url(self, *, app_token: str) -> str:
+        return f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables"
+
     def _request_json(
         self,
         *,
@@ -340,6 +343,28 @@ class FeishuService:
     def list_bitable_fields(self, *, app_token: str, table_id: str, page_size: int = 100) -> list[dict[str, Any]]:
         self._require_runtime_settings()
         base_url = self._fields_base_url(app_token=app_token, table_id=table_id)
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            payload = self._request_json(
+                method="GET",
+                url=base_url,
+                query_params={"page_size": page_size, "page_token": page_token},
+            )
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            batch = data.get("items") if isinstance(data.get("items"), list) else []
+            items.extend(item for item in batch if isinstance(item, dict))
+            has_more = bool(data.get("has_more"))
+            page_token = str(data.get("page_token") or "").strip() or None
+            if not has_more or page_token is None:
+                break
+        return items
+
+    def list_bitable_tables(self, *, app_token: str, page_size: int = 100) -> list[dict[str, Any]]:
+        """列出一个多维表格 app 下的全部分页（table）。"""
+
+        self._require_runtime_settings()
+        base_url = self._tables_base_url(app_token=app_token)
         items: list[dict[str, Any]] = []
         page_token: str | None = None
         while True:

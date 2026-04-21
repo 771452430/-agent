@@ -21,6 +21,12 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from ..graphs.support_issue_graph import (
+    SupportIssueDigestGraph,
+    SupportIssueFeedbackGraph,
+    SupportIssueRowGraph,
+    SupportIssueRunGraph,
+)
 from ..rag.pipeline import RAGPipeline
 from ..schemas import (
     CreateSupportIssueAgentRequest,
@@ -47,6 +53,7 @@ from ..schemas import (
     SupportIssueNotificationEvent,
     SupportIssueOwnerRule,
     SupportIssueInsights,
+    SupportIssueGraphTraceEvent,
     SupportIssueRowResult,
     SupportIssueRun,
     UpdateSupportIssueCaseCandidateRequest,
@@ -113,6 +120,10 @@ SUPPORT_ISSUE_SYSTEM_PROMPT = (
     "优先给出排查步骤、处理建议和注意事项；如果信息不足，明确说明限制；"
     "不要编造知识库中不存在的信息；不要输出多余寒暄。"
 )
+ROW_TABLE_ID_KEY = "__agentdemo_table_id"
+ROW_TABLE_NAME_KEY = "__agentdemo_table_name"
+ROW_BITABLE_URL_KEY = "__agentdemo_bitable_url"
+SCOPED_RECORD_ID_SEPARATOR = "::"
 
 
 class SupportIssueService:
@@ -140,8 +151,21 @@ class SupportIssueService:
         self.mail_service = mail_service
         self.yonyou_work_notify_service = yonyou_work_notify_service or YonyouWorkNotifyService()
         self.yonyou_contacts_search_service = yonyou_contacts_search_service or YonyouContactsSearchService()
-        self.rag_pipeline = RAGPipeline(knowledge_store)
+        # RAGPipeline 已经升级为需要 LLMService 参与 query bundle 与 rerank。
+        self.rag_pipeline = RAGPipeline(knowledge_store, llm_service)
         self.retrieval_service = RetrievalService(knowledge_store, llm_service)
+        # 支持问题 Agent 的核心执行链路改造成三张图：
+        # - row_graph 负责单行；
+        # - feedback_graph 负责全表反馈同步；
+        # - digest_graph / run_graph 分别负责汇总与主运行。
+        self.support_issue_row_graph = SupportIssueRowGraph(self)
+        self.support_issue_feedback_graph = SupportIssueFeedbackGraph(self)
+        self.support_issue_digest_graph = SupportIssueDigestGraph(self, self.support_issue_feedback_graph)
+        self.support_issue_run_graph = SupportIssueRunGraph(
+            self,
+            self.support_issue_row_graph,
+            self.support_issue_feedback_graph,
+        )
 
     def _require_runnable_model_config(self, model_config: ModelConfig | None) -> ModelConfig:
         try:
@@ -1043,10 +1067,12 @@ class SupportIssueService:
         record_id: str,
         progress_field_name: str,
         progress_value: str,
+        table_id: str | None = None,
     ) -> None:
         self._update_row_fields(
             agent,
             record_id=record_id,
+            table_id=table_id,
             fields={progress_field_name: progress_value},
         )
 
@@ -1073,6 +1099,149 @@ class SupportIssueService:
         """
 
         return str(row.get("record_id") or row.get("recordId") or "").strip()
+
+    def _build_scoped_record_id(self, *, table_id: str, record_id: str) -> str:
+        """把多页签记录包装成带 table_id 的稳定主键。
+
+        这样 SQLite 里的反馈事实、候选案例和通知日志就不会因为不同页签
+        恰好出现同名 `record_id` 而互相覆盖。
+        """
+
+        normalized_table_id = table_id.strip()
+        normalized_record_id = record_id.strip()
+        if normalized_record_id == "":
+            return ""
+        if normalized_table_id == "":
+            return normalized_record_id
+        return f"{normalized_table_id}{SCOPED_RECORD_ID_SEPARATOR}{normalized_record_id}"
+
+    def _split_scoped_record_id(
+        self,
+        agent: SupportIssueAgentConfig,
+        scoped_record_id: str,
+        *,
+        table_id: str | None = None,
+    ) -> tuple[str, str]:
+        """拆分 scoped record_id，并兼容老数据只有原始 record_id 的情况。"""
+
+        normalized_scoped_id = scoped_record_id.strip()
+        explicit_table_id = (table_id or "").strip()
+        if SCOPED_RECORD_ID_SEPARATOR in normalized_scoped_id:
+            split_index = normalized_scoped_id.find(SCOPED_RECORD_ID_SEPARATOR)
+            parsed_table_id = normalized_scoped_id[:split_index].strip()
+            raw_record_id = normalized_scoped_id[split_index + len(SCOPED_RECORD_ID_SEPARATOR) :].strip()
+            return parsed_table_id or explicit_table_id or agent.feishu_table_id, raw_record_id
+        return explicit_table_id or agent.feishu_table_id, normalized_scoped_id
+
+    def _row_table_id(self, row: dict[str, Any], *, agent: SupportIssueAgentConfig | None = None) -> str:
+        normalized_table_id = str(row.get(ROW_TABLE_ID_KEY) or "").strip()
+        if normalized_table_id != "":
+            return normalized_table_id
+        if agent is not None:
+            return agent.feishu_table_id
+        return ""
+
+    def _row_table_name(self, row: dict[str, Any]) -> str:
+        return str(row.get(ROW_TABLE_NAME_KEY) or "").strip()
+
+    def _row_bitable_url(self, row: dict[str, Any], *, agent: SupportIssueAgentConfig) -> str:
+        row_bitable_url = str(row.get(ROW_BITABLE_URL_KEY) or "").strip()
+        if row_bitable_url != "":
+            return row_bitable_url
+        table_id = self._row_table_id(row, agent=agent)
+        return self._build_table_bitable_url(agent, table_id=table_id)
+
+    def _annotate_row_with_table_context(
+        self,
+        *,
+        row: dict[str, Any],
+        table_id: str,
+        table_name: str,
+        bitable_url: str,
+    ) -> dict[str, Any]:
+        annotated = dict(row)
+        annotated[ROW_TABLE_ID_KEY] = table_id
+        annotated[ROW_TABLE_NAME_KEY] = table_name
+        annotated[ROW_BITABLE_URL_KEY] = bitable_url
+        return annotated
+
+    def _build_table_bitable_url(self, agent: SupportIssueAgentConfig, *, table_id: str) -> str:
+        """基于当前 Agent 的 base app，生成指向目标页签的飞书地址。"""
+
+        try:
+            parsed = self._build_bitable_context(agent.feishu_bitable_url)
+        except ValueError:
+            parsed = {"host": self.feishu_service.DEFAULT_BITABLE_HOST, "view_id": None}
+        host = str(parsed.get("host") or self.feishu_service.DEFAULT_BITABLE_HOST)
+        # 只有 Agent 当前选中的默认页签继续沿用 view_id，其它页签只保留 table 参数。
+        view_id = parsed.get("view_id") if table_id == agent.feishu_table_id else None
+        return self.feishu_service.build_bitable_url(
+            app_token=agent.feishu_app_token,
+            table_id=table_id,
+            view_id=str(view_id) if view_id is not None else None,
+            host=host,
+        )
+
+    def _list_agent_table_contexts(self, agent: SupportIssueAgentConfig) -> list[dict[str, str]]:
+        """列出当前多维表格 app 下需要参与处理的全部分页。"""
+
+        raw_tables = self.feishu_service.list_bitable_tables(app_token=agent.feishu_app_token)
+        table_contexts: list[dict[str, str]] = []
+        seen_table_ids: set[str] = set()
+        for item in raw_tables:
+            table_id = str(item.get("table_id") or item.get("tableId") or "").strip()
+            if table_id == "" or table_id in seen_table_ids:
+                continue
+            seen_table_ids.add(table_id)
+            table_contexts.append(
+                {
+                    "table_id": table_id,
+                    "table_name": str(item.get("name") or item.get("table_name") or item.get("tableName") or "").strip(),
+                    "bitable_url": self._build_table_bitable_url(agent, table_id=table_id),
+                }
+            )
+
+        # 接口异常兜底或历史场景下，至少保证当前 Agent 选中的默认页签仍然可运行。
+        if len(table_contexts) == 0:
+            table_contexts.append(
+                {
+                    "table_id": agent.feishu_table_id,
+                    "table_name": "",
+                    "bitable_url": self._build_table_bitable_url(agent, table_id=agent.feishu_table_id),
+                }
+            )
+        elif agent.feishu_table_id not in seen_table_ids:
+            table_contexts.append(
+                {
+                    "table_id": agent.feishu_table_id,
+                    "table_name": "",
+                    "bitable_url": self._build_table_bitable_url(agent, table_id=agent.feishu_table_id),
+                }
+            )
+
+        table_contexts.sort(key=lambda item: (0 if item["table_id"] == agent.feishu_table_id else 1, item["table_name"], item["table_id"]))
+        return table_contexts
+
+    def _list_all_agent_rows(self, agent: SupportIssueAgentConfig) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        """读取整个多维表格 app 下所有页签的记录，并附带来源表上下文。"""
+
+        table_contexts = self._list_agent_table_contexts(agent)
+        all_rows: list[dict[str, Any]] = []
+        for table_context in table_contexts:
+            rows = self.feishu_service.list_bitable_records(
+                app_token=agent.feishu_app_token,
+                table_id=table_context["table_id"],
+            )
+            for row in rows:
+                all_rows.append(
+                    self._annotate_row_with_table_context(
+                        row=row,
+                        table_id=table_context["table_id"],
+                        table_name=table_context["table_name"],
+                        bitable_url=table_context["bitable_url"],
+                    )
+                )
+        return all_rows, table_contexts
 
     def _extract_urls_from_field_value(self, value: Any) -> list[str]:
         """从飞书字段值里尽量还原 URL 列表。
@@ -1184,6 +1353,7 @@ class SupportIssueService:
         fields: dict[str, Any],
         resolved_fields: dict[str, FeishuBitableFieldInfo],
         synced_at: datetime,
+        source_bitable_url: str | None = None,
     ) -> SupportIssueFeedbackFact:
         """把一行飞书记录抽成结构化反馈事实。
 
@@ -1219,7 +1389,7 @@ class SupportIssueService:
             confidence_score=self._parse_float_field_value(fields.get(confidence_field.field_name)),
             retrieval_hit_count=self._parse_int_field_value(fields.get(hit_count_field.field_name)),
             question_category=question_category,
-            source_bitable_url=agent.feishu_bitable_url,
+            source_bitable_url=(source_bitable_url or "").strip() or agent.feishu_bitable_url,
             created_at=synced_at,
             updated_at=synced_at,
             last_synced_at=synced_at,
@@ -1231,6 +1401,8 @@ class SupportIssueService:
         agent: SupportIssueAgentConfig,
         run_id: str,
         record_id: str,
+        source_bitable_url: str,
+        source_table_name: str,
         question: str,
         module_value: str,
         solution: str,
@@ -1254,11 +1426,12 @@ class SupportIssueService:
         topic = self._question_topic(question)
         title = f"支持问题待人工确认｜{module_value or '未分类模块'}"
         content = (
+            f"页签：{source_table_name or '未命名页签'}\n"
             f"模块：{module_value or '未分类模块'}\n"
             f"问题：{topic}\n"
             f"当前进度：{MANUAL_REVIEW_PROGRESS_VALUE}\n"
             f"处理摘要：{self._short_text(solution or NO_HIT_MESSAGE)}\n"
-            f"飞书表：{agent.feishu_bitable_url}\n"
+            f"飞书表：{source_bitable_url}\n"
             f"record_id：{record_id}"
         )
         self._send_yonyou_notification(
@@ -1269,7 +1442,7 @@ class SupportIssueService:
             src_msg_id=f"SUPPORT_MANUAL_REVIEW:{agent.id}:{record_id}:{run_id}",
             title=title,
             content=content,
-            web_url=agent.feishu_bitable_url,
+            web_url=source_bitable_url,
         )
 
     def _backfill_support_owner_notification_if_needed(
@@ -1281,6 +1454,8 @@ class SupportIssueService:
         resolved_fields: dict[str, FeishuBitableFieldInfo],
         fact: SupportIssueFeedbackFact,
         synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
     ) -> None:
         if fact.progress_value != MANUAL_REVIEW_PROGRESS_VALUE:
             return
@@ -1304,6 +1479,8 @@ class SupportIssueService:
             agent=agent,
             run_id=f"sync-{synced_at.strftime('%Y%m%d%H%M%S')}",
             record_id=record_id,
+            source_bitable_url=source_bitable_url,
+            source_table_name=source_table_name,
             question=fact.question,
             module_value=module_value,
             solution=fact.ai_solution or NO_HIT_MESSAGE,
@@ -1318,6 +1495,8 @@ class SupportIssueService:
         resolved_fields: dict[str, FeishuBitableFieldInfo],
         fact: SupportIssueFeedbackFact,
         progress_changed_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
     ) -> None:
         registrant_field = resolved_fields["registrant"]
         try:
@@ -1347,10 +1526,11 @@ class SupportIssueService:
         final_summary = fact.feedback_final_answer.strip() or fact.ai_solution.strip() or "请到支持问题表查看处理结果。"
         content = (
             f"提示您登记的问题「{topic}」已经回复，请去支持问题表格查看。\n"
+            f"所在页签：{source_table_name or '未命名页签'}\n"
             f"当前进度：{HUMAN_CONFIRMED_PROGRESS_VALUE}\n"
             f"处理结果：{self._short_text(final_summary, limit=180)}\n"
             f"{self._registrant_notification_reminder()}\n"
-            f"飞书表：{agent.feishu_bitable_url}\n"
+            f"飞书表：{source_bitable_url}\n"
             f"record_id：{record_id}"
         )
         self._send_yonyou_notification(
@@ -1361,7 +1541,7 @@ class SupportIssueService:
             src_msg_id=f"SUPPORT_CONFIRM_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
             title=f"支持问题已回复｜{topic}",
             content=content,
-            web_url=agent.feishu_bitable_url,
+            web_url=source_bitable_url,
         )
 
     def _backfill_registrant_confirmation_notification_if_needed(
@@ -1373,6 +1553,8 @@ class SupportIssueService:
         resolved_fields: dict[str, FeishuBitableFieldInfo],
         fact: SupportIssueFeedbackFact,
         synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
     ) -> None:
         if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
             return
@@ -1409,6 +1591,8 @@ class SupportIssueService:
             resolved_fields=resolved_fields,
             fact=fact,
             progress_changed_at=synced_at,
+            source_bitable_url=source_bitable_url,
+            source_table_name=source_table_name,
         )
 
     def _feedback_fact_to_candidate(
@@ -2304,10 +2488,7 @@ class SupportIssueService:
         rejected_count = 0
         pending_confirm_count = 0
         try:
-            records = self.feishu_service.list_bitable_records(
-                app_token=agent.feishu_app_token,
-                table_id=agent.feishu_table_id,
-            )
+            records, _table_contexts = self._list_all_agent_rows(agent)
             for item in records:
                 fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
                 feedback_result = self._stringify_field_value(fields.get(agent.feedback_result_field_name))
@@ -2368,128 +2549,20 @@ class SupportIssueService:
         )
 
     def sync_feedback(self, agent_id: str) -> SupportIssueFeedbackSyncResponse:
-        """从飞书同步反馈字段到平台数据库，并生成/刷新案例候选。
-
-        这是反哺链路的第一步：
-        1. 读飞书当前状态；
-        2. upsert 最新反馈事实；
-        3. 对关键字段变化写入历史；
-        4. 根据采纳结果生成案例候选。
-        """
+        """通过 LangGraph 执行反馈同步，并返回带 trace 的响应。"""
 
         agent = self.get_agent(agent_id)
-        synced_at = _utc_now()
-
-        try:
-            raw_rows = self.feishu_service.list_bitable_records(
-                app_token=agent.feishu_app_token,
-                table_id=agent.feishu_table_id,
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"飞书反馈同步失败：{exc}") from exc
-
-        resolved_fields = self._resolve_runtime_field_mapping(agent, records=raw_rows)
-        fact_upsert_count = 0
-        history_appended_count = 0
-        candidate_created_count = 0
-        candidate_updated_count = 0
-
-        for row in raw_rows:
-            record_id = self._extract_record_id(row)
-            fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
-            if record_id == "" or not isinstance(fields, dict):
-                continue
-
-            next_fact = self._build_feedback_fact(
-                agent=agent,
-                record_id=record_id,
-                fields=fields,
-                resolved_fields=resolved_fields,
-                synced_at=synced_at,
-            )
-            previous_fact = self.support_issue_store.get_feedback_fact(agent.id, record_id)
-            current_snapshot = self._feedback_fact_snapshot_dict(next_fact)
-            previous_snapshot = (
-                self._feedback_fact_snapshot_dict(previous_fact)
-                if previous_fact is not None
-                else {}
-            )
-            changed_fields = self._diff_feedback_fact_snapshots(previous_snapshot, current_snapshot)
-            if previous_fact is not None and len(changed_fields) == 0:
-                next_fact.updated_at = previous_fact.updated_at
-                next_fact.created_at = previous_fact.created_at
-
-            persisted_fact = self.support_issue_store.upsert_feedback_fact(next_fact)
-            fact_upsert_count += 1
-
-            if len(changed_fields) > 0 and previous_fact is not None:
-                self.support_issue_store.append_feedback_history(
-                    agent_id=agent.id,
-                    record_id=record_id,
-                    changed_fields=changed_fields,
-                    previous_snapshot=previous_snapshot,
-                    current_snapshot=current_snapshot,
-                    changed_at=synced_at,
-                )
-                history_appended_count += 1
-
-            self._backfill_support_owner_notification_if_needed(
-                agent=agent,
-                record_id=record_id,
-                fields=fields,
-                resolved_fields=resolved_fields,
-                fact=persisted_fact,
-                synced_at=synced_at,
-            )
-
-            self._backfill_registrant_confirmation_notification_if_needed(
-                agent=agent,
-                record_id=record_id,
-                fields=fields,
-                resolved_fields=resolved_fields,
-                fact=persisted_fact,
-                synced_at=synced_at,
-            )
-
-            current_candidate = self.support_issue_store.get_case_candidate_by_record(agent.id, record_id)
-
-            next_candidate = self._feedback_fact_to_candidate(persisted_fact)
-            should_create_candidate = agent.case_review_enabled and self._should_create_case_candidate(persisted_fact)
-
-            if current_candidate is None:
-                if not should_create_candidate:
-                    continue
-                self.support_issue_store.upsert_case_candidate(
-                    next_candidate,
-                    reset_to_pending_review=True,
-                )
-                candidate_created_count += 1
-                continue
-
-            candidate_changed = self._case_candidate_payload_changed(current_candidate, next_candidate)
-            if candidate_changed:
-                if current_candidate.status == "approved":
-                    self._delete_case_candidate_document(current_candidate)
-                self.support_issue_store.upsert_case_candidate(
-                    next_candidate,
-                    reset_to_pending_review=True,
-                )
-                candidate_updated_count += 1
-
-        summary = (
-            f"本次同步读取 {len(raw_rows)} 行；"
-            f"更新反馈事实 {fact_upsert_count} 条，追加历史 {history_appended_count} 条，"
-            f"新增候选 {candidate_created_count} 条，刷新候选 {candidate_updated_count} 条。"
-        )
-        return SupportIssueFeedbackSyncResponse(
-            agent_id=agent.id,
-            synced_row_count=len(raw_rows),
-            fact_upsert_count=fact_upsert_count,
-            history_appended_count=history_appended_count,
-            candidate_created_count=candidate_created_count,
-            candidate_updated_count=candidate_updated_count,
-            summary=summary,
-        )
+        initial_state = {
+            "agent_id": agent.id,
+            "agent": agent,
+            "synced_at": _utc_now(),
+            "graph_trace": [],
+        }
+        final_state = self.support_issue_feedback_graph.graph.invoke(initial_state)
+        response = final_state.get("response")
+        if isinstance(response, SupportIssueFeedbackSyncResponse):
+            return response
+        raise RuntimeError("支持问题反馈同步图未返回有效结果。")
 
     def list_case_candidates(
         self,
@@ -2577,6 +2650,13 @@ class SupportIssueService:
             document_content.encode("utf-8"),
             node_id=target_node_id,
             relative_path=f"{SUPPORT_CASE_LIBRARY_ROOT}/{category_name}/{file_name}",
+            metadata={
+                "source": "approved_case",
+                "question_category": candidate.question_category,
+                "feedback_result": candidate.feedback_result,
+                "record_id": candidate.record_id,
+                "agent_id": candidate.agent_id,
+            },
         )
         updated = self.support_issue_store.update_case_candidate_review(
             candidate_id=candidate.id,
@@ -2595,175 +2675,60 @@ class SupportIssueService:
         return self.support_issue_store.list_digest_runs(agent_id)
 
     def run_digest(self, agent_id: str, *, trigger_source: str = "manual") -> SupportIssueDigestRun:
-        """执行单 Agent digest，并发送周期邮件。"""
+        """通过 LangGraph 执行 digest，并把轨迹保存在 digest run 中。"""
 
         agent = self.get_agent(agent_id)
-
-        # digest 统计依赖平台内的反馈事实，因此这里先做一次同步，保证口径最新。
-        self.sync_feedback(agent_id)
-
-        started_at = _utc_now()
-        period_start, period_end = self._build_digest_period(started_at)
-
-        facts = self.support_issue_store.list_feedback_facts(agent_id)
-        candidates = self.support_issue_store.list_case_candidates(agent_id)
-
-        facts_in_period = [fact for fact in facts if fact.updated_at >= period_start]
-        candidates_in_period = [candidate for candidate in candidates if candidate.updated_at >= period_start]
-        approved_candidates_in_period = [
-            candidate
-            for candidate in candidates_in_period
-            if candidate.status == "approved" and candidate.approved_at is not None and candidate.approved_at >= period_start
-        ]
-
-        generated_count = sum(1 for fact in facts_in_period if fact.progress_value == DONE_PROGRESS_VALUE)
-        no_hit_facts = [fact for fact in facts_in_period if self._is_no_hit_feedback_fact(fact)]
-        no_hit_record_ids = {fact.record_id for fact in no_hit_facts}
-        manual_review_count = sum(
-            1
-            for fact in facts_in_period
-            if fact.progress_value == MANUAL_REVIEW_PROGRESS_VALUE and fact.record_id not in no_hit_record_ids
-        )
-        no_hit_count = len(no_hit_facts)
-        failed_count = sum(1 for fact in facts_in_period if fact.progress_value == FAILED_PROGRESS_VALUE)
-        total_processed_count = generated_count + manual_review_count + no_hit_count + failed_count
-
-        acceptance_count = sum(1 for fact in facts_in_period if fact.feedback_result == FEEDBACK_ACCEPTED)
-        revised_acceptance_count = sum(1 for fact in facts_in_period if fact.feedback_result == FEEDBACK_REVISED_ACCEPTED)
-        rejected_count = sum(1 for fact in facts_in_period if fact.feedback_result == FEEDBACK_REJECTED)
-        analyzed_feedback_total = acceptance_count + revised_acceptance_count + rejected_count
-
-        low_confidence_count = sum(
-            1 for fact in facts_in_period if fact.confidence_score < LOW_CONFIDENCE_THRESHOLD and fact.progress_value != ""
-        )
-
-        category_counter = Counter(
-            fact.question_category for fact in facts_in_period if fact.question_category.strip() != ""
-        )
-        top_categories = [
-            SupportIssueCategoryStat(category=category, count=count)
-            for category, count in category_counter.most_common(5)
-        ]
-
-        no_hit_topic_counter = Counter(
-            self._question_topic(fact.question)
-            for fact in no_hit_facts
-            if fact.question.strip() != ""
-        )
-        top_no_hit_topics = [topic for topic, _count in no_hit_topic_counter.most_common(5)]
-
-        highlight_samples: list[str] = []
-        for fact in sorted(facts_in_period, key=lambda item: item.updated_at, reverse=True)[:5]:
-            highlight_samples.append(
-                f"{self._question_topic(fact.question)}｜进度={fact.progress_value or '未知'}｜分类={fact.question_category or '未分类'}"
-            )
-
-        knowledge_gap_suggestions: list[str] = []
-        if no_hit_count > 0:
-            knowledge_gap_suggestions.append("无命中问题仍然存在，建议优先补齐高频无命中主题对应的知识文档。")
-        if revised_acceptance_count > 0:
-            knowledge_gap_suggestions.append("“修改后采纳”仍有样本，建议将人工补充步骤沉淀为标准案例模板。")
-        if rejected_count > 0:
-            knowledge_gap_suggestions.append("存在驳回样本，建议复盘该类问题的检索词拼接与回答模板。")
-        if len(approved_candidates_in_period) == 0 and len(candidates_in_period) > 0:
-            knowledge_gap_suggestions.append("已有候选案例尚未入库，建议尽快完成审核，提升后续复用率。")
-
-        digest_run = SupportIssueDigestRun(
-            id=str(uuid4()),
-            agent_id=agent.id,
-            status="success",
-            trigger_source=trigger_source if trigger_source in {"manual", "scheduled"} else "manual",
-            started_at=started_at,
-            ended_at=_utc_now(),
-            period_start=period_start,
-            period_end=period_end,
-            recipient_emails=agent.digest_recipient_emails,
-            email_sent=False,
-            email_subject="",
-            summary=self._build_digest_summary(
-                total_processed_count=total_processed_count,
-                generated_count=generated_count,
-                manual_review_count=manual_review_count,
-                no_hit_count=no_hit_count,
-                failed_count=failed_count,
-                acceptance_count=acceptance_count,
-                revised_acceptance_count=revised_acceptance_count,
-                rejected_count=rejected_count,
-                new_candidate_count=len(candidates_in_period),
-                approved_candidate_count=len(approved_candidates_in_period),
-            ),
-            error_message=None,
-            total_processed_count=total_processed_count,
-            generated_count=generated_count,
-            manual_review_count=manual_review_count,
-            no_hit_count=no_hit_count,
-            failed_count=failed_count,
-            acceptance_count=acceptance_count,
-            revised_acceptance_count=revised_acceptance_count,
-            rejected_count=rejected_count,
-            acceptance_rate=self._safe_rate(acceptance_count + revised_acceptance_count, max(analyzed_feedback_total, 1)),
-            rejection_rate=self._safe_rate(rejected_count, max(analyzed_feedback_total, 1)),
-            low_confidence_rate=self._safe_rate(low_confidence_count, max(total_processed_count, 1)),
-            no_hit_rate=self._safe_rate(no_hit_count, max(total_processed_count, 1)),
-            manual_rewrite_rate=self._safe_rate(revised_acceptance_count, max(analyzed_feedback_total, 1)),
-            top_categories=top_categories,
-            top_no_hit_topics=top_no_hit_topics,
-            highlight_samples=highlight_samples,
-            knowledge_gap_suggestions=knowledge_gap_suggestions,
-            new_candidate_count=len(candidates_in_period),
-            approved_candidate_count=len(approved_candidates_in_period),
-        )
-
-        digest_run.email_subject = (
-            f"【支持问题 Agent 立即汇总】{agent.name}"
-            if digest_run.trigger_source == "manual"
-            else f"【支持问题 Agent 周期汇总】{agent.name}"
-        )
-        body, html_body = self._build_digest_email_bodies(agent=agent, digest_run=digest_run)
-
-        digest_items: list[dict[str, object]] = []
-        for fact in facts_in_period:
-            digest_items.append(
-                {
-                    "record_id": fact.record_id,
-                    "item_type": "feedback_fact",
-                    "title": self._question_topic(fact.question),
-                    "payload": {
-                        "progress_value": fact.progress_value,
-                        "feedback_result": fact.feedback_result,
-                        "question_category": fact.question_category,
-                    },
-                }
-            )
-        for candidate in candidates_in_period:
-            digest_items.append(
-                {
-                    "record_id": candidate.record_id,
-                    "candidate_id": candidate.id,
-                    "item_type": "case_candidate",
-                    "title": self._question_topic(candidate.question),
-                    "payload": {
-                        "status": candidate.status,
-                        "question_category": candidate.question_category,
-                    },
-                }
-            )
-
+        normalized_trigger = trigger_source if trigger_source in {"manual", "scheduled"} else "manual"
+        initial_state = {
+            "agent_id": agent.id,
+            "agent": agent,
+            "trigger_source": normalized_trigger,
+            "started_at": _utc_now(),
+            "graph_trace": [],
+        }
         try:
-            self.mail_service.send_email(
-                recipient_emails=agent.digest_recipient_emails,
-                subject=digest_run.email_subject,
-                body=body,
-                html_body=html_body,
-            )
-            digest_run.email_sent = True
+            final_state = self.support_issue_digest_graph.graph.invoke(initial_state)
+            digest_run = final_state.get("digest_run")
+            if isinstance(digest_run, SupportIssueDigestRun):
+                return digest_run
+            raise RuntimeError("支持问题 digest 图未返回有效结果。")
+        except HTTPException:
+            raise
         except Exception as exc:
-            digest_run.status = "failed"
-            digest_run.error_message = str(exc)
-
-        digest_run.ended_at = _utc_now()
-        self.support_issue_store.record_digest_run(agent_id=agent.id, run=digest_run, items=digest_items)
-        return digest_run
+            started_at = initial_state["started_at"]
+            trace = [
+                SupportIssueGraphTraceEvent(
+                    node="digest_graph_crashed",
+                    phase="digest",
+                    status="failed",
+                    started_at=started_at,
+                    ended_at=_utc_now(),
+                    message=str(exc),
+                    payload_preview={},
+                )
+            ]
+            failed_run = SupportIssueDigestRun(
+                id=str(uuid4()),
+                agent_id=agent.id,
+                status="failed",
+                trigger_source=normalized_trigger,
+                started_at=started_at,
+                ended_at=_utc_now(),
+                period_start=started_at,
+                period_end=_utc_now(),
+                recipient_emails=agent.digest_recipient_emails,
+                email_sent=False,
+                email_subject=(
+                    f"【支持问题 Agent 立即汇总】{agent.name}"
+                    if normalized_trigger == "manual"
+                    else f"【支持问题 Agent 周期汇总】{agent.name}"
+                ),
+                summary="支持问题 digest 执行异常中断。",
+                error_message=str(exc),
+                graph_trace=trace,
+            )
+            self.support_issue_store.record_digest_run(agent_id=agent.id, run=failed_run, items=[])
+            return failed_run
 
     def list_due_agents(self) -> list[SupportIssueAgentConfig]:
         return self.support_issue_store.list_due_agents()
@@ -2777,25 +2742,50 @@ class SupportIssueService:
         *,
         record_id: str,
         fields: dict[str, Any],
+        table_id: str | None = None,
     ) -> None:
+        target_table_id, raw_record_id = self._split_scoped_record_id(agent, record_id, table_id=table_id)
         self.feishu_service.update_bitable_record(
             app_token=agent.feishu_app_token,
-            table_id=agent.feishu_table_id,
-            record_id=record_id,
+            table_id=target_table_id,
+            record_id=raw_record_id,
             fields=fields,
         )
 
     def run_agent(self, agent_id: str) -> SupportIssueRun:
+        """通过 LangGraph 执行支持问题主链路，并持久化运行 trace。"""
+
         agent = self.get_agent(agent_id)
         started_at = _utc_now()
         run_id = str(uuid4())
-
+        initial_state = {
+            "agent_id": agent.id,
+            "agent": agent,
+            "run_id": run_id,
+            "started_at": started_at,
+            "graph_trace": [],
+            "row_results": [],
+        }
         try:
-            raw_rows = self.feishu_service.list_bitable_records(
-                app_token=agent.feishu_app_token,
-                table_id=agent.feishu_table_id,
-            )
+            final_state = self.support_issue_run_graph.graph.invoke(initial_state)
+            run = final_state.get("run")
+            if isinstance(run, SupportIssueRun):
+                return run
+            raise RuntimeError("支持问题运行图未返回有效结果。")
+        except HTTPException:
+            raise
         except Exception as exc:
+            trace = [
+                SupportIssueGraphTraceEvent(
+                    node="run_graph_crashed",
+                    phase="run",
+                    status="failed",
+                    started_at=started_at,
+                    ended_at=_utc_now(),
+                    message=str(exc),
+                    payload_preview={},
+                )
+            ]
             failed_run = SupportIssueRun(
                 id=run_id,
                 agent_id=agent.id,
@@ -2808,381 +2798,10 @@ class SupportIssueService:
                 manual_review_count=0,
                 no_hit_count=0,
                 failed_count=0,
-                summary="飞书表格读取失败，未进入待分析筛选与检索回写链路。",
+                summary="支持问题 Agent 执行异常中断。",
                 error_message=str(exc),
                 row_results=[],
+                graph_trace=trace,
             )
             self.support_issue_store.record_run(agent.id, failed_run)
             return failed_run
-
-        resolved_fields = self._resolve_runtime_field_mapping(agent, records=raw_rows)
-        question_field = resolved_fields["question"]
-        answer_field = resolved_fields["answer"]
-        link_field = resolved_fields["link"]
-        progress_field = resolved_fields["progress"]
-        module_field = resolved_fields["module"]
-        confidence_field = resolved_fields["confidence"]
-        hit_count_field = resolved_fields["hit_count"]
-        question_field_name = question_field.field_name
-        answer_field_name = answer_field.field_name
-        progress_field_name = progress_field.field_name
-        link_is_url_like = self._is_url_like_field(link_field)
-        historical_cases = self._collect_historical_cases(
-            rows=raw_rows,
-            question_field_name=question_field_name,
-            agent=agent,
-        )
-        for approved_case in self.support_issue_store.list_approved_case_candidates(agent.id):
-            if approved_case.question.strip() == "" or approved_case.final_solution.strip() == "":
-                continue
-            historical_cases.append(
-                {
-                    "question": approved_case.question,
-                    "solution": approved_case.final_solution,
-                    "feedback_result": approved_case.feedback_result or FEEDBACK_ACCEPTED,
-                }
-            )
-
-        candidate_rows: list[dict[str, Any]] = []
-        for item in raw_rows:
-            fields = item.get("fields")
-            if not isinstance(fields, dict):
-                continue
-            if self._row_needs_processing(progress_field_name, fields):
-                candidate_rows.append(item)
-
-        if len(candidate_rows) == 0:
-            run = SupportIssueRun(
-                id=run_id,
-                agent_id=agent.id,
-                status="no_change",
-                started_at=started_at,
-                ended_at=_utc_now(),
-                fetched_row_count=len(raw_rows),
-                processed_row_count=0,
-                generated_count=0,
-                manual_review_count=0,
-                no_hit_count=0,
-                failed_count=0,
-                summary=f"本轮读取 {len(raw_rows)} 行，当前没有“{progress_field_name}”为待分析或失败待重试的数据。",
-                error_message=None,
-                row_results=[],
-            )
-            self.support_issue_store.record_run(agent.id, run)
-            try:
-                self.sync_feedback(agent.id)
-            except Exception:
-                pass
-            return run
-
-        generated_count = 0
-        manual_review_count = 0
-        no_hit_count = 0
-        failed_count = 0
-        row_results: list[SupportIssueRowResult] = []
-        scope_type, scope_id = self._normalize_scope(agent.knowledge_scope_type, agent.knowledge_scope_id)
-
-        for item in candidate_rows:
-            record_id = str(item.get("record_id") or item.get("recordId") or "").strip()
-            fields = item.get("fields") if isinstance(item.get("fields"), dict) else {}
-            question = self._stringify_field_value(fields.get(question_field_name))
-            module_value = self._stringify_field_value(fields.get(module_field.field_name))
-            feedback_snapshot = self._extract_feedback_snapshot(agent, fields)
-            composed_query = self._compose_query(question=question, fields=fields)
-            category = self._classify_question(composed_query if composed_query != "" else question)
-            similar_cases = self._select_similar_cases(query=composed_query or question, cases=historical_cases)
-            similar_case_context = self._build_similar_case_context(similar_cases)
-            if record_id == "":
-                failed_count += 1
-                row_results.append(
-                    SupportIssueRowResult(
-                        record_id="",
-                        question=question,
-                        status="failed",
-                        solution="",
-                        related_link=None,
-                        message="当前行缺少 record_id，无法回写飞书。",
-                        retrieval_hit_count=0,
-                        confidence_score=0.0,
-                        judge_status="failed",
-                        judge_reason="缺少 record_id。",
-                        question_category=category,
-                        similar_case_count=len(similar_cases),
-                        feedback_snapshot=feedback_snapshot,
-                    )
-                )
-                continue
-
-            try:
-                self._update_row_fields(
-                    agent,
-                    record_id=record_id,
-                    fields={progress_field_name: PROCESSING_PROGRESS_VALUE},
-                )
-            except Exception as exc:
-                failed_count += 1
-                row_results.append(
-                    SupportIssueRowResult(
-                        record_id=record_id,
-                        question=question,
-                        status="failed",
-                        solution="",
-                        related_link=None,
-                        message=f"写入处理中状态失败：{exc}",
-                        retrieval_hit_count=0,
-                        confidence_score=0.0,
-                        judge_status="failed",
-                        judge_reason=f"写入处理中失败：{exc}",
-                        question_category=category,
-                        similar_case_count=len(similar_cases),
-                        feedback_snapshot=feedback_snapshot,
-                    )
-                )
-                continue
-
-            if question == "":
-                message = "问题列为空，无法生成解决方案。"
-                try:
-                    self._update_row_fields(
-                        agent,
-                        record_id=record_id,
-                        fields=self._build_runtime_update_fields(
-                            (answer_field, "生成失败：问题列为空，请补充后重试。"),
-                            (link_field, self._empty_link_field_value(url_like_field=link_is_url_like)),
-                            (confidence_field, 0.0),
-                            (hit_count_field, 0),
-                            (progress_field, FAILED_PROGRESS_VALUE),
-                        ),
-                    )
-                except Exception as exc:
-                    try:
-                        self._mark_record_progress_only(
-                            agent,
-                            record_id=record_id,
-                            progress_field_name=progress_field_name,
-                            progress_value=FAILED_PROGRESS_VALUE,
-                        )
-                        message = f"{message} 详细失败信息回写失败，已仅更新回复进度为失败待重试：{exc}"
-                    except Exception as progress_exc:
-                        message = f"{message} 回写失败待重试状态也失败：{exc}；进度单独回写也失败：{progress_exc}"
-                failed_count += 1
-                row_results.append(
-                    SupportIssueRowResult(
-                        record_id=record_id,
-                        question="",
-                        status="failed",
-                        solution="",
-                        related_link=None,
-                        message=message,
-                        retrieval_hit_count=0,
-                        confidence_score=0.0,
-                        judge_status="failed",
-                        judge_reason="问题列为空。",
-                        question_category=category,
-                        similar_case_count=len(similar_cases),
-                        feedback_snapshot=feedback_snapshot,
-                    )
-                )
-                continue
-
-            try:
-                system_prompt = self._compose_system_prompt(category)
-                if similar_case_context != "":
-                    system_prompt = (
-                        system_prompt
-                        + "以下历史已采纳案例仅作为辅助参考，不能覆盖知识依据；"
-                        + similar_case_context
-                    )
-                retrieval_result = self.retrieval_service.run(
-                    query=composed_query,
-                    scope_type=scope_type,
-                    scope_id=scope_id,
-                    model_config=agent.model_settings,
-                    system_prompt=system_prompt,
-                )
-                retrieval_hit_count = len(retrieval_result.citations)
-                if retrieval_hit_count == 0:
-                    self._update_row_fields(
-                        agent,
-                        record_id=record_id,
-                        fields=self._build_runtime_update_fields(
-                            (answer_field, NO_HIT_MESSAGE),
-                            (link_field, self._empty_link_field_value(url_like_field=link_is_url_like)),
-                            (confidence_field, 0.0),
-                            (hit_count_field, 0),
-                            (progress_field, MANUAL_REVIEW_PROGRESS_VALUE),
-                        ),
-                    )
-                    no_hit_count += 1
-                    self._notify_support_owner_for_manual_review(
-                        agent=agent,
-                        run_id=run_id,
-                        record_id=record_id,
-                        question=question,
-                        module_value=module_value,
-                        solution=NO_HIT_MESSAGE,
-                    )
-                    row_results.append(
-                        SupportIssueRowResult(
-                            record_id=record_id,
-                            question=question,
-                            status="no_hit",
-                            solution=NO_HIT_MESSAGE,
-                            related_link=None,
-                            message="未检索到可用知识，已标记待人工确认。",
-                            retrieval_hit_count=0,
-                            confidence_score=0.0,
-                            judge_status="no_hit",
-                            judge_reason="未命中知识，已转人工确认。",
-                            question_category=category,
-                            similar_case_count=len(similar_cases),
-                            feedback_snapshot=feedback_snapshot,
-                        )
-                    )
-                    continue
-
-                solution = retrieval_result.summary.strip()
-                judge_status, confidence_score, judge_reason = self._judge_solution(
-                    question=question,
-                    summary=solution,
-                    retrieval_hit_count=retrieval_hit_count,
-                )
-                related_link = self._join_related_document_links(
-                    retrieval_result,
-                    url_like_field=link_is_url_like,
-                )
-                related_link_field_value = self._build_link_field_value(
-                    retrieval_result,
-                    url_like_field=link_is_url_like,
-                )
-                progress_value = DONE_PROGRESS_VALUE if judge_status == "pass" else MANUAL_REVIEW_PROGRESS_VALUE
-                self._update_row_fields(
-                    agent,
-                    record_id=record_id,
-                    fields=self._build_runtime_update_fields(
-                        (answer_field, solution),
-                        (link_field, related_link_field_value),
-                        (confidence_field, round(confidence_score, 4)),
-                        (hit_count_field, retrieval_hit_count),
-                        (progress_field, progress_value),
-                    ),
-                )
-                if judge_status == "pass":
-                    generated_count += 1
-                else:
-                    manual_review_count += 1
-                    self._notify_support_owner_for_manual_review(
-                        agent=agent,
-                        run_id=run_id,
-                        record_id=record_id,
-                        question=question,
-                        module_value=module_value,
-                        solution=solution,
-                    )
-                row_results.append(
-                    SupportIssueRowResult(
-                        record_id=record_id,
-                        question=question,
-                        status="generated" if judge_status == "pass" else "manual_review",
-                        solution=solution,
-                        related_link=related_link,
-                        message=(
-                            "已生成解决方案并回写飞书。"
-                            if judge_status == "pass"
-                            else f"已生成草稿答案，因置信度偏低转人工确认：{judge_reason}"
-                        ),
-                        retrieval_hit_count=retrieval_hit_count,
-                        confidence_score=round(confidence_score, 4),
-                        judge_status=judge_status,
-                        judge_reason=judge_reason,
-                        question_category=category,
-                        similar_case_count=len(similar_cases),
-                        feedback_snapshot=feedback_snapshot,
-                    )
-                )
-            except Exception as exc:
-                error_text = str(exc).strip() or "未知错误"
-                failure_solution = f"生成失败：{error_text[:240]}"
-                message = error_text
-                try:
-                    self._update_row_fields(
-                        agent,
-                        record_id=record_id,
-                        fields=self._build_runtime_update_fields(
-                            (answer_field, failure_solution),
-                            (link_field, self._empty_link_field_value(url_like_field=link_is_url_like)),
-                            (confidence_field, 0.0),
-                            (hit_count_field, 0),
-                            (progress_field, FAILED_PROGRESS_VALUE),
-                        ),
-                    )
-                except Exception as update_exc:
-                    try:
-                        self._mark_record_progress_only(
-                            agent,
-                            record_id=record_id,
-                            progress_field_name=progress_field_name,
-                            progress_value=FAILED_PROGRESS_VALUE,
-                        )
-                        message = f"{message}；详细失败信息回写失败，已仅更新回复进度为失败待重试：{update_exc}"
-                    except Exception as progress_exc:
-                        message = f"{message}；回写失败待重试状态也失败：{update_exc}；进度单独回写也失败：{progress_exc}"
-                failed_count += 1
-                row_results.append(
-                    SupportIssueRowResult(
-                        record_id=record_id,
-                        question=question,
-                        status="failed",
-                        solution=failure_solution,
-                        related_link=None,
-                        message=message,
-                        retrieval_hit_count=0,
-                        confidence_score=0.0,
-                        judge_status="failed",
-                        judge_reason=error_text[:200],
-                        question_category=category,
-                        similar_case_count=len(similar_cases),
-                        feedback_snapshot=feedback_snapshot,
-                    )
-                )
-
-        processed_count = len(candidate_rows)
-        # 这里把整批行级结果汇总成一次 run 的总体状态：
-        # 全失败 -> failed；部分失败 -> partial_success；其余 -> success。
-        if failed_count > 0 and generated_count == 0 and manual_review_count == 0 and no_hit_count == 0:
-            run_status = "failed"
-        elif failed_count > 0:
-            run_status = "partial_success"
-        else:
-            run_status = "success"
-
-        summary = (
-            f"本轮读取 {len(raw_rows)} 行，命中待处理 {len(candidate_rows)} 行；"
-            f"已生成 {generated_count} 行，待人工确认 {manual_review_count} 行，"
-            f"无命中 {no_hit_count} 行，失败 {failed_count} 行。"
-        )
-        run = SupportIssueRun(
-            id=run_id,
-            agent_id=agent.id,
-            status=run_status,
-            started_at=started_at,
-            ended_at=_utc_now(),
-            fetched_row_count=len(raw_rows),
-            processed_row_count=processed_count,
-            generated_count=generated_count,
-            manual_review_count=manual_review_count,
-            no_hit_count=no_hit_count,
-            failed_count=failed_count,
-            summary=summary,
-            error_message=None if failed_count == 0 else "部分或全部问题处理失败，请查看行级摘要。",
-            row_results=row_results,
-        )
-        self.support_issue_store.record_run(agent.id, run)
-        try:
-            # 这里不把同步失败升级为运行失败：
-            # 主链路的核心职责是“读表 -> 检索 -> 回写”，
-            # 反馈同步属于反哺增强层，失败时不应反向污染本次运行结果。
-            self.sync_feedback(agent.id)
-        except Exception:
-            pass
-        return run
