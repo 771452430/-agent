@@ -310,6 +310,12 @@ export function ChatWorkspace() {
             {liveFinal != null && (
               <section className="apple-status-success rounded-[30px] p-5">
                 <div className="text-sm font-semibold text-emerald-100">FinalResponse</div>
+                {liveFinal.runtime != null && (
+                  <div className="apple-panel-subtle mt-3 rounded-[22px] px-4 py-3 font-mono text-xs leading-6 text-emerald-50">
+                    <div>provider={liveFinal.runtime.provider}</div>
+                    <div>model={liveFinal.runtime.model}</div>
+                  </div>
+                )}
                 <p className="mt-3 whitespace-pre-wrap text-sm leading-7 text-slate-50">{liveFinal.answer}</p>
                 {liveFinal.citations.length > 0 && (
                   <div className="mt-4 space-y-2">

@@ -45,6 +45,7 @@ from ..schemas import (
     RAGQueryVariant,
     RetrievalCandidateDebug,
     RetrievalProfile,
+    RuntimeModelInfo,
     SupportIssueClassificationResult,
     SupportIssueDraftResult,
     SupportIssueReviewResult,
@@ -287,6 +288,53 @@ class LLMService:
         if not tool_outputs:
             return "无"
         return "\n".join(f"- {name}: {value}" for name, value in tool_outputs.items())
+
+    def _with_runtime_info(
+        self,
+        response: FinalResponse,
+        *,
+        provider: ProviderRuntimeConfig,
+        model_config: ModelConfig,
+    ) -> FinalResponse:
+        return response.model_copy(
+            update={
+                "runtime": RuntimeModelInfo(
+                    provider=provider.id,
+                    model=model_config.model,
+                )
+            }
+        )
+
+    def _looks_like_runtime_identity_question(self, query: str) -> bool:
+        normalized = " ".join(str(query or "").lower().split())
+        if normalized == "":
+            return False
+        patterns = (
+            r"你(现[在今]?|当前)?(用|是)(什么|哪个|啥)?模型",
+            r"你是什么大模型",
+            r"你是哪个大模型",
+            r"你是不是\s*minimax",
+            r"你是\s*minimax",
+            r"是不是\s*minimax",
+            r"当前(运行|使用|调用).*(provider|模型|model)",
+            r"(当前|现在).*(provider|model)",
+            r"你现在用的.*(provider|model)",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    def _runtime_identity_response(
+        self,
+        *,
+        provider: ProviderRuntimeConfig,
+        model_config: ModelConfig,
+    ) -> FinalResponse:
+        return FinalResponse(
+            answer=f"provider={provider.id}\nmodel={model_config.model}",
+            citations=[],
+            used_tools=[],
+            next_actions=[],
+            runtime=RuntimeModelInfo(provider=provider.id, model=model_config.model),
+        )
 
     def _fallback_response(
         self,
@@ -752,6 +800,8 @@ class LLMService:
         system_prompt: str | None = None,
     ) -> FinalResponse:
         normalized_config, provider = self.ensure_model_config_runnable(model_config)
+        if self._looks_like_runtime_identity_question(query):
+            return self._runtime_identity_response(provider=provider, model_config=normalized_config)
 
         prompt = self._build_prompt(system_prompt=system_prompt)
         prompt_value = prompt.invoke(
@@ -764,12 +814,16 @@ class LLMService:
         )
 
         if normalized_config.mode == "learning":
-            return self._fallback_response(
-                query=query,
-                tool_outputs=tool_outputs,
-                citations=citations,
-                retrieval_context=retrieval_context,
-                system_prompt=system_prompt,
+            return self._with_runtime_info(
+                self._fallback_response(
+                    query=query,
+                    tool_outputs=tool_outputs,
+                    citations=citations,
+                    retrieval_context=retrieval_context,
+                    system_prompt=system_prompt,
+                ),
+                provider=provider,
+                model_config=normalized_config,
             )
 
         prompt_messages = prompt_value.to_messages()
@@ -787,11 +841,11 @@ class LLMService:
             # 对第三方兼容网关的间歇性抖动做整轮重试。
             # 只有当错误特征像“上游节点异常”时才重试，避免无意义重复调用。
             if not result.answer.startswith("真实接口模式调用失败。"):
-                return result
+                return self._with_runtime_info(result, provider=provider, model_config=normalized_config)
             if retry_index >= 2 or not self._is_retryable_provider_error(result.answer):
-                return result
+                return self._with_runtime_info(result, provider=provider, model_config=normalized_config)
             time.sleep(1.0 * (retry_index + 1))
-        return result
+        return self._with_runtime_info(result, provider=provider, model_config=normalized_config)
 
     def _dedupe_strings(self, values: list[str], *, limit: int | None = None) -> list[str]:
         deduped: list[str] = []

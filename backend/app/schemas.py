@@ -447,6 +447,14 @@ class FinalResponse(BaseModel):
     citations: list[Citation] = Field(default_factory=list)
     used_tools: list[str] = Field(default_factory=list)
     next_actions: list[str] = Field(default_factory=list)
+    runtime: "RuntimeModelInfo | None" = None
+
+
+class RuntimeModelInfo(BaseModel):
+    """当前回答实际使用的运行时模型信息。"""
+
+    provider: str
+    model: str
 
 
 class ChatMessage(BaseModel):

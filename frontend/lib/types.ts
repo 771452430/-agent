@@ -269,6 +269,10 @@ export type FinalResponse = {
   citations: Citation[];
   used_tools: string[];
   next_actions: string[];
+  runtime?: {
+    provider: string;
+    model: string;
+  } | null;
 };
 
 export type SkillDescriptor = {
