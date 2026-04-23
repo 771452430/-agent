@@ -53,11 +53,12 @@ import type {
 const DEFAULT_API_BASE = "http://127.0.0.1:8000";
 const SERVER_API_BASE = process.env.INTERNAL_API_BASE ?? process.env.NEXT_PUBLIC_API_BASE ?? DEFAULT_API_BASE;
 const NORMALIZED_SERVER_API_BASE = SERVER_API_BASE.replace(/\/$/, "");
+const BROWSER_API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/$/, "");
 const API_BASE =
   typeof window === "undefined"
     ? NORMALIZED_SERVER_API_BASE
-    : process.env.NODE_ENV === "development"
-      ? NORMALIZED_SERVER_API_BASE
+    : process.env.NODE_ENV === "development" || BROWSER_API_BASE !== ""
+      ? (process.env.NODE_ENV === "development" ? NORMALIZED_SERVER_API_BASE : BROWSER_API_BASE)
       : "";
 const SSE_SEPARATOR = String.fromCharCode(10, 10);
 const SSE_LINE_BREAK = String.fromCharCode(10);

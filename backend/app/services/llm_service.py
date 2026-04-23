@@ -2177,6 +2177,43 @@ class LLMService:
             seen.add(item.id)
         return merged
 
+    def _probe_provider_via_completion(self, provider: ProviderRuntimeConfig) -> str:
+        """当模型列表接口不可用时，退化为一次最小真实调用验证连通性。"""
+
+        if len(provider.models) == 0:
+            raise ValueError("当前没有可用于探测的模型，请先手动添加一个模型。")
+
+        probe_config = ModelConfig(
+            mode="provider",
+            provider=provider.id,
+            model=provider.models[0].id,
+            temperature=0,
+            max_tokens=128,
+        )
+        prompt_messages: list[BaseMessage] = [HumanMessage(content="请只回复 ok")]
+        headers = self._build_completion_headers(provider)
+        attempt_errors: list[str] = []
+
+        for attempt_label, url, payload in self._candidate_completion_attempts(
+            provider=provider,
+            model_config=probe_config,
+            prompt_messages=prompt_messages,
+        ):
+            try:
+                response_payload = self._request_json_post(url, headers=headers, payload=payload)
+                answer = self._extract_completion_text(provider, response_payload).strip()
+                return answer or "模型已成功返回响应。"
+            except urlerror.HTTPError as exc:
+                try:
+                    detail = exc.read().decode("utf-8")
+                except Exception:
+                    detail = str(exc)
+                attempt_errors.append(f"{attempt_label} {parse.urlparse(url).path}: {exc.code} {detail}".strip())
+            except Exception as exc:
+                attempt_errors.append(f"{attempt_label} {parse.urlparse(url).path}: {exc}".strip())
+
+        raise RuntimeError("；".join(attempt_errors) or "真实调用探测失败")
+
     def build_provider_test_runtime(
         self,
         provider_id: str,
@@ -2257,6 +2294,22 @@ class LLMService:
                 last_error = str(exc.reason)
             except Exception as exc:
                 last_error = str(exc)
+
+        try:
+            probe_result = self._probe_provider_via_completion(provider)
+            return ProviderTestResponse(
+                ok=True,
+                message=(
+                    "模型列表接口不可用，但已通过真实调用验证连接成功。"
+                    f"探测模型：`{provider.models[0].id}`；响应预览：{probe_result[:80]}"
+                ),
+                available_models=provider.models,
+            )
+        except Exception as exc:
+            if last_error:
+                last_error = f"{last_error}；真实调用探测失败：{exc}"
+            else:
+                last_error = f"真实调用探测失败：{exc}"
 
         return ProviderTestResponse(
             ok=False,
