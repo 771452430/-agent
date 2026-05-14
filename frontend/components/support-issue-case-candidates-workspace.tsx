@@ -239,8 +239,14 @@ export function SupportIssueCaseCandidatesWorkspace() {
     }
   }
 
-  async function handleSubmit(action: "save_edit" | "approve_and_publish") {
+  async function handleSubmit(action: "save_edit" | "approve_and_publish" | "withdraw") {
     if (selectedCandidate == null) return;
+    if (
+      action === "withdraw" &&
+      window.confirm("撤回后该案例会回到待审核，并从 RAG 检索里下线。确认撤回吗？") === false
+    ) {
+      return;
+    }
 
     setIsSubmitting(true);
     setError("");
@@ -463,7 +469,7 @@ export function SupportIssueCaseCandidatesWorkspace() {
           )}
         </section>
 
-        <aside className="rounded-3xl border border-slate-800 bg-slate-900 p-5">
+        <aside className="flex max-h-[calc(100vh-8rem)] min-h-0 flex-col overflow-hidden rounded-3xl border border-slate-800 bg-slate-900 p-5 xl:max-h-[calc(100vh-14rem)]">
           <div>
             <div className="text-sm text-slate-400">详情与编辑</div>
             <div className="mt-1 text-lg font-semibold">当前候选</div>
@@ -474,77 +480,79 @@ export function SupportIssueCaseCandidatesWorkspace() {
               请选择左侧表格中的一条候选案例。
             </div>
           ) : (
-            <div className="mt-5 space-y-4">
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                <div className="text-xs text-slate-500">名称</div>
-                <div className="mt-2 font-medium text-slate-100">
-                  {buildCandidateName(selectedCandidate.question, selectedCandidate.record_id)}
+            <div className="mt-5 flex min-h-0 flex-1 flex-col overflow-hidden">
+              <div className="min-h-0 flex-1 space-y-4 overflow-y-auto pr-2">
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                  <div className="text-xs text-slate-500">名称</div>
+                  <div className="mt-2 font-medium text-slate-100">
+                    {buildCandidateName(selectedCandidate.question, selectedCandidate.record_id)}
+                  </div>
+                  <div className="mt-3 grid gap-1 text-xs text-slate-400">
+                    <div>状态：{mapCaseStatusLabel(selectedCandidate.status)}</div>
+                    <div>来源飞书记录 ID：{selectedCandidate.record_id}</div>
+                    <div>问题分类：{selectedCandidate.question_category || "-"}</div>
+                    <div>人工处理结果：{selectedCandidate.feedback_result || "-"}</div>
+                    <div>AI 置信度：{formatPercent(selectedCandidate.confidence_score)}</div>
+                    <div>命中知识数：{selectedCandidate.retrieval_hit_count}</div>
+                    {selectedCandidate.approved_by && <div>审核人：{selectedCandidate.approved_by}</div>}
+                    {selectedCandidate.approved_at && <div>审核时间：{formatDate(selectedCandidate.approved_at)}</div>}
+                    {selectedCandidate.knowledge_document_id && (
+                      <div>知识库文档 ID：{selectedCandidate.knowledge_document_id}</div>
+                    )}
+                  </div>
                 </div>
-                <div className="mt-3 grid gap-1 text-xs text-slate-400">
-                  <div>状态：{mapCaseStatusLabel(selectedCandidate.status)}</div>
-                  <div>来源飞书记录 ID：{selectedCandidate.record_id}</div>
-                  <div>问题分类：{selectedCandidate.question_category || "-"}</div>
-                  <div>人工处理结果：{selectedCandidate.feedback_result || "-"}</div>
-                  <div>AI 置信度：{formatPercent(selectedCandidate.confidence_score)}</div>
-                  <div>命中知识数：{selectedCandidate.retrieval_hit_count}</div>
-                  {selectedCandidate.approved_by && <div>审核人：{selectedCandidate.approved_by}</div>}
-                  {selectedCandidate.approved_at && <div>审核时间：{formatDate(selectedCandidate.approved_at)}</div>}
-                  {selectedCandidate.knowledge_document_id && (
-                    <div>知识库文档 ID：{selectedCandidate.knowledge_document_id}</div>
-                  )}
+
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                  <div className="text-xs font-medium text-slate-300">原问题</div>
+                  <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-200">
+                    {selectedCandidate.question || "-"}
+                  </div>
+                </div>
+
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
+                  <div className="text-xs font-medium text-slate-300">AI 初稿</div>
+                  <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-200">
+                    {selectedCandidate.ai_draft || "-"}
+                  </div>
+                </div>
+
+                <label className="grid gap-1 text-sm">
+                  <span className="text-slate-400">人工最终方案</span>
+                  <textarea
+                    className="min-h-[220px] rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm"
+                    value={draftFinalSolution}
+                    onChange={(event) => setDraftFinalSolution(event.target.value)}
+                    placeholder="在这里整理最终可入库的人工方案"
+                  />
+                </label>
+
+                <label className="grid gap-1 text-sm">
+                  <span className="text-slate-400">反馈备注</span>
+                  <textarea
+                    className="min-h-[120px] rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm"
+                    value={draftFeedbackComment}
+                    onChange={(event) => setDraftFeedbackComment(event.target.value)}
+                    placeholder="补充注意事项、限制条件或审核说明"
+                  />
+                </label>
+
+                <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-xs text-slate-400">
+                  <div>关联文档链接</div>
+                  <div className="mt-2 space-y-2">
+                    {selectedCandidate.related_links.length > 0 ? (
+                      selectedCandidate.related_links.map((item) => (
+                        <a key={item} href={item} target="_blank" rel="noreferrer" className="block text-cyan-300">
+                          {item}
+                        </a>
+                      ))
+                    ) : (
+                      <div>-</div>
+                    )}
+                  </div>
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                <div className="text-xs font-medium text-slate-300">原问题</div>
-                <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-200">
-                  {selectedCandidate.question || "-"}
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4">
-                <div className="text-xs font-medium text-slate-300">AI 初稿</div>
-                <div className="mt-2 whitespace-pre-wrap break-all text-sm text-slate-200">
-                  {selectedCandidate.ai_draft || "-"}
-                </div>
-              </div>
-
-              <label className="grid gap-1 text-sm">
-                <span className="text-slate-400">人工最终方案</span>
-                <textarea
-                  className="min-h-[220px] rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm"
-                  value={draftFinalSolution}
-                  onChange={(event) => setDraftFinalSolution(event.target.value)}
-                  placeholder="在这里整理最终可入库的人工方案"
-                />
-              </label>
-
-              <label className="grid gap-1 text-sm">
-                <span className="text-slate-400">反馈备注</span>
-                <textarea
-                  className="min-h-[120px] rounded-2xl border border-slate-700 bg-slate-950 px-3 py-3 text-sm"
-                  value={draftFeedbackComment}
-                  onChange={(event) => setDraftFeedbackComment(event.target.value)}
-                  placeholder="补充注意事项、限制条件或审核说明"
-                />
-              </label>
-
-              <div className="rounded-2xl border border-slate-800 bg-slate-950/50 p-4 text-xs text-slate-400">
-                <div>关联文档链接</div>
-                <div className="mt-2 space-y-2">
-                  {selectedCandidate.related_links.length > 0 ? (
-                    selectedCandidate.related_links.map((item) => (
-                      <a key={item} href={item} target="_blank" rel="noreferrer" className="block text-cyan-300">
-                        {item}
-                      </a>
-                    ))
-                  ) : (
-                    <div>-</div>
-                  )}
-                </div>
-              </div>
-
-              <div className="flex flex-wrap gap-2">
+              <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-800 pt-4">
                 <button
                   className="rounded-xl border border-slate-700 px-4 py-2 text-sm text-slate-200 transition hover:border-slate-500 disabled:border-slate-800 disabled:text-slate-500"
                   onClick={() => {
@@ -561,8 +569,19 @@ export function SupportIssueCaseCandidatesWorkspace() {
                   }}
                   disabled={isSubmitting}
                 >
-                  {isSubmitting ? "处理中..." : "通过并入库"}
+                  {isSubmitting ? "处理中..." : "审核通过并入库"}
                 </button>
+                {selectedCandidate.status === "approved" && (
+                  <button
+                    className="rounded-xl border border-amber-400/40 px-4 py-2 text-sm text-amber-200 transition hover:bg-amber-400/10 disabled:border-slate-800 disabled:text-slate-500"
+                    onClick={() => {
+                      void handleSubmit("withdraw");
+                    }}
+                    disabled={isSubmitting}
+                  >
+                    {isSubmitting ? "撤回中..." : "撤回入库"}
+                  </button>
+                )}
               </div>
             </div>
           )}

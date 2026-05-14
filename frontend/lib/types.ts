@@ -15,6 +15,7 @@ export type ScopeType = "none" | "global" | "tree_recursive";
 export type ModelMode = "learning" | "provider";
 export type ProviderProtocol = "openai_compatible" | "anthropic_compatible" | "ollama_native" | "mock_local";
 export type ProviderModelSource = "manual" | "discovered";
+export type SupportIssueRetrievalMode = "retrieval" | "rich";
 
 export type ModelConfig = {
   mode: ModelMode;
@@ -590,6 +591,116 @@ export type WatcherFetchTestResponse = {
   parsed_bug_preview: ParsedBug[];
 };
 
+export type JiraDuplicateRunStatus = "success" | "no_change" | "partial_success" | "failed";
+export type JiraDuplicateMatchLevel = "high" | "medium" | "low" | "none";
+
+export type JiraDuplicateAgentConfig = {
+  id: string;
+  name: string;
+  description: string;
+  source_db_path: string;
+  dashboard_url: string;
+  request_method: WatcherRequestMethod;
+  request_headers: Record<string, string>;
+  request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: WatcherRequestMethod;
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
+  poll_interval_minutes: number;
+  high_similarity_threshold: number;
+  medium_similarity_threshold: number;
+  model_review_enabled: boolean;
+  model_config: ModelConfig;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  last_run_at?: string | null;
+  next_run_at?: string | null;
+  last_run_status?: JiraDuplicateRunStatus | null;
+  last_matched_count: number;
+};
+
+export type JiraDuplicateFetchTestResponse = {
+  ok: boolean;
+  status_code: number;
+  message: string;
+  dashboard_url: string;
+  request_method: WatcherRequestMethod;
+  request_headers: Record<string, string>;
+  request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: WatcherRequestMethod;
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
+  response_content_type: string;
+  response_body_preview: string;
+  parsed_item_count: number;
+  parsed_issue_count: number;
+  parsed_issue_preview: ParsedBug[];
+};
+
+export type JiraDuplicateCandidate = {
+  issue_key: string;
+  summary: string;
+  domain: string;
+  module: string;
+  status: string;
+  solution: string;
+  score: number;
+  reason: string;
+};
+
+export type JiraDuplicateIssueResult = {
+  issue_key: string;
+  jira_issue_id: string;
+  title: string;
+  description: string;
+  domain: string;
+  module: string;
+  status: string;
+  raw_excerpt: string;
+  match_level: JiraDuplicateMatchLevel;
+  match_score: number;
+  match_reason: string;
+  candidates: JiraDuplicateCandidate[];
+  error_message?: string | null;
+};
+
+export type JiraDuplicateRun = {
+  id: string;
+  agent_id: string;
+  status: JiraDuplicateRunStatus;
+  started_at: string;
+  ended_at?: string | null;
+  fetched_count: number;
+  parsed_count: number;
+  matched_count: number;
+  high_confidence_count: number;
+  medium_confidence_count: number;
+  no_match_count: number;
+  failed_count: number;
+  summary: string;
+  error_message?: string | null;
+  issue_results: JiraDuplicateIssueResult[];
+};
+
+export type JiraSolutionSearchResponse = {
+  result: JiraDuplicateIssueResult;
+  indexed_count: number;
+  embedding_backend: string;
+  source_db_path: string;
+};
+
+export type JiraSolutionDraftReplyResponse = {
+  draft_text: string;
+  generated_by_model: boolean;
+  model_label: string;
+  message: string;
+};
+
 /**
  * 支持问题 Agent 类型。
  *
@@ -688,12 +799,14 @@ export type SupportIssueAgentConfig = {
   model_config: ModelConfig;
   knowledge_scope_type: ScopeType;
   knowledge_scope_id?: string | null;
+  retrieval_mode: SupportIssueRetrievalMode;
   question_field_name: string;
   answer_field_name: string;
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
   module_field_name: string;
+  support_staff_field_name: string;
   registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
@@ -717,6 +830,8 @@ export type SupportIssueAgentConfig = {
 
 export type SupportIssueOwnerRule = {
   module_value: string;
+  keywords: string;
+  owner_name: string;
   yht_user_id: string;
 };
 

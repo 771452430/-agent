@@ -59,6 +59,7 @@ DONE_PROGRESS_VALUE = "AI分析完成"
 MANUAL_REVIEW_PROGRESS_VALUE = "待人工确认"
 FAILED_PROGRESS_VALUE = "失败待重试"
 HUMAN_CONFIRMED_PROGRESS_VALUE = "人工确认完成"
+COMPLETED_PROGRESS_VALUE = "完成"
 NO_HIT_MESSAGE = "未检索到相关知识，已标记待人工确认，请人工补充处理。"
 NO_HIT_MESSAGE_KEYWORD = "未检索到相关知识"
 LOW_CONFIDENCE_THRESHOLD = 0.65
@@ -87,6 +88,7 @@ class SupportIssueRowGraphState(TypedDict, total=False):
     source_bitable_url: str
     question: str
     module_value: str
+    retrieval_mode: str
     feedback_snapshot: SupportIssueFeedbackSnapshot | None
     fallback_category: str
     composed_query: str
@@ -97,7 +99,7 @@ class SupportIssueRowGraphState(TypedDict, total=False):
     evidence_result: SupportIssueEvidenceResult | None
     draft_result: SupportIssueDraftResult | None
     review_result: SupportIssueReviewResult | None
-    next_step: Literal["classify", "draft", "finalize", "no_hit", "question_empty", "write"]
+    next_step: Literal["classify", "retrieve", "draft", "finalize", "no_hit", "question_empty", "write"]
     retrieval_result: Any
     retrieval_hit_count: int
     solution: str
@@ -307,6 +309,7 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
         builder = StateGraph(SupportIssueRowGraphState)
         builder.add_node("prepare_row_context", self.prepare_row_context)
         builder.add_node("handle_empty_question", self.handle_empty_question)
+        builder.add_node("retrieval_agent", self.retrieval_agent)
         builder.add_node("classifier_agent", self.classifier_agent)
         builder.add_node("evidence_agent", self.evidence_agent)
         builder.add_node("handle_no_hit", self.handle_no_hit)
@@ -323,9 +326,11 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
             {
                 "finalize": "finalize_row",
                 "question_empty": "handle_empty_question",
+                "retrieve": "retrieval_agent",
                 "classify": "classifier_agent",
             },
         )
+        builder.add_edge("retrieval_agent", "write_row")
         builder.add_edge("classifier_agent", "evidence_agent")
         builder.add_conditional_edges(
             "evidence_agent",
@@ -348,7 +353,7 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
     def _route_after_prepare_row_context(
         self,
         state: SupportIssueRowGraphState,
-    ) -> Literal["classify", "finalize", "question_empty"]:
+    ) -> Literal["classify", "retrieve", "finalize", "question_empty"]:
         return state.get("next_step", "classify")
 
     def _route_after_evidence_agent(
@@ -485,6 +490,120 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
         except Exception:
             return fallback
 
+    def _route_manual_review_assignment(self, state: SupportIssueRowGraphState) -> tuple[str, str]:
+        current_module_value = state.get("module_value", "")
+        if hasattr(self.runtime, "_resolve_manual_review_route"):
+            routed_module_value, owner_name = self.runtime._resolve_manual_review_route(
+                agent=state["agent"],
+                question=state.get("question", ""),
+                module_value=current_module_value,
+            )
+            return routed_module_value or current_module_value, owner_name
+        routed_module_value = self.runtime._resolve_manual_review_module_value(
+            agent=state["agent"],
+            question=state.get("question", ""),
+            module_value=current_module_value,
+        )
+        return routed_module_value or current_module_value, ""
+
+    def _manual_review_assignment_field_pairs(
+        self,
+        state: SupportIssueRowGraphState,
+        routed_module_value: str,
+        owner_name: str,
+    ) -> list[tuple[FeishuBitableFieldInfo | None, Any]]:
+        field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = []
+        module_field = state["resolved_fields"].get("module")
+        if routed_module_value.strip() != "" and module_field is not None and module_field.field_name.strip() != "":
+            field_pairs.append((module_field, routed_module_value))
+        support_staff_field = state["resolved_fields"].get("support_staff")
+        if owner_name.strip() != "" and support_staff_field is not None and support_staff_field.field_name.strip() != "":
+            field_pairs.append((support_staff_field, owner_name.strip()))
+        return field_pairs
+
+    def _support_staff_field_pairs(
+        self,
+        state: SupportIssueRowGraphState,
+        owner_name: str,
+    ) -> list[tuple[FeishuBitableFieldInfo | None, Any]]:
+        if owner_name.strip() == "":
+            return []
+        support_staff_field = state["resolved_fields"].get("support_staff")
+        if support_staff_field is None or support_staff_field.field_name.strip() == "":
+            return []
+        return [(support_staff_field, owner_name.strip())]
+
+    def _approved_case_link_values(self, approved_case: Any, *, url_like_field: bool) -> tuple[str | None, Any]:
+        links = [
+            str(item).strip()
+            for item in (getattr(approved_case, "related_links", []) or [])
+            if str(item).strip() != ""
+        ]
+        if len(links) == 0:
+            return None, self.runtime._empty_link_field_value(url_like_field=url_like_field)
+        if not url_like_field:
+            joined_links = "\n".join(links)
+            return joined_links, joined_links
+        return links[0], {"link": links[0], "text": links[0]}
+
+    def _build_exact_approved_case_generation(
+        self,
+        current_state: SupportIssueRowGraphState,
+        *,
+        approved_case: Any,
+        evidence_result: SupportIssueEvidenceResult,
+    ) -> dict[str, Any]:
+        solution = str(getattr(approved_case, "final_solution", "") or "").strip()
+        case_question = str(getattr(approved_case, "question", "") or "").strip()
+        related_link, related_link_field_value = self._approved_case_link_values(
+            approved_case,
+            url_like_field=current_state["link_is_url_like"],
+        )
+        hit_count = max(1, int(getattr(approved_case, "retrieval_hit_count", 0) or 0))
+        confidence_score = round(max(0.92, float(getattr(approved_case, "confidence_score", 0.0) or 0.0)), 4)
+        _matched_module_value, routed_owner_name = self._route_manual_review_assignment(current_state)
+        update_field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = [
+            (current_state["resolved_fields"]["answer"], solution),
+            (current_state["resolved_fields"]["link"], related_link_field_value),
+            (current_state["resolved_fields"]["confidence"], confidence_score),
+            (current_state["resolved_fields"]["hit_count"], hit_count),
+            (current_state["resolved_fields"]["progress"], DONE_PROGRESS_VALUE),
+        ]
+        update_field_pairs.extend(self._support_staff_field_pairs(current_state, routed_owner_name))
+        judge_reason = f"命中已审核同题案例：{case_question}" if case_question else "命中已审核同题案例。"
+        case_category = str(getattr(approved_case, "question_category", "") or "").strip()
+        result_state = dict(
+            current_state,
+            evidence_result=evidence_result,
+            category=case_category or current_state.get("category", ""),
+        )
+        row_result = self._build_row_result(
+            result_state,
+            status="generated",
+            solution=solution,
+            related_link=related_link,
+            message="已命中已审核同题案例并回写飞书。",
+            retrieval_hit_count=hit_count,
+            confidence_score=confidence_score,
+            judge_status="pass",
+            judge_reason=judge_reason,
+        )
+        return {
+            "retrieval_hit_count": hit_count,
+            "evidence_result": evidence_result,
+            "solution": solution,
+            "related_link": related_link,
+            "related_link_field_value": related_link_field_value,
+            "judge_status": "pass",
+            "confidence_score": confidence_score,
+            "judge_reason": judge_reason,
+            "progress_value": DONE_PROGRESS_VALUE,
+            "update_fields": self.runtime._build_runtime_update_fields(*update_field_pairs),
+            "row_result": row_result,
+            "needs_support_owner_notify": False,
+            "support_owner_solution": solution,
+        }
+
     def prepare_row_context(self, state: SupportIssueRowGraphState) -> dict[str, Any]:
         """Supervisor 节点：准备单行上下文，并先把飞书状态打到“分析中”。"""
 
@@ -520,6 +639,7 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
                 "source_bitable_url": source_bitable_url,
                 "question": question,
                 "module_value": module_value,
+                "retrieval_mode": current_state["agent"].retrieval_mode,
                 "feedback_snapshot": feedback_snapshot,
                 "fallback_category": fallback_category,
                 "composed_query": composed_query,
@@ -579,7 +699,9 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
                     "_trace_payload_preview": {"record_id": record_id},
                 }
 
-            next_step: Literal["classify", "question_empty"] = "question_empty" if question == "" else "classify"
+            next_step: Literal["classify", "retrieve", "question_empty"] = "question_empty"
+            if question != "":
+                next_step = "retrieve" if current_state["agent"].retrieval_mode == "retrieval" else "classify"
             return {
                 **base_updates,
                 "next_step": next_step,
@@ -636,6 +758,244 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
         return self._run_traced_node(
             state=state,
             node="handle_empty_question",
+            phase="row",
+            callback=callback,
+            record_id=state.get("record_id"),
+        )
+
+    def retrieval_agent(self, state: SupportIssueRowGraphState) -> dict[str, Any]:
+        """轻检索子路径：直接采用检索工作台的总结逻辑。"""
+
+        def callback(current_state: SupportIssueRowGraphState) -> dict[str, Any]:
+            try:
+                retrieval_result = self.runtime.retrieval_service.run(
+                    query=current_state["question"],
+                    scope_type=current_state["scope_type"],
+                    scope_id=current_state.get("scope_id"),
+                    model_config=current_state["agent"].model_settings,
+                    system_prompt=None,
+                    retrieval_profile="support_issue",
+                    query_bundle_context={
+                        "question": current_state["question"],
+                        "module_value": current_state.get("module_value", ""),
+                        "category": current_state.get("category", ""),
+                        "similar_case_context": current_state.get("similar_case_context", ""),
+                    },
+                )
+                retrieval_hit_count = len(getattr(retrieval_result, "citations", []) or [])
+                evidence_summary = str(getattr(retrieval_result, "summary", "") or "").strip()
+                related_link = self.runtime._join_related_document_links(
+                    retrieval_result,
+                    url_like_field=current_state["link_is_url_like"],
+                )
+                related_link_field_value = self.runtime._build_link_field_value(
+                    retrieval_result,
+                    url_like_field=current_state["link_is_url_like"],
+                )
+
+                approved_case = self.runtime._find_exact_approved_case(
+                    agent=current_state["agent"],
+                    question=current_state["question"],
+                )
+                if retrieval_hit_count == 0 and approved_case is not None:
+                    evidence_result = SupportIssueEvidenceResult(
+                        retrieval_hit_count=1,
+                        evidence_summary=str(getattr(approved_case, "final_solution", "") or "").strip(),
+                        no_hit=False,
+                        source_note="RAG 补充召回命中案例候选池中的已审核同题案例。",
+                    )
+                    return {
+                        **self._build_exact_approved_case_generation(
+                            current_state,
+                            approved_case=approved_case,
+                            evidence_result=evidence_result,
+                        ),
+                        "retrieval_result": retrieval_result,
+                        "_trace_message": "轻检索路径命中案例候选池。",
+                        "_trace_payload_preview": {
+                            "record_id": current_state["record_id"],
+                            "retrieval_hit_count": 1,
+                            "query": current_state["question"],
+                            "source": "approved_case_candidate",
+                        },
+                    }
+
+                if retrieval_hit_count == 0:
+                    routed_module_value, owner_name = self._route_manual_review_assignment(current_state)
+                    update_field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = [
+                        (current_state["resolved_fields"]["answer"], NO_HIT_MESSAGE),
+                        (
+                            current_state["resolved_fields"]["link"],
+                            self.runtime._empty_link_field_value(url_like_field=current_state["link_is_url_like"]),
+                        ),
+                        (current_state["resolved_fields"]["confidence"], 0.0),
+                        (current_state["resolved_fields"]["hit_count"], 0),
+                        (current_state["resolved_fields"]["progress"], MANUAL_REVIEW_PROGRESS_VALUE),
+                    ]
+                    update_field_pairs.extend(
+                        self._manual_review_assignment_field_pairs(current_state, routed_module_value, owner_name)
+                    )
+                    row_result = self._build_row_result(
+                        dict(current_state, module_value=routed_module_value),
+                        status="no_hit",
+                        solution=NO_HIT_MESSAGE,
+                        related_link=None,
+                        message="未检索到可用知识，已标记待人工确认。",
+                        retrieval_hit_count=0,
+                        confidence_score=0.0,
+                        judge_status="no_hit",
+                        judge_reason="未命中知识，已转人工确认。",
+                    )
+                    evidence_result = SupportIssueEvidenceResult(
+                        retrieval_hit_count=0,
+                        evidence_summary=evidence_summary,
+                        no_hit=True,
+                        source_note="检索模式直接采用 RAG 汇总结果。",
+                    )
+                    return {
+                        "retrieval_result": retrieval_result,
+                        "retrieval_hit_count": 0,
+                        "evidence_result": evidence_result,
+                        "update_fields": self.runtime._build_runtime_update_fields(*update_field_pairs),
+                        "row_result": row_result,
+                        "module_value": routed_module_value,
+                        "needs_support_owner_notify": True,
+                        "support_owner_solution": NO_HIT_MESSAGE,
+                        "_trace_message": "轻检索路径已完成检索。",
+                        "_trace_payload_preview": {
+                            "record_id": current_state["record_id"],
+                            "retrieval_hit_count": 0,
+                            "query": current_state["question"],
+                        },
+                    }
+
+                judge_status, confidence_score, judge_reason = self.runtime._judge_solution(
+                    question=current_state["question"],
+                    summary=evidence_summary,
+                    retrieval_hit_count=retrieval_hit_count,
+                )
+                approved_case_bonus, approved_case_reason = self.runtime._approved_case_confidence_boost(
+                    agent=current_state["agent"],
+                    question=current_state["question"],
+                    retrieval_hit_count=retrieval_hit_count,
+                )
+                if approved_case_bonus > 0:
+                    confidence_score = round(min(1.0, confidence_score + approved_case_bonus), 4)
+                    judge_reason = (
+                        f"{judge_reason}；{approved_case_reason}"
+                        if judge_reason
+                        else approved_case_reason
+                    )
+                    if judge_status != "pass" and confidence_score >= LOW_CONFIDENCE_THRESHOLD:
+                        judge_status = "pass"
+                row_status: Literal["generated", "manual_review"] = "generated" if judge_status == "pass" else "manual_review"
+                progress_value = DONE_PROGRESS_VALUE if row_status == "generated" else MANUAL_REVIEW_PROGRESS_VALUE
+                routed_module_value = current_state.get("module_value", "")
+                routed_owner_name = ""
+                update_field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = [
+                    (current_state["resolved_fields"]["answer"], evidence_summary),
+                    (current_state["resolved_fields"]["link"], related_link_field_value),
+                    (current_state["resolved_fields"]["confidence"], round(max(0.0, min(1.0, confidence_score)), 4)),
+                    (current_state["resolved_fields"]["hit_count"], retrieval_hit_count),
+                    (current_state["resolved_fields"]["progress"], progress_value),
+                ]
+                if row_status == "manual_review":
+                    routed_module_value, routed_owner_name = self._route_manual_review_assignment(current_state)
+                    update_field_pairs.extend(
+                        self._manual_review_assignment_field_pairs(current_state, routed_module_value, routed_owner_name)
+                    )
+                else:
+                    _matched_module_value, routed_owner_name = self._route_manual_review_assignment(current_state)
+                    update_field_pairs.extend(self._support_staff_field_pairs(current_state, routed_owner_name))
+                update_fields = self.runtime._build_runtime_update_fields(*update_field_pairs)
+                row_result = self._build_row_result(
+                    dict(current_state, module_value=routed_module_value),
+                    status=row_status,
+                    solution=evidence_summary,
+                    related_link=related_link,
+                    message=(
+                        "已生成解决方案并回写飞书。"
+                        if row_status == "generated"
+                        else f"已生成草稿答案，因置信度偏低转人工确认：{judge_reason}"
+                    ),
+                    retrieval_hit_count=retrieval_hit_count,
+                    confidence_score=round(max(0.0, min(1.0, confidence_score)), 4),
+                    judge_status=judge_status,
+                    judge_reason=judge_reason,
+                )
+                evidence_result = SupportIssueEvidenceResult(
+                    retrieval_hit_count=retrieval_hit_count,
+                    evidence_summary=evidence_summary,
+                    no_hit=False,
+                    source_note="检索模式直接采用 RAG 汇总结果。",
+                )
+                return {
+                    "retrieval_result": retrieval_result,
+                    "retrieval_hit_count": retrieval_hit_count,
+                    "evidence_result": evidence_result,
+                    "solution": evidence_summary,
+                    "related_link": related_link,
+                    "related_link_field_value": related_link_field_value,
+                    "judge_status": judge_status,
+                    "confidence_score": round(max(0.0, min(1.0, confidence_score)), 4),
+                    "judge_reason": judge_reason,
+                    "progress_value": progress_value,
+                    "update_fields": update_fields,
+                    "row_result": row_result,
+                    "module_value": routed_module_value,
+                    "needs_support_owner_notify": row_status != "generated",
+                    "support_owner_solution": evidence_summary,
+                    "_trace_message": "轻检索路径已完成检索。",
+                    "_trace_payload_preview": {
+                        "record_id": current_state["record_id"],
+                        "retrieval_hit_count": retrieval_hit_count,
+                        "query": current_state["question"],
+                    },
+                }
+            except Exception as exc:
+                error_text = str(exc).strip() or "未知错误"
+                failure_solution = f"生成失败：{error_text[:240]}"
+                resolved_fields = current_state["resolved_fields"]
+                evidence_result = SupportIssueEvidenceResult(
+                    retrieval_hit_count=0,
+                    evidence_summary="",
+                    no_hit=False,
+                    source_note=f"检索异常：{error_text[:120]}",
+                )
+                update_fields = self.runtime._build_runtime_update_fields(
+                    (resolved_fields["answer"], failure_solution),
+                    (resolved_fields["link"], self.runtime._empty_link_field_value(url_like_field=current_state["link_is_url_like"])),
+                    (resolved_fields["confidence"], 0.0),
+                    (resolved_fields["hit_count"], 0),
+                    (resolved_fields["progress"], FAILED_PROGRESS_VALUE),
+                )
+                row_result = self._build_row_result(
+                    dict(current_state, evidence_result=evidence_result),
+                    status="failed",
+                    solution=failure_solution,
+                    related_link=None,
+                    message=error_text,
+                    retrieval_hit_count=0,
+                    confidence_score=0.0,
+                    judge_status="failed",
+                    judge_reason=error_text[:200],
+                )
+                return {
+                    "retrieval_result": None,
+                    "evidence_result": evidence_result,
+                    "update_fields": update_fields,
+                    "row_result": row_result,
+                    "needs_support_owner_notify": False,
+                    "failure_message_separator": "；",
+                    "next_step": "write",
+                    "_trace_status": "failed",
+                    "_trace_message": error_text,
+                    "_trace_payload_preview": {"record_id": current_state["record_id"]},
+                }
+
+        return self._run_traced_node(
+            state=state,
+            node="retrieval_agent",
             phase="row",
             callback=callback,
             record_id=state.get("record_id"),
@@ -703,6 +1063,39 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
                     no_hit=retrieval_hit_count == 0,
                     source_note="证据来自 scoped RAG 检索结果。",
                 )
+                approved_case = self.runtime._find_exact_approved_case(
+                    agent=current_state["agent"],
+                    question=current_state["question"],
+                )
+                if retrieval_hit_count == 0 and approved_case is not None:
+                    evidence_result = SupportIssueEvidenceResult(
+                        retrieval_hit_count=1,
+                        evidence_summary=str(getattr(approved_case, "final_solution", "") or "").strip(),
+                        no_hit=False,
+                        source_note="RAG 补充召回命中案例候选池中的已审核同题案例。",
+                    )
+                    return {
+                        "retrieval_result": retrieval_result,
+                        **self._build_exact_approved_case_generation(
+                            current_state,
+                            approved_case=approved_case,
+                            evidence_result=evidence_result,
+                        ),
+                        "next_step": "write",
+                        "_trace_message": "证据子 agent 命中案例候选池。",
+                        "_trace_payload_preview": {
+                            "record_id": current_state["record_id"],
+                            "retrieval_hit_count": 1,
+                            "query_variants": (
+                                [item.query for item in retrieval_debug.query_bundle.query_variants[:4]]
+                                if retrieval_debug is not None
+                                else []
+                            ),
+                            "candidate_count": retrieval_debug.candidate_count if retrieval_debug is not None else 0,
+                            "selected_count": retrieval_debug.selected_count if retrieval_debug is not None else 0,
+                            "source": "approved_case_candidate",
+                        },
+                    }
                 next_step: Literal["draft", "no_hit"] = "no_hit" if retrieval_hit_count == 0 else "draft"
                 return {
                     "retrieval_result": retrieval_result,
@@ -775,15 +1168,20 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
 
         def callback(current_state: SupportIssueRowGraphState) -> dict[str, Any]:
             resolved_fields = current_state["resolved_fields"]
-            update_fields = self.runtime._build_runtime_update_fields(
+            routed_module_value, owner_name = self._route_manual_review_assignment(current_state)
+            update_field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = [
                 (resolved_fields["answer"], NO_HIT_MESSAGE),
                 (resolved_fields["link"], self.runtime._empty_link_field_value(url_like_field=current_state["link_is_url_like"])),
                 (resolved_fields["confidence"], 0.0),
                 (resolved_fields["hit_count"], 0),
                 (resolved_fields["progress"], MANUAL_REVIEW_PROGRESS_VALUE),
+            ]
+            update_field_pairs.extend(
+                self._manual_review_assignment_field_pairs(current_state, routed_module_value, owner_name)
             )
+            update_fields = self.runtime._build_runtime_update_fields(*update_field_pairs)
             row_result = self._build_row_result(
-                current_state,
+                dict(current_state, module_value=routed_module_value),
                 status="no_hit",
                 solution=NO_HIT_MESSAGE,
                 related_link=None,
@@ -796,6 +1194,7 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
             return {
                 "update_fields": update_fields,
                 "row_result": row_result,
+                "module_value": routed_module_value,
                 "needs_support_owner_notify": True,
                 "support_owner_solution": NO_HIT_MESSAGE,
                 "_trace_message": "未命中知识，已准备转人工确认。",
@@ -864,19 +1263,51 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
             judge_status = review_result.judge_status
             confidence_score = round(review_result.confidence_score, 4)
             judge_reason = review_result.judge_reason
-            progress_value = review_result.progress_value or (
-                DONE_PROGRESS_VALUE if judge_status == "pass" else MANUAL_REVIEW_PROGRESS_VALUE
+            approved_case_bonus, approved_case_reason = self.runtime._approved_case_confidence_boost(
+                agent=current_state["agent"],
+                question=current_state["question"],
+                retrieval_hit_count=current_state["retrieval_hit_count"],
+            )
+            if approved_case_bonus > 0:
+                confidence_score = round(min(1.0, confidence_score + approved_case_bonus), 4)
+                judge_reason = (
+                    f"{judge_reason}；{approved_case_reason}"
+                    if judge_reason
+                    else approved_case_reason
+                )
+                if judge_status != "pass" and confidence_score >= LOW_CONFIDENCE_THRESHOLD:
+                    judge_status = "pass"
+                    judge_reason = f"{judge_reason}；已达到直接通过阈值"
+            progress_value = DONE_PROGRESS_VALUE if judge_status == "pass" else MANUAL_REVIEW_PROGRESS_VALUE
+            review_result = review_result.model_copy(
+                update={
+                    "judge_status": judge_status,
+                    "confidence_score": confidence_score,
+                    "judge_reason": judge_reason,
+                    "progress_value": progress_value,
+                }
             )
             resolved_fields = current_state["resolved_fields"]
-            update_fields = self.runtime._build_runtime_update_fields(
+            routed_module_value = current_state.get("module_value", "")
+            routed_owner_name = ""
+            update_field_pairs: list[tuple[FeishuBitableFieldInfo | None, Any]] = [
                 (resolved_fields["answer"], current_state["solution"]),
                 (resolved_fields["link"], current_state["related_link_field_value"]),
                 (resolved_fields["confidence"], confidence_score),
                 (resolved_fields["hit_count"], current_state["retrieval_hit_count"]),
                 (resolved_fields["progress"], progress_value),
-            )
+            ]
+            if judge_status != "pass":
+                routed_module_value, routed_owner_name = self._route_manual_review_assignment(current_state)
+                update_field_pairs.extend(
+                    self._manual_review_assignment_field_pairs(current_state, routed_module_value, routed_owner_name)
+                )
+            else:
+                _matched_module_value, routed_owner_name = self._route_manual_review_assignment(current_state)
+                update_field_pairs.extend(self._support_staff_field_pairs(current_state, routed_owner_name))
+            update_fields = self.runtime._build_runtime_update_fields(*update_field_pairs)
             row_result = self._build_row_result(
-                dict(current_state, review_result=review_result),
+                dict(current_state, review_result=review_result, module_value=routed_module_value),
                 status="generated" if judge_status == "pass" else "manual_review",
                 solution=current_state["solution"],
                 related_link=current_state.get("related_link"),
@@ -898,6 +1329,7 @@ class SupportIssueRowGraph(_SupportIssueGraphBase):
                 "progress_value": progress_value,
                 "update_fields": update_fields,
                 "row_result": row_result,
+                "module_value": routed_module_value,
                 "needs_support_owner_notify": judge_status != "pass",
                 "support_owner_solution": current_state["solution"],
                 "_trace_message": "复核子 agent 已完成草稿复核。",
@@ -1135,6 +1567,7 @@ class SupportIssueFeedbackGraph(_SupportIssueGraphBase):
         builder.add_node("upsert_facts", self.upsert_facts)
         builder.add_node("append_history", self.append_history)
         builder.add_node("backfill_support_owner_notifications", self.backfill_support_owner_notifications)
+        builder.add_node("backfill_registrant_ai_completed_notifications", self.backfill_registrant_ai_completed_notifications)
         builder.add_node("detect_registrant_confirmation_completed", self.detect_registrant_confirmation_completed)
         builder.add_node("refresh_case_candidates", self.refresh_case_candidates)
         builder.add_node("summarize_sync", self.summarize_sync)
@@ -1145,7 +1578,8 @@ class SupportIssueFeedbackGraph(_SupportIssueGraphBase):
         builder.add_edge("compare_snapshots", "upsert_facts")
         builder.add_edge("upsert_facts", "append_history")
         builder.add_edge("append_history", "backfill_support_owner_notifications")
-        builder.add_edge("backfill_support_owner_notifications", "detect_registrant_confirmation_completed")
+        builder.add_edge("backfill_support_owner_notifications", "backfill_registrant_ai_completed_notifications")
+        builder.add_edge("backfill_registrant_ai_completed_notifications", "detect_registrant_confirmation_completed")
         builder.add_edge("detect_registrant_confirmation_completed", "refresh_case_candidates")
         builder.add_edge("refresh_case_candidates", "summarize_sync")
         builder.add_edge("summarize_sync", END)
@@ -1155,6 +1589,16 @@ class SupportIssueFeedbackGraph(_SupportIssueGraphBase):
         """读取飞书全表数据。"""
 
         def callback(current_state: SupportIssueFeedbackGraphState) -> dict[str, Any]:
+            preloaded_rows = current_state.get("raw_rows", [])
+            if len(preloaded_rows) > 0:
+                table_contexts = current_state.get("table_contexts", [])
+                return {
+                    "table_contexts": table_contexts,
+                    "raw_rows": preloaded_rows,
+                    "_trace_message": "已复用本轮读取到的飞书反馈数据。",
+                    "_trace_payload_preview": {"table_count": len(table_contexts), "row_count": len(preloaded_rows)},
+                }
+
             agent = current_state["agent"]
             try:
                 raw_rows, table_contexts = self.runtime._list_all_agent_rows(agent)
@@ -1346,34 +1790,62 @@ class SupportIssueFeedbackGraph(_SupportIssueGraphBase):
             callback=callback,
         )
 
+    def backfill_registrant_ai_completed_notifications(self, state: SupportIssueFeedbackGraphState) -> dict[str, Any]:
+        """确保所有“AI分析完成”记录都有登记人通知。"""
+
+        def callback(current_state: SupportIssueFeedbackGraphState) -> dict[str, Any]:
+            for plan in current_state.get("plans", []):
+                self.runtime._backfill_registrant_ai_completed_notification_if_needed(
+                    agent=current_state["agent"],
+                    record_id=plan["record_id"],
+                    fields=plan["fields"],
+                    resolved_fields=current_state["resolved_fields"],
+                    fact=plan["persisted_fact"],
+                    synced_at=current_state["synced_at"],
+                    source_bitable_url=plan.get("source_bitable_url", current_state["agent"].feishu_bitable_url),
+                    source_table_name=plan.get("source_table_name", ""),
+                )
+            return {
+                "_trace_message": "登记人 AI 完成态通知检测完成。",
+                "_trace_payload_preview": {"plan_count": len(current_state.get("plans", []))},
+            }
+
+        return self._run_traced_node(
+            state=state,
+            node="backfill_registrant_ai_completed_notifications",
+            phase="feedback",
+            callback=callback,
+        )
+
     def detect_registrant_confirmation_completed(self, state: SupportIssueFeedbackGraphState) -> dict[str, Any]:
-        """只在进度从“非完成态”首次变成“人工确认完成”时通知登记人。"""
+        """扫描人工确认完成记录，通知登记人后自动收口为完成。"""
 
         def callback(current_state: SupportIssueFeedbackGraphState) -> dict[str, Any]:
             notified_count = 0
+            completed_count = 0
             for plan in current_state.get("plans", []):
-                previous_fact = plan.get("previous_fact")
                 persisted_fact = plan["persisted_fact"]
-                if previous_fact is None:
-                    continue
-                if previous_fact.progress_value == HUMAN_CONFIRMED_PROGRESS_VALUE:
-                    continue
                 if persisted_fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
                     continue
-                self.runtime._notify_registrants_for_confirmation_completed(
+                closed = self.runtime._close_human_confirmed_record_after_notification(
                     agent=current_state["agent"],
                     record_id=plan["record_id"],
                     fields=plan["fields"],
                     resolved_fields=current_state["resolved_fields"],
                     fact=persisted_fact,
-                    progress_changed_at=current_state["synced_at"],
+                    synced_at=current_state["synced_at"],
                     source_bitable_url=plan.get("source_bitable_url", current_state["agent"].feishu_bitable_url),
                     source_table_name=plan.get("source_table_name", ""),
                 )
-                notified_count += 1
+                if closed:
+                    notified_count += 1
+                    completed_count += 1
             return {
                 "_trace_message": "登记人完成态通知检测完成。",
-                "_trace_payload_preview": {"registrant_notified_count": notified_count},
+                "_trace_payload_preview": {
+                    "registrant_notified_count": notified_count,
+                    "auto_completed_count": completed_count,
+                },
             }
 
         return self._run_traced_node(
@@ -1507,6 +1979,9 @@ class SupportIssueDigestGraph(_SupportIssueGraphBase):
                 "agent": current_state["agent"],
                 "synced_at": _utc_now(),
                 "graph_trace": [],
+                "table_contexts": current_state.get("table_contexts", []),
+                "raw_rows": current_state.get("raw_rows", []),
+                "resolved_fields": current_state.get("resolved_fields", {}),
             }
             final_state = self.feedback_graph.graph.invoke(feedback_state)
             response = final_state.get("response")
@@ -2067,6 +2542,7 @@ class SupportIssueRunGraph(_SupportIssueGraphBase):
             if len(candidate_rows) == 0:
                 return {
                     "row_results": [],
+                    "raw_rows": current_state.get("raw_rows", []),
                     "_trace_status": "skipped",
                     "_trace_message": "当前没有待处理记录，跳过行级子图。",
                 }
@@ -2094,12 +2570,17 @@ class SupportIssueRunGraph(_SupportIssueGraphBase):
                     row_result = final_row_state.get("row_result")
                     if isinstance(row_result, SupportIssueRowResult):
                         row_results.append(row_result)
+                        update_fields = final_row_state.get("update_fields")
+                        fields = row.get("fields")
+                        if row_result.status != "failed" and isinstance(update_fields, dict) and isinstance(fields, dict):
+                            fields.update(update_fields)
                     else:
                         raise RuntimeError("单行图未返回 row_result。")
                 except Exception as exc:
                     row_results.append(self._build_crashed_row_result(current_state, row=row, exc=exc))
             return {
                 "row_results": row_results,
+                "raw_rows": current_state.get("raw_rows", []),
                 "_trace_message": "行级子图处理完成。",
                 "_trace_payload_preview": {"processed_row_count": len(row_results)},
             }
@@ -2139,6 +2620,9 @@ class SupportIssueRunGraph(_SupportIssueGraphBase):
                 )
                 return {
                     "run": run,
+                    "table_contexts": current_state.get("table_contexts", []),
+                    "raw_rows": raw_rows,
+                    "resolved_fields": current_state.get("resolved_fields", {}),
                     "_trace_status": "skipped",
                     "_trace_message": "没有待处理记录，run 收口为 no_change。",
                 }
@@ -2178,6 +2662,9 @@ class SupportIssueRunGraph(_SupportIssueGraphBase):
             )
             return {
                 "run": run,
+                "table_contexts": current_state.get("table_contexts", []),
+                "raw_rows": raw_rows,
+                "resolved_fields": current_state.get("resolved_fields", {}),
                 "_trace_message": "run 结果汇总完成。",
                 "_trace_payload_preview": {
                     "run_status": run_status,
@@ -2211,6 +2698,9 @@ class SupportIssueRunGraph(_SupportIssueGraphBase):
                 "agent": current_state["agent"],
                 "synced_at": _utc_now(),
                 "graph_trace": [],
+                "table_contexts": current_state.get("table_contexts", []),
+                "raw_rows": current_state.get("raw_rows", []),
+                "resolved_fields": current_state.get("resolved_fields", {}),
             }
             try:
                 final_feedback_state = self.feedback_graph.graph.invoke(feedback_state)

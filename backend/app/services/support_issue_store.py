@@ -95,11 +95,26 @@ def _normalize_owner_rules(rules: list[SupportIssueOwnerRule] | None) -> list[Su
     for item in rules or []:
         rule = item if isinstance(item, SupportIssueOwnerRule) else SupportIssueOwnerRule.model_validate(item)
         module_value = rule.module_value.strip()
+        keywords = rule.keywords.strip()
+        owner_name = rule.owner_name.strip()
         yht_user_id = rule.yht_user_id.strip()
         if module_value == "" or yht_user_id == "":
             continue
-        normalized.append(SupportIssueOwnerRule(module_value=module_value, yht_user_id=yht_user_id))
+        normalized.append(
+            SupportIssueOwnerRule(
+                module_value=module_value,
+                keywords=keywords,
+                owner_name=owner_name,
+                yht_user_id=yht_user_id,
+            )
+        )
     return normalized
+
+
+def _normalize_retrieval_mode(value: str | None) -> str:
+    """统一清洗支持问题 Agent 的检索模式。"""
+
+    return "retrieval" if str(value or "").strip() == "retrieval" else "rich"
 
 
 def _next_digest_at(base_time: datetime | None = None) -> datetime:
@@ -182,12 +197,14 @@ class SupportIssueStore:
                     model_config_json TEXT NOT NULL,
                     knowledge_scope_type TEXT NOT NULL,
                     knowledge_scope_id TEXT,
+                    retrieval_mode TEXT NOT NULL DEFAULT 'rich',
                     question_field_name TEXT NOT NULL,
                     answer_field_name TEXT NOT NULL,
                     link_field_name TEXT NOT NULL,
                     progress_field_name TEXT NOT NULL DEFAULT '回复进度',
                     status_field_name TEXT NOT NULL,
                     module_field_name TEXT NOT NULL DEFAULT '负责模块',
+                    support_staff_field_name TEXT NOT NULL DEFAULT '支持人员',
                     registrant_field_name TEXT NOT NULL DEFAULT '登记人',
                     feedback_result_field_name TEXT NOT NULL DEFAULT '人工处理结果',
                     feedback_final_answer_field_name TEXT NOT NULL DEFAULT '人工最终方案',
@@ -356,8 +373,10 @@ class SupportIssueStore:
 
             # 老数据迁移：在已有表上补齐新列。
             self._ensure_column(conn, "support_issue_agents", "feishu_bitable_url", "TEXT")
+            self._ensure_column(conn, "support_issue_agents", "retrieval_mode", "TEXT NOT NULL DEFAULT 'rich'")
             self._ensure_column(conn, "support_issue_agents", "progress_field_name", "TEXT NOT NULL DEFAULT '回复进度'")
             self._ensure_column(conn, "support_issue_agents", "module_field_name", "TEXT NOT NULL DEFAULT '负责模块'")
+            self._ensure_column(conn, "support_issue_agents", "support_staff_field_name", "TEXT NOT NULL DEFAULT '支持人员'")
             self._ensure_column(conn, "support_issue_agents", "registrant_field_name", "TEXT NOT NULL DEFAULT '登记人'")
             self._ensure_column(
                 conn,
@@ -448,12 +467,20 @@ class SupportIssueStore:
 
             # 把新增列的空值补齐为默认值，保证旧数据读取稳定。
             conn.execute(
+                "UPDATE support_issue_agents SET retrieval_mode = 'rich' "
+                "WHERE retrieval_mode IS NULL OR retrieval_mode = ''"
+            )
+            conn.execute(
                 "UPDATE support_issue_agents SET progress_field_name = '回复进度' "
                 "WHERE progress_field_name IS NULL OR progress_field_name = ''"
             )
             conn.execute(
                 "UPDATE support_issue_agents SET module_field_name = '负责模块' "
                 "WHERE module_field_name IS NULL OR module_field_name = ''"
+            )
+            conn.execute(
+                "UPDATE support_issue_agents SET support_staff_field_name = '支持人员' "
+                "WHERE support_staff_field_name IS NULL OR support_staff_field_name = ''"
             )
             conn.execute(
                 "UPDATE support_issue_agents SET registrant_field_name = '登记人' "
@@ -547,12 +574,14 @@ class SupportIssueStore:
             model_settings=ModelConfig.model_validate_json(row["model_config_json"]),
             knowledge_scope_type=row["knowledge_scope_type"],
             knowledge_scope_id=row["knowledge_scope_id"],
+            retrieval_mode=_normalize_retrieval_mode(row["retrieval_mode"] if "retrieval_mode" in row.keys() else None),
             question_field_name=row["question_field_name"],
             answer_field_name=row["answer_field_name"],
             link_field_name=row["link_field_name"],
             progress_field_name=row["progress_field_name"] or "回复进度",
             status_field_name=row["status_field_name"],
             module_field_name=row["module_field_name"] or "负责模块",
+            support_staff_field_name=row["support_staff_field_name"] or "支持人员",
             registrant_field_name=row["registrant_field_name"] or "登记人",
             feedback_result_field_name=row["feedback_result_field_name"] or "人工处理结果",
             feedback_final_answer_field_name=row["feedback_final_answer_field_name"] or "人工最终方案",
@@ -748,12 +777,14 @@ class SupportIssueStore:
         model_config: ModelConfig,
         knowledge_scope_type: str,
         knowledge_scope_id: str | None,
+        retrieval_mode: str,
         question_field_name: str,
         answer_field_name: str,
         link_field_name: str,
         progress_field_name: str,
         status_field_name: str,
         module_field_name: str,
+        support_staff_field_name: str,
         registrant_field_name: str,
         feedback_result_field_name: str,
         feedback_final_answer_field_name: str,
@@ -776,16 +807,16 @@ class SupportIssueStore:
                 INSERT INTO support_issue_agents (
                     id, name, description, enabled, poll_interval_minutes,
                     feishu_bitable_url, feishu_app_token, feishu_table_id, model_config_json,
-                    knowledge_scope_type, knowledge_scope_id,
+                    knowledge_scope_type, knowledge_scope_id, retrieval_mode,
                     question_field_name, answer_field_name, link_field_name, progress_field_name, status_field_name,
-                    module_field_name, registrant_field_name,
+                    module_field_name, support_staff_field_name, registrant_field_name,
                     feedback_result_field_name, feedback_final_answer_field_name, feedback_comment_field_name,
                     confidence_field_name, hit_count_field_name,
                     support_owner_rules_json, fallback_support_yht_user_id,
                     digest_enabled, digest_recipient_emails_json, case_review_enabled,
                     created_at, updated_at, last_run_at, next_run_at, last_digest_at, next_digest_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     agent_id,
@@ -799,12 +830,14 @@ class SupportIssueStore:
                     model_config.model_dump_json(),
                     knowledge_scope_type,
                     knowledge_scope_id,
+                    _normalize_retrieval_mode(retrieval_mode),
                     question_field_name,
                     answer_field_name,
                     link_field_name,
                     progress_field_name,
                     status_field_name,
                     module_field_name,
+                    support_staff_field_name,
                     registrant_field_name,
                     feedback_result_field_name,
                     feedback_final_answer_field_name,
@@ -842,12 +875,14 @@ class SupportIssueStore:
         model_config: ModelConfig | None = None,
         knowledge_scope_type: str | None = None,
         knowledge_scope_id: str | None = None,
+        retrieval_mode: str | None = None,
         question_field_name: str | None = None,
         answer_field_name: str | None = None,
         link_field_name: str | None = None,
         progress_field_name: str | None = None,
         status_field_name: str | None = None,
         module_field_name: str | None = None,
+        support_staff_field_name: str | None = None,
         registrant_field_name: str | None = None,
         feedback_result_field_name: str | None = None,
         feedback_final_answer_field_name: str | None = None,
@@ -899,9 +934,9 @@ class SupportIssueStore:
                 UPDATE support_issue_agents
                 SET name = ?, description = ?, enabled = ?, poll_interval_minutes = ?,
                     feishu_bitable_url = ?, feishu_app_token = ?, feishu_table_id = ?, model_config_json = ?,
-                    knowledge_scope_type = ?, knowledge_scope_id = ?,
+                    knowledge_scope_type = ?, knowledge_scope_id = ?, retrieval_mode = ?,
                     question_field_name = ?, answer_field_name = ?, link_field_name = ?, progress_field_name = ?, status_field_name = ?,
-                    module_field_name = ?, registrant_field_name = ?,
+                    module_field_name = ?, support_staff_field_name = ?, registrant_field_name = ?,
                     feedback_result_field_name = ?, feedback_final_answer_field_name = ?, feedback_comment_field_name = ?,
                     confidence_field_name = ?, hit_count_field_name = ?,
                     support_owner_rules_json = ?, fallback_support_yht_user_id = ?,
@@ -922,12 +957,16 @@ class SupportIssueStore:
                     knowledge_scope_id
                     if knowledge_scope_type is not None or knowledge_scope_id is not None
                     else current.knowledge_scope_id,
+                    _normalize_retrieval_mode(retrieval_mode if retrieval_mode is not None else current.retrieval_mode),
                     question_field_name if question_field_name is not None else current.question_field_name,
                     answer_field_name if answer_field_name is not None else current.answer_field_name,
                     link_field_name if link_field_name is not None else current.link_field_name,
                     progress_field_name if progress_field_name is not None else current.progress_field_name,
                     status_field_name if status_field_name is not None else current.status_field_name,
                     module_field_name if module_field_name is not None else current.module_field_name,
+                    support_staff_field_name
+                    if support_staff_field_name is not None
+                    else current.support_staff_field_name,
                     registrant_field_name if registrant_field_name is not None else current.registrant_field_name,
                     feedback_result_field_name
                     if feedback_result_field_name is not None
@@ -1467,6 +1506,35 @@ class SupportIssueStore:
                 tuple(params),
             ).fetchone()
         return row is not None
+
+    def latest_notification_event_for_recipient(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_id: str,
+        statuses: tuple[str, ...] | None = None,
+    ) -> SupportIssueNotificationEvent | None:
+        status_clause = ""
+        params: list[str] = [agent_id, record_id, event_type, recipient_user_id]
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            status_clause = f" AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM support_issue_notification_events
+                WHERE agent_id = ? AND record_id = ? AND event_type = ? AND recipient_user_id = ?
+                {status_clause}
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                tuple(params),
+            ).fetchone()
+        return self._row_to_notification_event(row) if row is not None else None
 
     def record_digest_run(
         self,

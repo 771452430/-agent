@@ -13,6 +13,7 @@ from .schemas import (
     AgentRunResponse,
     CatalogResponse,
     CreateSupportIssueAgentRequest,
+    CreateJiraDuplicateAgentRequest,
     CreateWatcherRequest,
     CreateAgentRequest,
     CreateThreadRequest,
@@ -48,6 +49,7 @@ from .schemas import (
     RetrievalQueryRequest,
     RetrievalResult,
     RunSupportIssueAgentRequest,
+    RunJiraDuplicateAgentRequest,
     RunWatcherRequest,
     RunAgentRequest,
     SendMessageRequest,
@@ -57,9 +59,17 @@ from .schemas import (
     SupportIssueFeedbackSyncResponse,
     SupportIssueInsights,
     SupportIssueRun,
+    JiraDuplicateAgentConfig,
+    JiraDuplicateFetchTestResponse,
+    JiraDuplicateRun,
+    JiraSolutionDraftReplyRequest,
+    JiraSolutionDraftReplyResponse,
+    JiraSolutionSearchRequest,
+    JiraSolutionSearchResponse,
     ThreadState,
     ThreadSummary,
     UpdateSupportIssueCaseCandidateRequest,
+    UpdateJiraDuplicateAgentRequest,
     UpdateFeishuSettingsRequest,
     UpdateKnowledgeDocumentRequest,
     UpdateMailSettingsRequest,
@@ -83,6 +93,9 @@ from .services.feishu_settings_store import FeishuSettingsStore
 from .services.gitlab_import_service import GitLabImportService
 from .services.gitlab_settings_service import GitLabSettingsService
 from .services.gitlab_settings_store import GitLabSettingsStore
+from .services.jira_duplicate_scheduler import JiraDuplicateScheduler
+from .services.jira_duplicate_service import JiraDuplicateService
+from .services.jira_duplicate_store import JiraDuplicateStore
 from .services.knowledge_store import KnowledgeStore
 from .services.llm_service import LLMService
 from .services.mail_service import MailService
@@ -123,6 +136,7 @@ knowledge_store = KnowledgeStore(
 )
 watcher_store = WatcherStore(settings.sqlite_path)
 support_issue_store = SupportIssueStore(settings.sqlite_path)
+jira_duplicate_store = JiraDuplicateStore(settings.sqlite_path)
 work_notify_settings_store = WorkNotifySettingsStore(settings.sqlite_path)
 llm_service = LLMService(provider_store=provider_store, allow_mock_model=settings.allow_mock_model)
 gitlab_settings_service = GitLabSettingsService(gitlab_settings_store, settings)
@@ -159,6 +173,17 @@ support_issue_scheduler = SupportIssueScheduler(
     support_issue_service,
     settings.support_issue_scheduler_interval_seconds,
 )
+jira_duplicate_service = JiraDuplicateService(
+    store=jira_duplicate_store,
+    llm_service=llm_service,
+    settings=settings,
+    provider_store=provider_store,
+    rag_embedding_settings_service=rag_embedding_settings_service,
+)
+jira_duplicate_scheduler = JiraDuplicateScheduler(
+    jira_duplicate_service,
+    settings.support_issue_scheduler_interval_seconds,
+)
 
 # 这一段是后端“对象装配区”：
 # 先把 Store / Service / Scheduler 串好，再把它们暴露成 HTTP 路由。
@@ -178,12 +203,14 @@ app.add_middleware(
 async def on_startup() -> None:
     await watcher_scheduler.start()
     await support_issue_scheduler.start()
+    await jira_duplicate_scheduler.start()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     await watcher_scheduler.stop()
     await support_issue_scheduler.stop()
+    await jira_duplicate_scheduler.stop()
 
 
 @app.get("/health")
@@ -454,6 +481,66 @@ def run_watcher(watcher_id: str, request: RunWatcherRequest | None = None) -> Wa
 @app.get("/api/watchers/{watcher_id}/runs", response_model=list[WatcherRun])
 def list_watcher_runs(watcher_id: str) -> list[WatcherRun]:
     return watcher_service.list_runs(watcher_id)
+
+
+# -----------------------------
+# Jira 重复工单审核 Agent 接口
+# -----------------------------
+@app.get("/api/jira-duplicate-agents", response_model=list[JiraDuplicateAgentConfig])
+def list_jira_duplicate_agents() -> list[JiraDuplicateAgentConfig]:
+    return jira_duplicate_service.list_agents()
+
+
+@app.post("/api/jira-duplicate-agents", response_model=JiraDuplicateAgentConfig)
+def create_jira_duplicate_agent(request: CreateJiraDuplicateAgentRequest) -> JiraDuplicateAgentConfig:
+    return jira_duplicate_service.create_agent(request)
+
+
+@app.get("/api/jira-duplicate-agents/{agent_id}", response_model=JiraDuplicateAgentConfig)
+def get_jira_duplicate_agent(agent_id: str) -> JiraDuplicateAgentConfig:
+    return jira_duplicate_service.get_agent(agent_id)
+
+
+@app.patch("/api/jira-duplicate-agents/{agent_id}", response_model=JiraDuplicateAgentConfig)
+def update_jira_duplicate_agent(
+    agent_id: str,
+    request: UpdateJiraDuplicateAgentRequest,
+) -> JiraDuplicateAgentConfig:
+    return jira_duplicate_service.update_agent(agent_id, request)
+
+
+@app.post("/api/jira-duplicate-agents/{agent_id}/test-fetch", response_model=JiraDuplicateFetchTestResponse)
+def test_jira_duplicate_fetch(agent_id: str) -> JiraDuplicateFetchTestResponse:
+    return jira_duplicate_service.test_fetch(agent_id)
+
+
+@app.post("/api/jira-duplicate-agents/{agent_id}/run", response_model=JiraDuplicateRun)
+def run_jira_duplicate_agent(
+    agent_id: str,
+    request: RunJiraDuplicateAgentRequest | None = None,
+) -> JiraDuplicateRun:
+    _ = request
+    return jira_duplicate_service.run_agent(agent_id)
+
+
+@app.get("/api/jira-duplicate-agents/{agent_id}/runs", response_model=list[JiraDuplicateRun])
+def list_jira_duplicate_runs(agent_id: str) -> list[JiraDuplicateRun]:
+    return jira_duplicate_service.list_runs(agent_id)
+
+
+@app.post("/api/jira-duplicate-agents/{agent_id}/reindex")
+def reindex_jira_duplicate_cases(agent_id: str) -> dict[str, object]:
+    return jira_duplicate_service.reindex(agent_id)
+
+
+@app.post("/api/jira-solution-search", response_model=JiraSolutionSearchResponse)
+def search_jira_solution(request: JiraSolutionSearchRequest) -> JiraSolutionSearchResponse:
+    return jira_duplicate_service.search_solution(request)
+
+
+@app.post("/api/jira-solution-search/draft-reply", response_model=JiraSolutionDraftReplyResponse)
+def draft_jira_solution_reply(request: JiraSolutionDraftReplyRequest) -> JiraSolutionDraftReplyResponse:
+    return jira_duplicate_service.draft_solution_reply(request)
 
 
 # -----------------------------

@@ -83,6 +83,7 @@ MANUAL_REVIEW_PROGRESS_VALUE = "待人工确认"
 NO_HIT_PROGRESS_VALUE = "无命中"
 FAILED_PROGRESS_VALUE = "失败待重试"
 HUMAN_CONFIRMED_PROGRESS_VALUE = "人工确认完成"
+COMPLETED_PROGRESS_VALUE = "完成"
 NO_HIT_MESSAGE = "未检索到相关知识，已标记待人工确认，请人工补充处理。"
 NO_HIT_MESSAGE_KEYWORD = "未检索到相关知识"
 LOW_CONFIDENCE_THRESHOLD = 0.65
@@ -114,11 +115,18 @@ SUPPORT_CASE_LIBRARY_CATEGORY_MAP = {
     "FAQ": "实施常见问题",
     "需升级人工": "实施常见问题",
 }
+SUPPORT_ISSUE_RESPONSE_STYLE_PROMPT = (
+    "输出要像给人看的成稿，而不是机器拼接的结果。"
+    "优先做到：先结论后步骤，结构清楚，语气自然，表达简洁但完整。"
+    "可以适当使用条目化，但不要机械堆关键词，也不要写成模板腔。"
+    "如果适合直接回写表格，就尽量整理成可直接使用的中文方案。"
+)
 SUPPORT_ISSUE_SYSTEM_PROMPT = (
     "你是支持问题处理助手。"
     "请根据检索命中的知识片段，输出可直接写入问题台账的解决方案。"
     "优先给出排查步骤、处理建议和注意事项；如果信息不足，明确说明限制；"
     "不要编造知识库中不存在的信息；不要输出多余寒暄。"
+    + SUPPORT_ISSUE_RESPONSE_STYLE_PROMPT
 )
 ROW_TABLE_ID_KEY = "__agentdemo_table_id"
 ROW_TABLE_NAME_KEY = "__agentdemo_table_name"
@@ -277,19 +285,114 @@ class SupportIssueService:
     def _normalize_module_match_key(self, value: str) -> str:
         return self._normalize_field_match_key(value)
 
+    def _split_owner_rule_keywords(self, rule: SupportIssueOwnerRule) -> list[str]:
+        candidates = [rule.module_value]
+        candidates.extend(re.split(r"[,，;；、\n]+", rule.keywords))
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw in candidates:
+            item = raw.strip()
+            if item == "":
+                continue
+            key = self._normalize_similarity_text(item)
+            if key == "" or key in seen:
+                continue
+            seen.add(key)
+            normalized.append(item)
+        return normalized
+
+    def _owner_rule_question_similarity(self, question: str, rule: SupportIssueOwnerRule) -> float:
+        normalized_question = self._normalize_similarity_text(question)
+        if normalized_question == "":
+            return 0.0
+        best_score = 0.0
+        for keyword in self._split_owner_rule_keywords(rule):
+            normalized_keyword = self._normalize_similarity_text(keyword)
+            if normalized_keyword == "":
+                continue
+            if normalized_keyword in normalized_question or normalized_question in normalized_keyword:
+                # 人工维护的关键词只要被问题命中，就可以认为有较强路由意图。
+                coverage = min(len(normalized_keyword), len(normalized_question)) / max(
+                    len(normalized_keyword),
+                    len(normalized_question),
+                )
+                best_score = max(best_score, min(1.0, 0.75 + coverage * 0.25))
+                continue
+            best_score = max(best_score, self._case_similarity(normalized_question, normalized_keyword))
+        return best_score
+
+    def _resolve_support_owner_route(
+        self,
+        *,
+        question: str,
+        module_value: str,
+        rules: list[SupportIssueOwnerRule],
+        fallback_user_id: str,
+    ) -> tuple[str, str, str]:
+        normalized_module = self._normalize_module_match_key(module_value)
+        if normalized_module != "":
+            for rule in rules:
+                if self._normalize_module_match_key(rule.module_value) == normalized_module:
+                    return rule.module_value.strip(), rule.yht_user_id.strip(), rule.owner_name.strip()
+
+        best_rule: SupportIssueOwnerRule | None = None
+        best_score = 0.0
+        for rule in rules:
+            score = self._owner_rule_question_similarity(question, rule)
+            if score > best_score:
+                best_score = score
+                best_rule = rule
+
+        if best_rule is not None and best_score >= 0.35:
+            return best_rule.module_value.strip(), best_rule.yht_user_id.strip(), best_rule.owner_name.strip()
+
+        return module_value.strip(), fallback_user_id.strip(), ""
+
+    def _resolve_manual_review_module_value(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        module_value: str,
+    ) -> str:
+        routed_module_value, _owner_user_id, _owner_name = self._resolve_support_owner_route(
+            question=question,
+            module_value=module_value,
+            rules=agent.support_owner_rules,
+            fallback_user_id=agent.fallback_support_yht_user_id,
+        )
+        return routed_module_value
+
+    def _resolve_manual_review_route(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        module_value: str,
+    ) -> tuple[str, str]:
+        routed_module_value, _owner_user_id, owner_name = self._resolve_support_owner_route(
+            question=question,
+            module_value=module_value,
+            rules=agent.support_owner_rules,
+            fallback_user_id=agent.fallback_support_yht_user_id,
+        )
+        return routed_module_value, owner_name
+
     def _resolve_support_owner_user_id(
         self,
         *,
         module_value: str,
         rules: list[SupportIssueOwnerRule],
         fallback_user_id: str,
+        question: str = "",
     ) -> str:
-        normalized_module = self._normalize_module_match_key(module_value)
-        if normalized_module != "":
-            for rule in rules:
-                if self._normalize_module_match_key(rule.module_value) == normalized_module:
-                    return rule.yht_user_id.strip()
-        return fallback_user_id.strip()
+        _routed_module_value, owner_user_id, _owner_name = self._resolve_support_owner_route(
+            question=question,
+            module_value=module_value,
+            rules=rules,
+            fallback_user_id=fallback_user_id,
+        )
+        return owner_user_id
 
     def _extract_user_ids_from_field_value(self, value: Any) -> list[str]:
         user_ids: list[str] = []
@@ -450,7 +553,7 @@ class SupportIssueService:
         return resolved_user_ids
 
     def _registrant_notification_reminder(self) -> str:
-        return "如确认问题已闭环，请将“回复进度”改为“完成”，否则后续轮巡仍可能继续提醒。"
+        return "本条通知发送成功后，系统会自动将“回复进度”改为“完成”。"
 
     def _record_notification_event(
         self,
@@ -507,6 +610,31 @@ class SupportIssueService:
             statuses=statuses,
         )
 
+    def _has_notification_event_for_recipient_since(
+        self,
+        *,
+        agent_id: str,
+        record_id: str,
+        event_type: str,
+        recipient_user_id: str,
+        statuses: tuple[str, ...],
+        since: datetime,
+    ) -> bool:
+        latest_event = self.support_issue_store.latest_notification_event_for_recipient(
+            agent_id=agent_id,
+            record_id=record_id,
+            event_type=event_type,
+            recipient_user_id=recipient_user_id,
+            statuses=statuses,
+        )
+        if latest_event is None:
+            return False
+        latest_created_at = latest_event.created_at
+        if latest_created_at.tzinfo is None:
+            latest_created_at = latest_created_at.replace(tzinfo=timezone.utc)
+        since_at = since if since.tzinfo is not None else since.replace(tzinfo=timezone.utc)
+        return latest_created_at >= since_at
+
     def _send_yonyou_notification(
         self,
         *,
@@ -518,7 +646,7 @@ class SupportIssueService:
         title: str,
         content: str,
         web_url: str | None = None,
-    ) -> None:
+    ) -> bool:
         normalized_recipients = [item.strip() for item in recipient_user_ids if item.strip() != ""]
         if len(normalized_recipients) == 0:
             self._record_notification_event(
@@ -529,7 +657,7 @@ class SupportIssueService:
                 status="skipped",
                 error_message="缺少可用的通知接收人 userId。",
             )
-            return
+            return False
 
         try:
             response = self.yonyou_work_notify_service.send_work_notify(
@@ -555,6 +683,7 @@ class SupportIssueService:
                     recipient_user_id=recipient,
                     status="sent",
                 )
+            return True
         except YonyouWorkNotifyError as exc:
             error_message = str(exc)
             for recipient in normalized_recipients:
@@ -566,6 +695,7 @@ class SupportIssueService:
                     status="failed",
                     error_message=error_message,
                 )
+            return False
 
     def _short_text(self, value: str, *, limit: int = 120) -> str:
         compact = " ".join(value.strip().split())
@@ -636,6 +766,69 @@ class SupportIssueService:
             lines.append(f"   最终方案：{case.get('solution', '')}")
         return "\n".join(lines).strip()
 
+    def _approved_case_confidence_boost(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        retrieval_hit_count: int,
+    ) -> tuple[float, str]:
+        """给“已审核通过且同题/近似同题”的案例额外加权。
+
+        这层加权只用于已通过案例，避免把普通相似案例也抬到同样的置信度。
+        同时要求至少有一点检索命中，防止完全无依据的答案被强行抬高。
+        """
+
+        if retrieval_hit_count <= 0:
+            return 0.0, ""
+
+        normalized_question = self._normalize_similarity_text(question)
+        if normalized_question == "":
+            return 0.0, ""
+
+        best_similarity = 0.0
+        best_case_question = ""
+        for case in self.support_issue_store.list_approved_case_candidates(agent.id):
+            case_question = self._stringify_field_value(case.question)
+            case_solution = self._stringify_field_value(case.final_solution)
+            if case_question == "" or case_solution == "":
+                continue
+
+            normalized_case_question = self._normalize_similarity_text(case_question)
+            if normalized_case_question == normalized_question:
+                return 0.24, f"命中已审核同题案例：{case_question}"
+
+            similarity = self._case_similarity(question, case_question)
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_case_question = case_question
+
+        if best_similarity >= 0.85:
+            return 0.12, f"命中已审核高度相似案例：{best_case_question}"
+        if best_similarity >= 0.7:
+            return 0.06, f"命中已审核相似案例：{best_case_question}"
+        return 0.0, ""
+
+    def _find_exact_approved_case(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+    ) -> SupportIssueCaseCandidate | None:
+        """查找已审核通过且问题名称完全一致的案例。"""
+
+        normalized_question = self._normalize_similarity_text(question)
+        if normalized_question == "":
+            return None
+        for case in self.support_issue_store.list_approved_case_candidates(agent.id):
+            case_question = self._stringify_field_value(case.question)
+            case_solution = self._stringify_field_value(case.final_solution)
+            if case_question == "" or case_solution == "":
+                continue
+            if self._normalize_similarity_text(case_question) == normalized_question:
+                return case
+        return None
+
     def _judge_solution(
         self,
         *,
@@ -649,6 +842,9 @@ class SupportIssueService:
         normalized_summary = summary.strip()
         if normalized_summary == "":
             return "manual_review", 0.15, "生成结果为空。"
+
+        if SupportIssueService._summary_indicates_irrelevant_evidence(normalized_summary):
+            return "manual_review", 0.45, "命中内容与问题不相关，需人工确认。"
 
         confidence = 0.45
         confidence += min(0.25, retrieval_hit_count * 0.05)
@@ -673,6 +869,78 @@ class SupportIssueService:
         if bounded_confidence < LOW_CONFIDENCE_THRESHOLD:
             return "manual_review", bounded_confidence, "答案证据或匹配度不足，已转人工确认。"
         return "pass", bounded_confidence, "答案匹配度和证据充分性通过。"
+
+    @staticmethod
+    def _summary_indicates_irrelevant_evidence(summary: str) -> bool:
+        """识别“检索命中但证据明确无关”的答案。"""
+
+        normalized = re.sub(r"\s+", "", summary.strip())
+        if normalized == "":
+            return False
+
+        no_evidence_markers = (
+            "当前知识库未检索到与",
+            "未检索到与",
+            "未检索到相关依据",
+            "当前知识库未命中",
+            "没有对应的处理指引",
+            "无相关依据",
+            "无法基于现有资料",
+            "无法基于现有证据",
+            "当前可用的证据卡片里没有对应",
+        )
+        irrelevant_source_markers = (
+            "现有命中内容均为",
+            "检索命中的内容均为",
+            "检索到的内容均为",
+            "现有知识片段均为",
+            "现有知识库内容均为",
+        )
+        mismatch_markers = (
+            "检索到的知识库内容不匹配",
+            "知识库内容不匹配",
+            "与检索到的知识库内容不匹配",
+        )
+        irrelevant_markers = (
+            "与本问题无关",
+            "与该问题无关",
+            "与本问题无直接关联",
+            "与该问题无直接关联",
+            "不匹配",
+            "不适用于本问题场景",
+            "不适用于本问题",
+            "不适用于当前问题",
+            "不能据此编造",
+            "不能引用",
+            "不作为处理方案依据",
+        )
+        cannot_answer_markers = (
+            "当前无法依据现有知识库给出",
+            "无法据此给出",
+            "缺少可支撑的知识依据",
+            "缺少可支撑的依据",
+            "缺少知识依据",
+            "无法给出有效解决方案",
+            "不能基于现有知识库编造",
+            "不能基于现有知识片段编造",
+            "不能据此编造",
+            "不能引用",
+            "不作为处理方案依据",
+        )
+
+        if any(marker in normalized for marker in irrelevant_source_markers) and (
+            any(marker in normalized for marker in irrelevant_markers)
+            or any(marker in normalized for marker in cannot_answer_markers)
+        ):
+            return True
+        if any(marker in normalized for marker in mismatch_markers) and any(
+            marker in normalized for marker in cannot_answer_markers
+        ):
+            return True
+        return any(marker in normalized for marker in no_evidence_markers) and (
+            any(marker in normalized for marker in irrelevant_markers)
+            or any(marker in normalized for marker in cannot_answer_markers)
+        )
 
     def _best_related_link(self, document_ids: list[str]) -> str | None:
         external_urls = self.knowledge_store.get_document_external_urls(document_ids)
@@ -1009,6 +1277,10 @@ class SupportIssueService:
             available_fields,
             [agent.module_field_name, "负责模块", "模块", "业务模块"],
         )
+        support_staff_field = self._pick_field_by_candidates(
+            available_fields,
+            [agent.support_staff_field_name, "支持人员", "支持人", "支持负责人", "处理人", "负责人"],
+        )
         registrant_field = self._pick_field_by_candidates(
             available_fields,
             [agent.registrant_field_name, "登记人", "提交人", "提问人"],
@@ -1037,9 +1309,10 @@ class SupportIssueService:
         return {
             "question": question_field or FeishuBitableFieldInfo(field_name=agent.question_field_name),
             "answer": answer_field or FeishuBitableFieldInfo(field_name=agent.answer_field_name),
-            "link": link_field or FeishuBitableFieldInfo(field_name=agent.link_field_name),
+            "link": link_field or FeishuBitableFieldInfo(field_name=""),
             "progress": progress_field or FeishuBitableFieldInfo(field_name=agent.progress_field_name),
-            "module": module_field or FeishuBitableFieldInfo(field_name=agent.module_field_name),
+            "module": module_field or FeishuBitableFieldInfo(field_name=""),
+            "support_staff": support_staff_field or FeishuBitableFieldInfo(field_name=""),
             "registrant": registrant_field or FeishuBitableFieldInfo(field_name=agent.registrant_field_name),
             "feedback_result": feedback_result_field
             or FeishuBitableFieldInfo(field_name=agent.feedback_result_field_name),
@@ -1407,7 +1680,8 @@ class SupportIssueService:
         module_value: str,
         solution: str,
     ) -> None:
-        owner_user_id = self._resolve_support_owner_user_id(
+        routed_module_value, owner_user_id, owner_name = self._resolve_support_owner_route(
+            question=question,
             module_value=module_value,
             rules=agent.support_owner_rules,
             fallback_user_id=agent.fallback_support_yht_user_id,
@@ -1424,10 +1698,12 @@ class SupportIssueService:
             return
 
         topic = self._question_topic(question)
-        title = f"支持问题待人工确认｜{module_value or '未分类模块'}"
+        display_module_value = routed_module_value or module_value
+        title = f"支持问题待人工确认｜{display_module_value or '未分类模块'}"
         content = (
             f"页签：{source_table_name or '未命名页签'}\n"
-            f"模块：{module_value or '未分类模块'}\n"
+            f"模块：{display_module_value or '未分类模块'}\n"
+            f"支持人员：{owner_name or owner_user_id}\n"
             f"问题：{topic}\n"
             f"当前进度：{MANUAL_REVIEW_PROGRESS_VALUE}\n"
             f"处理摘要：{self._short_text(solution or NO_HIT_MESSAGE)}\n"
@@ -1462,11 +1738,25 @@ class SupportIssueService:
 
         module_field = resolved_fields["module"]
         module_value = self._stringify_field_value(fields.get(module_field.field_name))
-        owner_user_id = self._resolve_support_owner_user_id(
+        routed_module_value, owner_user_id, owner_name = self._resolve_support_owner_route(
+            question=fact.question,
             module_value=module_value,
             rules=agent.support_owner_rules,
             fallback_user_id=agent.fallback_support_yht_user_id,
         )
+        if routed_module_value != "" and routed_module_value != module_value and module_field.field_name.strip() != "":
+            self._update_row_fields(
+                agent,
+                record_id=record_id,
+                fields={module_field.field_name: routed_module_value},
+            )
+        support_staff_field = resolved_fields.get("support_staff")
+        if owner_name != "" and support_staff_field is not None and support_staff_field.field_name.strip() != "":
+            self._update_row_fields(
+                agent,
+                record_id=record_id,
+                fields={support_staff_field.field_name: owner_name},
+            )
         if owner_user_id != "" and self._has_notification_event_for_recipient(
             agent_id=agent.id,
             record_id=record_id,
@@ -1482,11 +1772,69 @@ class SupportIssueService:
             source_bitable_url=source_bitable_url,
             source_table_name=source_table_name,
             question=fact.question,
-            module_value=module_value,
+            module_value=routed_module_value,
             solution=fact.ai_solution or NO_HIT_MESSAGE,
         )
 
     def _notify_registrants_for_confirmation_completed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        progress_changed_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> bool:
+        registrant_field = resolved_fields["registrant"]
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(fields=fields, registrant_field=registrant_field)
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return False
+        if len(registrant_user_ids) == 0:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_confirmed",
+                recipient_user_id="",
+                status="skipped",
+                error_message=f"登记人列“{registrant_field.field_name}”未提取到有效邮箱/短账号，或未查询到对应 userId。",
+            )
+            return False
+
+        topic = self._question_topic(fact.question)
+        final_summary = fact.feedback_final_answer.strip() or fact.ai_solution.strip() or "请到支持问题表查看处理结果。"
+        content = (
+            f"提示您登记的问题「{topic}」已经回复，请去支持问题表格查看。\n"
+            f"所在页签：{source_table_name or '未命名页签'}\n"
+            f"当前进度：{HUMAN_CONFIRMED_PROGRESS_VALUE}\n"
+            f"处理结果：{self._short_text(final_summary, limit=180)}\n"
+            f"{self._registrant_notification_reminder()}\n"
+            f"飞书表：{source_bitable_url}\n"
+            f"record_id：{record_id}"
+        )
+        return self._send_yonyou_notification(
+            agent_id=agent.id,
+            record_id=record_id,
+            event_type="registrant_confirmed",
+            recipient_user_ids=registrant_user_ids,
+            src_msg_id=f"SUPPORT_CONFIRM_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
+            title=f"支持问题已回复｜{topic}",
+            content=content,
+            web_url=source_bitable_url,
+        )
+
+    def _notify_registrants_for_ai_completed(
         self,
         *,
         agent: SupportIssueAgentConfig,
@@ -1505,7 +1853,7 @@ class SupportIssueService:
             self._record_notification_event(
                 agent_id=agent.id,
                 record_id=record_id,
-                event_type="registrant_confirmed",
+                event_type="registrant_ai_completed",
                 recipient_user_id="",
                 status="failed",
                 error_message=f"登记人联系人查询失败：{exc}",
@@ -1515,7 +1863,7 @@ class SupportIssueService:
             self._record_notification_event(
                 agent_id=agent.id,
                 record_id=record_id,
-                event_type="registrant_confirmed",
+                event_type="registrant_ai_completed",
                 recipient_user_id="",
                 status="skipped",
                 error_message=f"登记人列“{registrant_field.field_name}”未提取到有效邮箱/短账号，或未查询到对应 userId。",
@@ -1523,25 +1871,133 @@ class SupportIssueService:
             return
 
         topic = self._question_topic(fact.question)
-        final_summary = fact.feedback_final_answer.strip() or fact.ai_solution.strip() or "请到支持问题表查看处理结果。"
+        ai_summary = fact.ai_solution.strip() or "请到支持问题表查看 AI 处理结果。"
         content = (
-            f"提示您登记的问题「{topic}」已经回复，请去支持问题表格查看。\n"
+            f"提示您登记的问题「{topic}」已经完成 AI 回复，请到支持问题表格查看。\n"
             f"所在页签：{source_table_name or '未命名页签'}\n"
-            f"当前进度：{HUMAN_CONFIRMED_PROGRESS_VALUE}\n"
-            f"处理结果：{self._short_text(final_summary, limit=180)}\n"
-            f"{self._registrant_notification_reminder()}\n"
+            f"当前进度：{DONE_PROGRESS_VALUE}\n"
+            f"AI回复摘要：{self._short_text(ai_summary, limit=180)}\n"
             f"飞书表：{source_bitable_url}\n"
             f"record_id：{record_id}"
         )
         self._send_yonyou_notification(
             agent_id=agent.id,
             record_id=record_id,
-            event_type="registrant_confirmed",
+            event_type="registrant_ai_completed",
             recipient_user_ids=registrant_user_ids,
-            src_msg_id=f"SUPPORT_CONFIRM_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
-            title=f"支持问题已回复｜{topic}",
+            src_msg_id=f"SUPPORT_AI_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
+            title=f"支持问题 AI 回复完成｜{topic}",
             content=content,
             web_url=source_bitable_url,
+        )
+
+    def _notify_registrants_for_completed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        progress_changed_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> bool:
+        registrant_field = resolved_fields["registrant"]
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(fields=fields, registrant_field=registrant_field)
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_completed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return False
+        if len(registrant_user_ids) == 0:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_completed",
+                recipient_user_id="",
+                status="skipped",
+                error_message=f"登记人列“{registrant_field.field_name}”未提取到有效邮箱/短账号，或未查询到对应 userId。",
+            )
+            return False
+
+        topic = self._question_topic(fact.question)
+        final_summary = fact.feedback_final_answer.strip() or fact.ai_solution.strip() or "请到支持问题表查看处理结果。"
+        content = (
+            f"提示您登记的问题「{topic}」已经处理完成，请去支持问题表格查看。\n"
+            f"所在页签：{source_table_name or '未命名页签'}\n"
+            f"当前进度：{COMPLETED_PROGRESS_VALUE}\n"
+            f"处理结果：{self._short_text(final_summary, limit=180)}\n"
+            f"飞书表：{source_bitable_url}\n"
+            f"record_id：{record_id}"
+        )
+        return self._send_yonyou_notification(
+            agent_id=agent.id,
+            record_id=record_id,
+            event_type="registrant_completed",
+            recipient_user_ids=registrant_user_ids,
+            src_msg_id=f"SUPPORT_DONE:{agent.id}:{record_id}:{progress_changed_at.isoformat()}",
+            title=f"支持问题已完成｜{topic}",
+            content=content,
+            web_url=source_bitable_url,
+        )
+
+    def _backfill_registrant_ai_completed_notification_if_needed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> None:
+        if fact.progress_value != DONE_PROGRESS_VALUE:
+            return
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(
+                fields=fields,
+                registrant_field=resolved_fields["registrant"],
+            )
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_ai_completed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return
+        if len(registrant_user_ids) > 0 and all(
+            self._has_notification_event_for_recipient_since(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_ai_completed",
+                recipient_user_id=recipient_user_id,
+                statuses=("sent",),
+                since=fact.updated_at,
+            )
+            for recipient_user_id in registrant_user_ids
+        ):
+            return
+        self._notify_registrants_for_ai_completed(
+            agent=agent,
+            record_id=record_id,
+            fields=fields,
+            resolved_fields=resolved_fields,
+            fact=fact,
+            progress_changed_at=synced_at,
+            source_bitable_url=source_bitable_url,
+            source_table_name=source_table_name,
         )
 
     def _backfill_registrant_confirmation_notification_if_needed(
@@ -1555,9 +2011,9 @@ class SupportIssueService:
         synced_at: datetime,
         source_bitable_url: str,
         source_table_name: str,
-    ) -> None:
+    ) -> bool:
         if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
-            return
+            return False
         try:
             registrant_user_ids = self._extract_registrant_user_ids(
                 fields=fields,
@@ -1572,7 +2028,7 @@ class SupportIssueService:
                 status="failed",
                 error_message=f"登记人联系人查询失败：{exc}",
             )
-            return
+            return False
         if len(registrant_user_ids) > 0 and all(
             self._has_notification_event_for_recipient(
                 agent_id=agent.id,
@@ -1583,8 +2039,8 @@ class SupportIssueService:
             )
             for recipient_user_id in registrant_user_ids
         ):
-            return
-        self._notify_registrants_for_confirmation_completed(
+            return True
+        return self._notify_registrants_for_confirmation_completed(
             agent=agent,
             record_id=record_id,
             fields=fields,
@@ -1594,6 +2050,89 @@ class SupportIssueService:
             source_bitable_url=source_bitable_url,
             source_table_name=source_table_name,
         )
+
+    def _backfill_registrant_completed_notification_if_needed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> bool:
+        if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
+            return False
+        try:
+            registrant_user_ids = self._extract_registrant_user_ids(
+                fields=fields,
+                registrant_field=resolved_fields["registrant"],
+            )
+        except YonyouContactsSearchError as exc:
+            self._record_notification_event(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_completed",
+                recipient_user_id="",
+                status="failed",
+                error_message=f"登记人联系人查询失败：{exc}",
+            )
+            return False
+        if len(registrant_user_ids) > 0 and all(
+            self._has_notification_event_for_recipient(
+                agent_id=agent.id,
+                record_id=record_id,
+                event_type="registrant_completed",
+                recipient_user_id=recipient_user_id,
+                statuses=("sent",),
+            )
+            for recipient_user_id in registrant_user_ids
+        ):
+            return True
+        return self._notify_registrants_for_completed(
+            agent=agent,
+            record_id=record_id,
+            fields=fields,
+            resolved_fields=resolved_fields,
+            fact=fact,
+            progress_changed_at=synced_at,
+            source_bitable_url=source_bitable_url,
+            source_table_name=source_table_name,
+        )
+
+    def _close_human_confirmed_record_after_notification(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> bool:
+        notified_or_already_sent = self._backfill_registrant_completed_notification_if_needed(
+            agent=agent,
+            record_id=record_id,
+            fields=fields,
+            resolved_fields=resolved_fields,
+            fact=fact,
+            synced_at=synced_at,
+            source_bitable_url=source_bitable_url,
+            source_table_name=source_table_name,
+        )
+        if not notified_or_already_sent:
+            return False
+        self._mark_record_progress_only(
+            agent,
+            record_id=record_id,
+            progress_field_name=resolved_fields["progress"].field_name,
+            progress_value=COMPLETED_PROGRESS_VALUE,
+        )
+        return True
 
     def _feedback_fact_to_candidate(
         self,
@@ -1750,6 +2289,22 @@ class SupportIssueService:
         except ValueError:
             # 旧文档可能已经被人工删除或历史数据不完整；这里不把整次编辑链路打断。
             return
+
+    def _withdraw_case_candidate(self, candidate: SupportIssueCaseCandidate, *, review_comment: str) -> SupportIssueCaseCandidate:
+        """撤回已通过案例，让它回到待审核并退出 RAG 检索。"""
+
+        self._delete_case_candidate_document(candidate)
+        withdrawn = self.support_issue_store.update_case_candidate_review(
+            candidate_id=candidate.id,
+            status="pending_review",
+            review_comment=review_comment or "已撤回审核通过，重新进入待审核。",
+            approved_by=None,
+            approved_at=None,
+            knowledge_document_id=None,
+        )
+        if withdrawn is None:
+            raise HTTPException(status_code=404, detail="Support case candidate not found")
+        return withdrawn
 
     def _build_feedback_fact_from_candidate_edit(
         self,
@@ -2383,12 +2938,14 @@ class SupportIssueService:
             model_config=model_config,
             knowledge_scope_type=request.knowledge_scope_type,
             knowledge_scope_id=request.knowledge_scope_id,
+            retrieval_mode=request.retrieval_mode,
             question_field_name=request.question_field_name,
             answer_field_name=request.answer_field_name,
             link_field_name=request.link_field_name,
             progress_field_name=request.progress_field_name,
             status_field_name=request.status_field_name,
             module_field_name=request.module_field_name,
+            support_staff_field_name=request.support_staff_field_name,
             registrant_field_name=request.registrant_field_name,
             feedback_result_field_name=request.feedback_result_field_name,
             feedback_final_answer_field_name=request.feedback_final_answer_field_name,
@@ -2430,12 +2987,14 @@ class SupportIssueService:
             feishu_table_id=parsed_table_id,
             knowledge_scope_type=request.knowledge_scope_type,
             knowledge_scope_id=request.knowledge_scope_id,
+            retrieval_mode=request.retrieval_mode,
             question_field_name=request.question_field_name,
             answer_field_name=request.answer_field_name,
             link_field_name=request.link_field_name,
             progress_field_name=request.progress_field_name,
             status_field_name=request.status_field_name,
             module_field_name=request.module_field_name,
+            support_staff_field_name=request.support_staff_field_name,
             registrant_field_name=request.registrant_field_name,
             feedback_result_field_name=request.feedback_result_field_name,
             feedback_final_answer_field_name=request.feedback_final_answer_field_name,
@@ -2602,6 +3161,9 @@ class SupportIssueService:
             request.feedback_comment,
             fallback=candidate.feedback_comment,
         )
+
+        if request.action == "withdraw":
+            return self._withdraw_case_candidate(candidate, review_comment=review_comment)
 
         if request.action == "save_edit":
             return self._save_case_candidate_content(

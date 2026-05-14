@@ -21,6 +21,7 @@ ScopeType = Literal["none", "global", "tree_recursive"]
 ModelMode = Literal["learning", "provider"]
 ProviderProtocol = Literal["openai_compatible", "anthropic_compatible", "ollama_native", "mock_local"]
 ProviderModelSource = Literal["manual", "discovered"]
+SupportIssueRetrievalMode = Literal["retrieval", "rich"]
 
 # -----------------------------
 # 模型 / Provider / 邮箱 / 飞书
@@ -1081,13 +1082,231 @@ class WatcherRun(BaseModel):
     assignment_results: list[WatcherAssignmentResult] = Field(default_factory=list)
 
 
+JiraDuplicateRunStatus = Literal["success", "no_change", "partial_success", "failed"]
+JiraDuplicateMatchLevel = Literal["high", "medium", "low", "none"]
+
+
+class JiraDuplicateAgentConfig(BaseModel):
+    """Jira 重复工单审核 Agent 配置。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    name: str
+    description: str = ""
+    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    dashboard_url: str = Field(min_length=1)
+    request_method: WatcherRequestMethod = "GET"
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
+    poll_interval_minutes: int = Field(default=30, ge=1, le=24 * 60)
+    high_similarity_threshold: float = Field(default=0.78, ge=0, le=1)
+    medium_similarity_threshold: float = Field(default=0.55, ge=0, le=1)
+    model_review_enabled: bool = False
+    model_settings: ModelConfig = Field(alias="model_config")
+    enabled: bool = True
+    created_at: datetime
+    updated_at: datetime
+    last_run_at: datetime | None = None
+    next_run_at: datetime | None = None
+    last_run_status: JiraDuplicateRunStatus | None = None
+    last_matched_count: int = 0
+
+
+class CreateJiraDuplicateAgentRequest(BaseModel):
+    """创建 Jira 重复工单审核 Agent。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(min_length=1)
+    description: str = ""
+    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    dashboard_url: str = Field(min_length=1)
+    request_method: WatcherRequestMethod = "GET"
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
+    poll_interval_minutes: int = Field(default=30, ge=1, le=24 * 60)
+    high_similarity_threshold: float = Field(default=0.78, ge=0, le=1)
+    medium_similarity_threshold: float = Field(default=0.55, ge=0, le=1)
+    model_review_enabled: bool = False
+    model_settings: ModelConfig | None = Field(default=None, alias="model_config")
+    enabled: bool = True
+
+
+class UpdateJiraDuplicateAgentRequest(BaseModel):
+    """更新 Jira 重复工单审核 Agent。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str | None = None
+    description: str | None = None
+    source_db_path: str | None = None
+    dashboard_url: str | None = None
+    request_method: WatcherRequestMethod | None = None
+    request_headers: dict[str, str] | None = None
+    request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod | None = None
+    detail_request_headers: dict[str, str] | None = None
+    detail_request_body_text: str | None = None
+    poll_interval_minutes: int | None = Field(default=None, ge=1, le=24 * 60)
+    high_similarity_threshold: float | None = Field(default=None, ge=0, le=1)
+    medium_similarity_threshold: float | None = Field(default=None, ge=0, le=1)
+    model_review_enabled: bool | None = None
+    model_settings: ModelConfig | None = Field(default=None, alias="model_config")
+    enabled: bool | None = None
+
+
+class RunJiraDuplicateAgentRequest(BaseModel):
+    """手动立即运行 Jira 重复工单审核 Agent。"""
+
+    pass
+
+
+class JiraSolutionSearchRequest(BaseModel):
+    """开发人员粘贴问题描述后，检索历史已完成 Jira 解决方案。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    description: str = Field(min_length=1)
+    issue_key: str = "MANUAL-QUERY"
+    title: str = ""
+    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    domain: str = ""
+    module: str = ""
+    category: str = ""
+    status: str = "待分析"
+    high_similarity_threshold: float = Field(default=0.78, ge=0, le=1)
+    medium_similarity_threshold: float = Field(default=0.55, ge=0, le=1)
+    model_review_enabled: bool = False
+    model_settings: ModelConfig | None = Field(default=None, alias="model_config")
+
+
+class JiraDuplicateFetchTestResponse(BaseModel):
+    """Jira 当前待处理接口检查结果。"""
+
+    ok: bool
+    status_code: int
+    message: str
+    dashboard_url: str
+    request_method: WatcherRequestMethod
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    request_body_json: dict[str, Any] | None = None
+    request_body_text: str | None = None
+    detail_url_template: str | None = None
+    detail_request_method: WatcherRequestMethod = "GET"
+    detail_request_headers: dict[str, str] = Field(default_factory=dict)
+    detail_request_body_text: str | None = None
+    response_content_type: str = ""
+    response_body_preview: str = ""
+    parsed_item_count: int = 0
+    parsed_issue_count: int = 0
+    parsed_issue_preview: list[ParsedBug] = Field(default_factory=list)
+
+
+class JiraDuplicateCandidate(BaseModel):
+    """某条当前 Jira 命中的历史已完成工单候选。"""
+
+    issue_key: str
+    summary: str = ""
+    domain: str = ""
+    module: str = ""
+    status: str = ""
+    solution: str = ""
+    score: float = 0.0
+    reason: str = ""
+
+
+class JiraDuplicateIssueResult(BaseModel):
+    """单条当前 Jira 的重复工单审核结果。"""
+
+    issue_key: str
+    jira_issue_id: str = ""
+    title: str = ""
+    description: str = ""
+    domain: str = ""
+    module: str = ""
+    status: str = ""
+    raw_excerpt: str = ""
+    match_level: JiraDuplicateMatchLevel = "none"
+    match_score: float = 0.0
+    match_reason: str = ""
+    candidates: list[JiraDuplicateCandidate] = Field(default_factory=list)
+    error_message: str | None = None
+
+
+class JiraDuplicateRun(BaseModel):
+    """Jira 重复工单审核 Agent 的一次运行记录。"""
+
+    id: str
+    agent_id: str
+    status: JiraDuplicateRunStatus
+    started_at: datetime
+    ended_at: datetime | None = None
+    fetched_count: int = 0
+    parsed_count: int = 0
+    matched_count: int = 0
+    high_confidence_count: int = 0
+    medium_confidence_count: int = 0
+    no_match_count: int = 0
+    failed_count: int = 0
+    summary: str = ""
+    error_message: str | None = None
+    issue_results: list[JiraDuplicateIssueResult] = Field(default_factory=list)
+
+
+class JiraSolutionSearchResponse(BaseModel):
+    """粘贴文本检索历史解决方案的结果。"""
+
+    result: JiraDuplicateIssueResult
+    indexed_count: int = 0
+    embedding_backend: str = ""
+    source_db_path: str = ""
+
+
+class JiraSolutionDraftReplyRequest(BaseModel):
+    """基于建议复用候选生成可编辑工单回复草稿。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    description: str = Field(min_length=1)
+    result: JiraDuplicateIssueResult
+    candidates: list[JiraDuplicateCandidate] = Field(default_factory=list)
+    model_settings: ModelConfig | None = Field(default=None, alias="model_config")
+
+
+class JiraSolutionDraftReplyResponse(BaseModel):
+    """工单回复草稿生成结果。"""
+
+    draft_text: str
+    generated_by_model: bool = False
+    model_label: str = ""
+    message: str = ""
+
+
 SupportIssueRunStatus = Literal["success", "no_change", "partial_success", "failed"]
 SupportIssueRowResultStatus = Literal["generated", "manual_review", "no_hit", "failed"]
 SupportIssueCaseCandidateStatus = Literal["pending_review", "approved"]
-SupportIssueCaseReviewAction = Literal["save_edit", "approve_and_publish"]
+SupportIssueCaseReviewAction = Literal["save_edit", "approve_and_publish", "withdraw"]
 SupportIssueDigestRunStatus = Literal["success", "failed"]
 SupportIssueDigestTriggerSource = Literal["manual", "scheduled"]
-SupportIssueNotificationEventType = Literal["manual_review_assigned", "registrant_confirmed"]
+SupportIssueNotificationEventType = Literal[
+    "manual_review_assigned",
+    "registrant_ai_completed",
+    "registrant_confirmed",
+    "registrant_completed",
+]
 SupportIssueNotificationEventStatus = Literal["sent", "skipped", "failed"]
 SupportIssueGraphTracePhase = Literal["run", "row", "feedback", "digest"]
 SupportIssueGraphTraceStatus = Literal["success", "skipped", "failed"]
@@ -1127,6 +1346,8 @@ class SupportIssueOwnerRule(BaseModel):
     """按业务模块匹配人工确认负责人。"""
 
     module_value: str = ""
+    keywords: str = ""
+    owner_name: str = ""
     yht_user_id: str = ""
 
 
@@ -1209,12 +1430,14 @@ class SupportIssueAgentConfig(BaseModel):
     model_settings: ModelConfig = Field(alias="model_config")
     knowledge_scope_type: ScopeType = "global"
     knowledge_scope_id: str | None = None
+    retrieval_mode: SupportIssueRetrievalMode = "rich"
     question_field_name: str = "问题"
     answer_field_name: str = "AI解决方案"
     link_field_name: str = "相关文档链接"
     progress_field_name: str = "回复进度"
     status_field_name: str = "处理状态"
     module_field_name: str = "负责模块"
+    support_staff_field_name: str = "支持人员"
     registrant_field_name: str = "登记人"
     feedback_result_field_name: str = "人工处理结果"
     feedback_final_answer_field_name: str = "人工最终方案"
@@ -1249,12 +1472,14 @@ class CreateSupportIssueAgentRequest(BaseModel):
     model_settings: ModelConfig | None = Field(default=None, alias="model_config")
     knowledge_scope_type: ScopeType = "global"
     knowledge_scope_id: str | None = None
+    retrieval_mode: SupportIssueRetrievalMode = "rich"
     question_field_name: str = "问题"
     answer_field_name: str = "AI解决方案"
     link_field_name: str = "相关文档链接"
     progress_field_name: str = "回复进度"
     status_field_name: str = "处理状态"
     module_field_name: str = "负责模块"
+    support_staff_field_name: str = "支持人员"
     registrant_field_name: str = "登记人"
     feedback_result_field_name: str = "人工处理结果"
     feedback_final_answer_field_name: str = "人工最终方案"
@@ -1281,12 +1506,14 @@ class UpdateSupportIssueAgentRequest(BaseModel):
     model_settings: ModelConfig | None = Field(default=None, alias="model_config")
     knowledge_scope_type: ScopeType | None = None
     knowledge_scope_id: str | None = None
+    retrieval_mode: SupportIssueRetrievalMode | None = None
     question_field_name: str | None = None
     answer_field_name: str | None = None
     link_field_name: str | None = None
     progress_field_name: str | None = None
     status_field_name: str | None = None
     module_field_name: str | None = None
+    support_staff_field_name: str | None = None
     registrant_field_name: str | None = None
     feedback_result_field_name: str | None = None
     feedback_final_answer_field_name: str | None = None
@@ -1431,11 +1658,13 @@ class UpdateSupportIssueCaseCandidateRequest(BaseModel):
 
     两态化改造后，候选页只保留两类显式动作：
     - `save_edit`：保存人工最终方案 / 反馈备注，通常仍停留在待审核；
-    - `approve_and_publish`：审核通过并写入正式案例库。
+    - `approve_and_publish`：审核通过并写入正式案例库；
+    - `withdraw`：撤回已通过案例，回到待审核并退出 RAG 检索。
 
     为了减少前后端接口数量，这个请求同时承载“内容编辑 + 审核动作”：
     - 当页面只是保存修改时，传 `save_edit`；
-    - 当页面直接点击“通过并入库”时，可以把最新草稿一并提交。
+    - 当页面直接点击“通过并入库”时，可以把最新草稿一并提交；
+    - 当页面点击“撤回入库”时，只处理审核状态和知识库下线，不改写飞书内容。
     """
 
     action: SupportIssueCaseReviewAction

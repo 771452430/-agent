@@ -46,6 +46,7 @@ import type {
   SupportIssueGraphTraceEvent,
   SupportIssueInsights,
   SupportIssueOwnerRule,
+  SupportIssueRetrievalMode,
   SupportIssueRun
 } from "../lib/types";
 import { ModelSelector } from "./model-selector";
@@ -70,12 +71,14 @@ type SupportIssueAgentFormState = {
   model_config: ModelConfig;
   knowledge_scope_type: ScopeType;
   knowledge_scope_id?: string | null;
+  retrieval_mode: SupportIssueRetrievalMode;
   question_field_name: string;
   answer_field_name: string;
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
   module_field_name: string;
+  support_staff_field_name: string;
   registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
@@ -141,12 +144,14 @@ function buildEmptyForm(): SupportIssueAgentFormState {
     model_config: DEFAULT_MODEL,
     knowledge_scope_type: "global",
     knowledge_scope_id: null,
+    retrieval_mode: "rich",
     question_field_name: "问题",
     answer_field_name: "AI解决方案",
     link_field_name: "相关文档链接",
     progress_field_name: "回复进度",
     status_field_name: "处理状态",
     module_field_name: "负责模块",
+    support_staff_field_name: "支持人员",
     registrant_field_name: "登记人",
     feedback_result_field_name: "人工处理结果",
     feedback_final_answer_field_name: "人工最终方案",
@@ -181,6 +186,8 @@ function parseCommaList(value: string) {
 function buildEmptyOwnerRule(): SupportIssueOwnerRule {
   return {
     module_value: "",
+    keywords: "",
+    owner_name: "",
     yht_user_id: ""
   };
 }
@@ -399,19 +406,26 @@ export function SupportIssueAgentsWorkspace() {
       model_config: detail.model_config,
       knowledge_scope_type: detail.knowledge_scope_type,
       knowledge_scope_id: detail.knowledge_scope_id ?? null,
+      retrieval_mode: detail.retrieval_mode,
       question_field_name: detail.question_field_name,
       answer_field_name: detail.answer_field_name,
       link_field_name: detail.link_field_name,
       progress_field_name: detail.progress_field_name,
       status_field_name: detail.status_field_name,
       module_field_name: detail.module_field_name,
+      support_staff_field_name: detail.support_staff_field_name,
       registrant_field_name: detail.registrant_field_name,
       feedback_result_field_name: detail.feedback_result_field_name,
       feedback_final_answer_field_name: detail.feedback_final_answer_field_name,
       feedback_comment_field_name: detail.feedback_comment_field_name,
       confidence_field_name: detail.confidence_field_name,
       hit_count_field_name: detail.hit_count_field_name,
-      support_owner_rules: detail.support_owner_rules,
+      support_owner_rules: detail.support_owner_rules.map((rule) => ({
+        module_value: rule.module_value,
+        keywords: rule.keywords ?? "",
+        owner_name: rule.owner_name ?? "",
+        yht_user_id: rule.yht_user_id
+      })),
       fallback_support_yht_user_id: detail.fallback_support_yht_user_id,
       digest_enabled: detail.digest_enabled,
       digest_recipient_emails_text: detail.digest_recipient_emails.join(", "),
@@ -742,12 +756,14 @@ export function SupportIssueAgentsWorkspace() {
         model_config: form.model_config,
         knowledge_scope_type: form.knowledge_scope_type,
         knowledge_scope_id: form.knowledge_scope_type === "tree_recursive" ? form.knowledge_scope_id : null,
+        retrieval_mode: form.retrieval_mode,
         question_field_name: form.question_field_name,
         answer_field_name: form.answer_field_name,
         link_field_name: form.link_field_name,
         progress_field_name: form.progress_field_name,
         status_field_name: form.status_field_name,
         module_field_name: form.module_field_name,
+        support_staff_field_name: form.support_staff_field_name,
         registrant_field_name: form.registrant_field_name,
         feedback_result_field_name: form.feedback_result_field_name,
         feedback_final_answer_field_name: form.feedback_final_answer_field_name,
@@ -757,6 +773,8 @@ export function SupportIssueAgentsWorkspace() {
         support_owner_rules: form.support_owner_rules
           .map((item) => ({
             module_value: item.module_value.trim(),
+            keywords: item.keywords.trim(),
+            owner_name: item.owner_name.trim(),
             yht_user_id: item.yht_user_id.trim()
           }))
           .filter((item) => item.module_value !== "" && item.yht_user_id !== ""),
@@ -1291,6 +1309,37 @@ export function SupportIssueAgentsWorkspace() {
             </div>
 
             <label className="grid gap-1 text-sm">
+              <span className="text-slate-400">检索模式</span>
+              <div className="flex gap-2">
+                <button
+                  className={
+                    "rounded-xl border px-3 py-2 text-sm transition " +
+                    (form.retrieval_mode === "retrieval"
+                      ? "border-cyan-400/40 bg-cyan-400/10 text-cyan-200"
+                      : "border-slate-700 text-slate-400 hover:border-slate-600")
+                  }
+                  onClick={() => setForm((current) => ({ ...current, retrieval_mode: "retrieval" }))}
+                >
+                  检索模式
+                </button>
+                <button
+                  className={
+                    "rounded-xl border px-3 py-2 text-sm transition " +
+                    (form.retrieval_mode === "rich"
+                      ? "border-amber-400/40 bg-amber-400/10 text-amber-200"
+                      : "border-slate-700 text-slate-400 hover:border-slate-600")
+                  }
+                  onClick={() => setForm((current) => ({ ...current, retrieval_mode: "rich" }))}
+                >
+                  丰富模式
+                </button>
+              </div>
+              <div className="text-xs leading-5 text-slate-500">
+                检索模式会直接采用检索工作台的总结结果；丰富模式会继续走分类、草稿和复核链路。
+              </div>
+            </label>
+
+            <label className="grid gap-1 text-sm">
               <span className="text-slate-400">知识范围</span>
               <select
                 className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
@@ -1487,6 +1536,17 @@ export function SupportIssueAgentsWorkspace() {
                 />
               </label>
               <label className="grid gap-1 text-sm">
+                <span className="text-slate-400">支持人员列</span>
+                <input
+                  list="support-agent-feishu-fields"
+                  className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                  value={form.support_staff_field_name}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, support_staff_field_name: event.target.value }))
+                  }
+                />
+              </label>
+              <label className="grid gap-1 text-sm">
                 <span className="text-slate-400">登记人列（邮箱/短账号）</span>
                 <input
                   list="support-agent-feishu-fields"
@@ -1529,7 +1589,7 @@ export function SupportIssueAgentsWorkspace() {
               <div>
                 <div className="text-sm font-medium text-slate-100">人工确认通知路由</div>
                 <div className="mt-1 text-xs text-slate-500">
-                  按“模块列”当前值匹配负责人 userId；未命中时走兜底负责人。登记人通知会优先读取“登记人列”，拿不到邮箱/短账号时再自动尝试表内域名/邮箱列。
+                  低置信度或无命中转人工时，会先用问题文案匹配这里的模块值和关键词，自动写回模块列并通知负责人；未命中时走兜底负责人。登记人通知会优先读取“登记人列”，拿不到邮箱/短账号时再自动尝试表内域名/邮箱列。
                 </div>
               </div>
               <button
@@ -1562,7 +1622,7 @@ export function SupportIssueAgentsWorkspace() {
             <div className="mt-4 space-y-3">
               {form.support_owner_rules.map((rule, index) => (
                 <div key={`owner-rule-${index}`} className="rounded-2xl border border-slate-800 bg-slate-900/80 p-4">
-                  <div className="grid gap-3 xl:grid-cols-[1fr_1fr_auto]">
+                  <div className="grid gap-3 xl:grid-cols-[1fr_1.2fr_1fr_1fr_auto]">
                     <label className="grid gap-1 text-sm">
                       <span className="text-slate-400">模块值</span>
                       <input
@@ -1577,6 +1637,38 @@ export function SupportIssueAgentsWorkspace() {
                           }))
                         }
                         placeholder="例如：工作台"
+                      />
+                    </label>
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-slate-400">匹配关键词</span>
+                      <input
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                        value={rule.keywords}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            support_owner_rules: current.support_owner_rules.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, keywords: event.target.value } : item
+                            )
+                          }))
+                        }
+                        placeholder="例如：工作台、浏览器关闭、openService"
+                      />
+                    </label>
+                    <label className="grid gap-1 text-sm">
+                      <span className="text-slate-400">负责人姓名</span>
+                      <input
+                        className="rounded-xl border border-slate-700 bg-slate-950 px-3 py-2"
+                        value={rule.owner_name}
+                        onChange={(event) =>
+                          setForm((current) => ({
+                            ...current,
+                            support_owner_rules: current.support_owner_rules.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, owner_name: event.target.value } : item
+                            )
+                          }))
+                        }
+                        placeholder="例如：王雅慧"
                       />
                     </label>
                     <label className="grid gap-1 text-sm">

@@ -90,6 +90,12 @@ class YonyouContactsSearchService:
         try:
             payload = json.loads(body)
         except json.JSONDecodeError as exc:
+            stripped_body = body.lstrip()
+            if stripped_body.startswith("<!DOCTYPE html") or stripped_body.startswith("<html"):
+                raise YonyouContactsSearchError(
+                    "联系人查询返回了 HTML 页面，通常表示联系人查询 Cookie 已过期或当前登录态失效。"
+                    "请到设置 -> 工作通知设置刷新联系人查询 Cookie。"
+                ) from exc
             raise YonyouContactsSearchError(f"联系人查询响应不是合法 JSON: {body[:300]}") from exc
         return payload if isinstance(payload, dict) else {"data": payload}
 

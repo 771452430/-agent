@@ -23,6 +23,8 @@ const NAV_ITEMS = [
   { href: "/retrieval", label: "检索模式", description: "知识树 + Scoped RAG" },
   { href: "/agents", label: "我的 Agent", description: "配置型 Agent" },
   { href: "/watchers", label: "巡检 Agent", description: "LangGraph 轮巡分配通知" },
+  { href: "/jira-duplicates", label: "Jira 工单 Agent", description: "重复工单审核 + 方案候选" },
+  { href: "/jira-solution-search", label: "Jira 方案检索 Agent", description: "粘贴问题描述 + 历史方案检索" },
   { href: "/support-agents", label: "支持问题 Agent", description: "飞书多维表格 + RAG 回写" }
 ];
 

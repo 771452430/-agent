@@ -81,6 +81,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "你需要结合工具结果和检索上下文，输出结构化且可验证的答案。"
     "如果当前处于本地学习模式，也要清楚说明答案依据来自哪一部分。"
 )
+SUPPORT_ISSUE_RESPONSE_STYLE_PROMPT = (
+    "输出要像给人看的成稿，而不是机器拼接的结果。"
+    "优先做到：先结论后步骤，结构清楚，语气自然，表达简洁但完整。"
+    "可以适当使用条目化，但不要机械堆关键词，也不要写成模板腔。"
+    "如果适合直接回写表格，就尽量整理成可直接使用的中文方案。"
+)
 
 # 一些第三方 OpenAI-compatible 网关并不是“稳定地返回同一种错误”，
 # 而是会出现：
@@ -665,7 +671,10 @@ class LLMService:
                     response_payload = self._request_json_post(url, headers=headers, payload=payload)
                     answer = self._extract_completion_text(provider, response_payload).strip()
                     if answer == "":
-                        answer = "模型已返回响应，但当前未能解析出文本内容。"
+                        attempt_errors.append(
+                            f"{attempt_label} {parse.urlparse(url).path}: 模型响应未包含可解析文本"
+                        )
+                        break
                     return FinalResponse(
                         answer=answer,
                         citations=citations,
@@ -696,7 +705,16 @@ class LLMService:
                         continue
                     attempt_errors.append(formatted)
                     break
-        raise RuntimeError("；".join(attempt_errors) or "协议级请求失败")
+        if attempt_errors:
+            if any("模型响应未包含可解析文本" not in item for item in attempt_errors):
+                raise RuntimeError("；".join(attempt_errors))
+            return FinalResponse(
+                answer="模型已返回响应，但当前未能解析出文本内容。",
+                citations=citations,
+                used_tools=list(tool_outputs.keys()),
+                next_actions=[],
+            )
+        raise RuntimeError("协议级请求失败")
 
     def _generate_provider_response_once(
         self,
@@ -1211,7 +1229,8 @@ class LLMService:
             model_config=model_config,
             system_prompt=system_prompt
             or "你是检索工作台助手。请只根据已筛选的证据卡片做总结，明确说明依据来自哪些文档。"
-               "如果证据不足，要直接说明限制，不要编造答案。",
+               "如果证据不足，要直接说明限制，不要编造答案。"
+               + SUPPORT_ISSUE_RESPONSE_STYLE_PROMPT,
         )
         return result.answer
 
@@ -1340,7 +1359,8 @@ class LLMService:
                     "system",
                     "你是支持问题 Row Graph 的草稿子 agent。"
                     "请根据检索总结整理成可直接回写到飞书表的中文答复。"
-                    "要求：保留步骤化结构，不要编造检索结果中没有的信息。",
+                    "要求：保留步骤化结构，不要编造检索结果中没有的信息。"
+                    + SUPPORT_ISSUE_RESPONSE_STYLE_PROMPT,
                 ),
                 (
                     "human",

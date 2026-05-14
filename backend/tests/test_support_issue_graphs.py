@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from app.graphs.support_issue_graph import (
+    COMPLETED_PROGRESS_VALUE,
     DONE_PROGRESS_VALUE,
     FEEDBACK_ACCEPTED,
     HUMAN_CONFIRMED_PROGRESS_VALUE,
@@ -34,9 +35,12 @@ from app.schemas import (
     SupportIssueDraftResult,
     SupportIssueFeedbackFact,
     SupportIssueFeedbackSnapshot,
+    SupportIssueNotificationEvent,
     SupportIssueOwnerRule,
     SupportIssueReviewResult,
+    UpdateSupportIssueCaseCandidateRequest,
 )
+from app.services.support_issue_service import SupportIssueService
 from app.services.support_issue_store import SupportIssueStore
 
 
@@ -315,13 +319,21 @@ class FakeRuntime:
             progress_field_name="回复进度",
             status_field_name="处理状态",
             module_field_name="负责模块",
+            support_staff_field_name="支持人员",
             registrant_field_name="登记人",
             feedback_result_field_name="人工处理结果",
             feedback_final_answer_field_name="人工最终方案",
             feedback_comment_field_name="反馈备注",
             confidence_field_name="AI置信度",
             hit_count_field_name="命中知识数",
-            support_owner_rules=[SupportIssueOwnerRule(module_value="工作台", yht_user_id="owner-1")],
+            support_owner_rules=[
+                SupportIssueOwnerRule(
+                    module_value="工作台",
+                    keywords="工作台、浏览器关闭",
+                    owner_name="王雅慧",
+                    yht_user_id="owner-1",
+                )
+            ],
             fallback_support_yht_user_id="fallback-owner",
             digest_enabled=True,
             digest_recipient_emails=["digest@example.com"],
@@ -331,6 +343,7 @@ class FakeRuntime:
         )
         self.rows: list[dict[str, Any]] = []
         self.rows_by_table: dict[str, list[dict[str, Any]]] = {}
+        self.list_all_agent_rows_call_count = 0
         self.table_contexts = [
             {
                 "table_id": "table-id",
@@ -340,7 +353,7 @@ class FakeRuntime:
         ]
         self.retrieval_mode = "success"
         self.retrieval_summary = "这是一个足够详细的处理方案，包含步骤与注意事项。"
-        self.judge_result = ("pass", 0.9, "答案匹配度和证据充分性通过。")
+        self.judge_result: tuple[str, float, str] | None = ("pass", 0.9, "答案匹配度和证据充分性通过。")
         self.review_result_override: tuple[str, float, str] | None = None
         self.draft_solution_override: str | None = None
         self.write_failures_remaining = 0
@@ -348,7 +361,9 @@ class FakeRuntime:
         self.updated_rows: dict[str, list[dict[str, Any]]] = {}
         self.progress_only_updates: list[tuple[str, str]] = []
         self.owner_notifications: list[str] = []
+        self.registrant_ai_notifications: list[str] = []
         self.registrant_notifications: list[str] = []
+        self.closed_human_confirmed_records: set[str] = set()
         self.deleted_documents: list[str] = []
         self.sent_emails: list[dict[str, Any]] = []
         self.last_retrieval_context: dict[str, Any] | None = None
@@ -374,6 +389,7 @@ class FakeRuntime:
             "link": FeishuBitableFieldInfo(field_name=agent.link_field_name),
             "progress": FeishuBitableFieldInfo(field_name=agent.progress_field_name),
             "module": FeishuBitableFieldInfo(field_name=agent.module_field_name),
+            "support_staff": FeishuBitableFieldInfo(field_name=agent.support_staff_field_name),
             "registrant": FeishuBitableFieldInfo(field_name=agent.registrant_field_name),
             "feedback_result": FeishuBitableFieldInfo(field_name=agent.feedback_result_field_name),
             "feedback_final_answer": FeishuBitableFieldInfo(field_name=agent.feedback_final_answer_field_name),
@@ -410,6 +426,7 @@ class FakeRuntime:
         return str(row.get("__agentdemo_bitable_url") or agent.feishu_bitable_url).strip()
 
     def _list_all_agent_rows(self, agent: SupportIssueAgentConfig) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+        self.list_all_agent_rows_call_count += 1
         rows: list[dict[str, Any]] = []
         for table in self.table_contexts:
             table_rows = self.rows_by_table.get(table["table_id"], self.rows if table["table_id"] == agent.feishu_table_id else [])
@@ -461,6 +478,79 @@ class FakeRuntime:
     def _build_similar_case_context(self, similar_cases: list[dict[str, str]]) -> str:
         return ""
 
+    def _approved_case_confidence_boost(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        retrieval_hit_count: int,
+    ) -> tuple[float, str]:
+        if retrieval_hit_count <= 0:
+            return 0.0, ""
+        normalized_question = " ".join(question.strip().lower().split())
+        for case in self.support_issue_store.list_approved_case_candidates(agent.id):
+            case_question = self._stringify_field_value(case.question)
+            case_solution = self._stringify_field_value(case.final_solution)
+            if case_question == "" or case_solution == "":
+                continue
+            if " ".join(case_question.strip().lower().split()) == normalized_question:
+                return 0.24, f"命中已审核同题案例：{case_question}"
+        return 0.0, ""
+
+    def _find_exact_approved_case(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+    ) -> SupportIssueCaseCandidate | None:
+        normalized_question = " ".join(question.strip().lower().split())
+        if normalized_question == "":
+            return None
+        for case in self.support_issue_store.list_approved_case_candidates(agent.id):
+            case_question = self._stringify_field_value(case.question)
+            case_solution = self._stringify_field_value(case.final_solution)
+            if case_question == "" or case_solution == "":
+                continue
+            if " ".join(case_question.strip().lower().split()) == normalized_question:
+                return case
+        return None
+
+    def _resolve_manual_review_module_value(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        module_value: str,
+    ) -> str:
+        normalized_module = module_value.strip()
+        for rule in agent.support_owner_rules:
+            if normalized_module != "" and rule.module_value.strip() == normalized_module:
+                return rule.module_value.strip()
+        for rule in agent.support_owner_rules:
+            keywords = [rule.module_value.strip()]
+            keywords.extend(item.strip() for item in rule.keywords.replace("，", "、").split("、"))
+            if any(keyword and keyword in question for keyword in keywords):
+                return rule.module_value.strip()
+        return normalized_module
+
+    def _resolve_manual_review_route(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        question: str,
+        module_value: str,
+    ) -> tuple[str, str]:
+        normalized_module = module_value.strip()
+        for rule in agent.support_owner_rules:
+            if normalized_module != "" and rule.module_value.strip() == normalized_module:
+                return rule.module_value.strip(), rule.owner_name.strip()
+        for rule in agent.support_owner_rules:
+            keywords = [rule.module_value.strip()]
+            keywords.extend(item.strip() for item in rule.keywords.replace("，", "、").split("、"))
+            if any(keyword and keyword in question for keyword in keywords):
+                return rule.module_value.strip(), rule.owner_name.strip()
+        return normalized_module, ""
+
     def _update_row_fields(
         self,
         agent: SupportIssueAgentConfig,
@@ -506,6 +596,13 @@ class FakeRuntime:
         return "" if len(retrieval_result.citations) == 0 else "https://doc.example.com/1"
 
     def _judge_solution(self, *, question: str, summary: str, retrieval_hit_count: int) -> tuple[str, float, str]:
+        if self.judge_result is None:
+            return SupportIssueService._judge_solution(
+                self,
+                question=question,
+                summary=summary,
+                retrieval_hit_count=retrieval_hit_count,
+            )
         return self.judge_result
 
     def _notify_support_owner_for_manual_review(
@@ -592,8 +689,59 @@ class FakeRuntime:
         progress_changed_at: datetime,
         source_bitable_url: str,
         source_table_name: str,
-    ) -> None:
+    ) -> bool:
         self.registrant_notifications.append(record_id)
+        return True
+
+    def _notify_registrants_for_ai_completed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        progress_changed_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> None:
+        self.registrant_ai_notifications.append(record_id)
+
+    def _backfill_registrant_ai_completed_notification_if_needed(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> None:
+        if fact.progress_value == DONE_PROGRESS_VALUE:
+            self.registrant_ai_notifications.append(record_id)
+
+    def _close_human_confirmed_record_after_notification(
+        self,
+        *,
+        agent: SupportIssueAgentConfig,
+        record_id: str,
+        fields: dict[str, Any],
+        resolved_fields: dict[str, FeishuBitableFieldInfo],
+        fact: SupportIssueFeedbackFact,
+        synced_at: datetime,
+        source_bitable_url: str,
+        source_table_name: str,
+    ) -> bool:
+        if fact.progress_value != HUMAN_CONFIRMED_PROGRESS_VALUE:
+            return False
+        if record_id in self.closed_human_confirmed_records:
+            return False
+        self.closed_human_confirmed_records.add(record_id)
+        self.registrant_notifications.append(record_id)
+        self.progress_only_updates.append((record_id, COMPLETED_PROGRESS_VALUE))
+        return True
 
     def _feedback_fact_to_candidate(self, fact: SupportIssueFeedbackFact) -> SupportIssueCaseCandidate:
         return SupportIssueCaseCandidate(
@@ -676,13 +824,21 @@ class SupportIssueGraphTests(unittest.TestCase):
     def _scoped_record_id(self, record_id: str, table_id: str = "table-id") -> str:
         return f"{table_id}::{record_id}"
 
-    def _build_row(self, *, record_id: str = "rec-1", question: str = "如何处理登录失败？", progress: str = "待分析") -> dict[str, Any]:
+    def _build_row(
+        self,
+        *,
+        record_id: str = "rec-1",
+        question: str = "如何处理登录失败？",
+        progress: str = "待分析",
+        module: str = "工作台",
+    ) -> dict[str, Any]:
         return {
             "record_id": record_id,
             "fields": {
                 "问题": question,
                 "回复进度": progress,
-                "负责模块": "工作台",
+                "负责模块": module,
+                "支持人员": "",
                 "登记人": "wangyahui@yonyou.com",
                 "人工处理结果": "",
                 "人工最终方案": "",
@@ -722,6 +878,75 @@ class SupportIssueGraphTests(unittest.TestCase):
         self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["AI解决方案"], NO_HIT_MESSAGE)
         self.assertTrue(any(item.node == "evidence_agent" for item in row_result.graph_trace))
 
+    def test_row_graph_no_hit_uses_exact_approved_case_candidate(self) -> None:
+        approved_at = _utc_now()
+        self.runtime.retrieval_mode = "no_hit"
+        self.runtime.support_issue_store.case_candidates["case-1"] = SupportIssueCaseCandidate(
+            id="case-1",
+            agent_id=self.runtime.agent.id,
+            record_id=self._scoped_record_id("rec-case"),
+            status="approved",
+            question="我的裤子不见了",
+            ai_draft=NO_HIT_MESSAGE,
+            feedback_result=FEEDBACK_ACCEPTED,
+            final_solution="不支持找衣服",
+            feedback_comment="",
+            confidence_score=0.0,
+            retrieval_hit_count=0,
+            question_category="FAQ",
+            related_links=[],
+            source_bitable_url=self.runtime.agent.feishu_bitable_url,
+            review_comment="审核通过",
+            knowledge_document_id="doc-case",
+            approved_at=approved_at,
+            approved_by="平台管理员",
+            created_at=approved_at,
+            updated_at=approved_at,
+        )
+        row_result = self._invoke_row_graph(self._build_row(question="我的裤子不见了"))
+        latest_update = self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]
+        self.assertEqual(row_result.status, "generated")
+        self.assertEqual(row_result.solution, "不支持找衣服")
+        self.assertEqual(latest_update["AI解决方案"], "不支持找衣服")
+        self.assertEqual(latest_update["回复进度"], DONE_PROGRESS_VALUE)
+        self.assertEqual(self.runtime.owner_notifications, [])
+        self.assertTrue("已审核同题案例" in row_result.judge_reason)
+
+    def test_row_graph_retrieval_mode_no_hit_uses_exact_approved_case_candidate(self) -> None:
+        approved_at = _utc_now()
+        self.runtime.agent = self.runtime.agent.model_copy(update={"retrieval_mode": "retrieval"})
+        self.runtime.retrieval_mode = "no_hit"
+        self.runtime.support_issue_store.case_candidates["case-1"] = SupportIssueCaseCandidate(
+            id="case-1",
+            agent_id=self.runtime.agent.id,
+            record_id=self._scoped_record_id("rec-case"),
+            status="approved",
+            question="我的裤子不见了",
+            ai_draft=NO_HIT_MESSAGE,
+            feedback_result=FEEDBACK_ACCEPTED,
+            final_solution="不支持找衣服",
+            feedback_comment="",
+            confidence_score=0.0,
+            retrieval_hit_count=0,
+            question_category="FAQ",
+            related_links=[],
+            source_bitable_url=self.runtime.agent.feishu_bitable_url,
+            review_comment="审核通过",
+            knowledge_document_id="doc-case",
+            approved_at=approved_at,
+            approved_by="平台管理员",
+            created_at=approved_at,
+            updated_at=approved_at,
+        )
+        row_result = self._invoke_row_graph(self._build_row(question="我的裤子不见了"))
+        latest_update = self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]
+        self.assertEqual(row_result.status, "generated")
+        self.assertEqual(row_result.solution, "不支持找衣服")
+        self.assertEqual(latest_update["AI解决方案"], "不支持找衣服")
+        self.assertEqual(latest_update["回复进度"], DONE_PROGRESS_VALUE)
+        self.assertEqual(self.runtime.owner_notifications, [])
+        self.assertTrue(any(item.node == "retrieval_agent" for item in row_result.graph_trace))
+
     def test_row_graph_low_confidence_routes_manual_review(self) -> None:
         self.runtime.judge_result = ("manual_review", 0.4, "答案证据不足。")
         row_result = self._invoke_row_graph(self._build_row())
@@ -729,14 +954,154 @@ class SupportIssueGraphTests(unittest.TestCase):
         self.assertIn(self._scoped_record_id("rec-1"), self.runtime.owner_notifications)
         self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["回复进度"], MANUAL_REVIEW_PROGRESS_VALUE)
 
+    def test_row_graph_manual_review_routes_module_by_keywords(self) -> None:
+        self.runtime.judge_result = ("manual_review", 0.4, "答案证据不足。")
+        row = self._build_row(question="工作台关闭浏览器后打不开", module="")
+        row_result = self._invoke_row_graph(row)
+        latest_update = self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]
+        self.assertEqual(row_result.status, "manual_review")
+        self.assertEqual(latest_update["负责模块"], "工作台")
+        self.assertEqual(latest_update["支持人员"], "王雅慧")
+        self.assertIn(self._scoped_record_id("rec-1"), self.runtime.owner_notifications)
+
+    def test_judge_solution_routes_irrelevant_evidence_to_manual_review(self) -> None:
+        status, confidence, reason = SupportIssueService._judge_solution(
+            self.runtime,
+            question="我在A1丢了一个黄色衣服找不到了",
+            summary=(
+                "结论：当前知识库未检索到与失物招领/区域 A1/黄色衣服查找相关的处理指引。"
+                "现有命中内容均为流程、工作流、角色管理类技术问题，与本问题无关，不能据此编造处理办法。"
+            ),
+            retrieval_hit_count=6,
+        )
+
+        self.assertEqual(status, "manual_review")
+        self.assertLess(confidence, 0.65)
+        self.assertIn("不相关", reason)
+
+    def test_judge_solution_routes_mismatched_knowledge_to_manual_review(self) -> None:
+        status, confidence, reason = SupportIssueService._judge_solution(
+            self.runtime,
+            question="我在A1丢了一个黄色衣服找不到了",
+            summary=(
+                "结论：当前问题“我在A1丢了一个黄色衣服找不到了”与检索到的知识库内容不匹配，"
+                "现有知识片段均为“流程/工作台/角色管理/找不到流程定义”等系统问题处理文档，"
+                "无法据此给出关于“失物查找”的有效解决方案。不能基于现有知识库编造处理办法。"
+            ),
+            retrieval_hit_count=6,
+        )
+
+        self.assertEqual(status, "manual_review")
+        self.assertLess(confidence, 0.65)
+        self.assertIn("不相关", reason)
+
+    def test_judge_solution_routes_formal_irrelevant_summary_to_manual_review(self) -> None:
+        status, confidence, reason = SupportIssueService._judge_solution(
+            self.runtime,
+            question="我在A1丢了一个黄色衣服找不到了",
+            summary=(
+                "结论：当前无法依据现有知识库给出“A1丢失黄色衣服”的有效处理方案。"
+                "原因是检索命中的内容均为流程/工作台系统问题排查，与失物招领/现场物品遗失无关，"
+                "缺少可支撑的知识依据，不能据此编造处理办法。"
+            ),
+            retrieval_hit_count=6,
+        )
+
+        self.assertEqual(status, "manual_review")
+        self.assertLess(confidence, 0.65)
+        self.assertIn("不相关", reason)
+
+    def test_judge_solution_keeps_relevant_support_answer_pass(self) -> None:
+        status, confidence, _reason = SupportIssueService._judge_solution(
+            self.runtime,
+            question="获取工作台上下文信息",
+            summary=(
+                "获取工作台上下文信息：可以调用 jDiwork.asyncDiworkContext()。"
+                "该接口会返回当前工作台上下文信息，调用后需要在回调中读取用户、租户、语种等字段，"
+                "并结合业务场景判断是否需要做空值兜底。"
+            ),
+            retrieval_hit_count=3,
+        )
+
+        self.assertEqual(status, "pass")
+        self.assertGreaterEqual(confidence, 0.65)
+
+    def test_row_graph_retrieval_mode_irrelevant_hits_routes_manual_review(self) -> None:
+        self.runtime.agent = self.runtime.agent.model_copy(update={"retrieval_mode": "retrieval"})
+        self.runtime.judge_result = None
+        self.runtime.retrieval_summary = (
+            "结论：当前问题“我在A1丢了一个黄色衣服找不到了”与检索到的知识库内容不匹配，"
+            "现有知识片段均为“流程/工作台/角色管理/找不到流程定义”等系统问题处理文档，"
+            "无法据此给出关于“失物查找”的有效解决方案。不能基于现有知识库编造处理办法。"
+        )
+
+        row_result = self._invoke_row_graph(
+            self._build_row(question="我在A1丢了一个黄色衣服找不到了", module="")
+        )
+        latest_update = self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]
+
+        self.assertEqual(row_result.status, "manual_review")
+        self.assertEqual(row_result.judge_status, "manual_review")
+        self.assertEqual(row_result.confidence_score, 0.45)
+        self.assertEqual(latest_update["回复进度"], MANUAL_REVIEW_PROGRESS_VALUE)
+        self.assertEqual(latest_update["AI解决方案"], self.runtime.retrieval_summary)
+        self.assertIn(self._scoped_record_id("rec-1"), self.runtime.owner_notifications)
+
+    def test_row_graph_exact_approved_case_boosts_confidence(self) -> None:
+        approved_at = _utc_now()
+        self.runtime.support_issue_store.case_candidates["case-1"] = SupportIssueCaseCandidate(
+            id="case-1",
+            agent_id=self.runtime.agent.id,
+            record_id=self._scoped_record_id("rec-1"),
+            status="approved",
+            question="工作台更新打开服务的标题",
+            ai_draft="原始草稿",
+            feedback_result=FEEDBACK_ACCEPTED,
+            final_solution="已审核通过的人工最终方案",
+            feedback_comment="",
+            confidence_score=0.92,
+            retrieval_hit_count=2,
+            question_category="FAQ",
+            related_links=["https://example.com/doc"],
+            source_bitable_url=self.runtime.agent.feishu_bitable_url,
+            review_comment="审核通过",
+            knowledge_document_id="doc-1",
+            approved_at=approved_at,
+            approved_by="平台管理员",
+            created_at=approved_at,
+            updated_at=approved_at,
+        )
+        self.runtime.review_result_override = ("manual_review", 0.6, "答案证据和匹配度一般。")
+        row_result = self._invoke_row_graph(self._build_row(question="工作台更新打开服务的标题"))
+        self.assertEqual(row_result.status, "generated")
+        self.assertGreaterEqual(row_result.confidence_score, 0.8)
+        self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["回复进度"], DONE_PROGRESS_VALUE)
+        self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["支持人员"], "王雅慧")
+        self.assertTrue("已审核同题案例" in row_result.judge_reason)
+
     def test_row_graph_success_generates_solution(self) -> None:
         row_result = self._invoke_row_graph(self._build_row())
         self.assertEqual(row_result.status, "generated")
         self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["回复进度"], DONE_PROGRESS_VALUE)
+        self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["支持人员"], "王雅慧")
         self.assertEqual(self.runtime.owner_notifications, [])
         self.assertTrue(any(item.node == "classifier_agent" for item in row_result.graph_trace))
         self.assertTrue(any(item.node == "draft_agent" for item in row_result.graph_trace))
         self.assertTrue(any(item.node == "review_agent" for item in row_result.graph_trace))
+
+    def test_row_graph_retrieval_mode_uses_direct_retrieval(self) -> None:
+        self.runtime.agent = self.runtime.agent.model_copy(update={"retrieval_mode": "retrieval"})
+        row_result = self._invoke_row_graph(self._build_row())
+        self.assertEqual(row_result.status, "generated")
+        self.assertEqual(self.runtime.updated_rows[self._scoped_record_id("rec-1")][-1]["支持人员"], "王雅慧")
+        self.assertTrue(any(item.node == "retrieval_agent" for item in row_result.graph_trace))
+        self.assertFalse(any(item.node == "classifier_agent" for item in row_result.graph_trace))
+        self.assertFalse(any(item.node == "draft_agent" for item in row_result.graph_trace))
+        self.assertFalse(any(item.node == "review_agent" for item in row_result.graph_trace))
+        self.assertIsNotNone(self.runtime.last_retrieval_context)
+        assert self.runtime.last_retrieval_context is not None
+        self.assertIsNone(self.runtime.last_retrieval_context["system_prompt"])
+        self.assertEqual(self.runtime.last_retrieval_context["retrieval_profile"], "support_issue")
 
     def test_row_graph_writeback_failure_turns_failed(self) -> None:
         self.runtime.write_failures_remaining = 1
@@ -794,6 +1159,7 @@ class SupportIssueGraphTests(unittest.TestCase):
         response = final_state["response"]
         self.assertEqual(response.fact_upsert_count, 1)
         self.assertEqual(self.runtime.registrant_notifications, [self._scoped_record_id("rec-1")])
+        self.assertIn((self._scoped_record_id("rec-1"), COMPLETED_PROGRESS_VALUE), self.runtime.progress_only_updates)
 
         self.runtime.registrant_notifications.clear()
         self.runtime.support_issue_store.feedback_facts[self._scoped_record_id("rec-1")] = self.runtime.support_issue_store.feedback_facts[self._scoped_record_id("rec-1")].model_copy(
@@ -809,8 +1175,62 @@ class SupportIssueGraphTests(unittest.TestCase):
         )
         self.assertEqual(self.runtime.registrant_notifications, [])
 
+    def test_feedback_graph_ai_completed_notifies_registrant(self) -> None:
+        synced_at = _utc_now() - timedelta(minutes=10)
+        previous_fact = SupportIssueFeedbackFact(
+            id="fact-rec-2",
+            agent_id=self.runtime.agent.id,
+            record_id=self._scoped_record_id("rec-2"),
+            question="问题2",
+            progress_value=PROCESSING_PROGRESS_VALUE,
+            ai_solution="旧答案",
+            related_links=[],
+            feedback_result="",
+            feedback_final_answer="",
+            feedback_comment="",
+            confidence_score=0.2,
+            retrieval_hit_count=0,
+            question_category="FAQ",
+            source_bitable_url=self.runtime.agent.feishu_bitable_url,
+            created_at=synced_at,
+            updated_at=synced_at,
+            last_synced_at=synced_at,
+        )
+        self.runtime.support_issue_store.feedback_facts[self._scoped_record_id("rec-2")] = previous_fact
+        self.runtime.rows = [
+            {
+                "record_id": "rec-2",
+                "fields": {
+                    "问题": "问题2",
+                    "回复进度": DONE_PROGRESS_VALUE,
+                    "负责模块": "工作台",
+                    "登记人": "wangyahui@yonyou.com",
+                    "人工处理结果": "",
+                    "人工最终方案": "",
+                    "反馈备注": "",
+                    "AI置信度": 0.8,
+                    "命中知识数": 1,
+                    "AI解决方案": "AI 方案",
+                },
+            }
+        ]
+        self.feedback_graph.graph.invoke(
+            {
+                "agent_id": self.runtime.agent.id,
+                "agent": self.runtime.agent,
+                "synced_at": _utc_now(),
+                "graph_trace": [],
+            }
+        )
+        self.assertEqual(self.runtime.registrant_ai_notifications, [self._scoped_record_id("rec-2")])
+
     def test_run_graph_no_pending_still_triggers_feedback_graph(self) -> None:
-        self.runtime.rows = [self._build_row(progress="AI分析完成")]
+        self.runtime.rows = [
+            self._build_row(
+                question="人工已确认的问题",
+                progress=HUMAN_CONFIRMED_PROGRESS_VALUE,
+            )
+        ]
         final_state = self.run_graph.graph.invoke(
             {
                 "agent_id": self.runtime.agent.id,
@@ -825,6 +1245,9 @@ class SupportIssueGraphTests(unittest.TestCase):
         self.assertEqual(run.status, "no_change")
         self.assertTrue(any(item.node == "trigger_feedback_graph" for item in run.graph_trace))
         self.assertEqual(len(self.runtime.support_issue_store.runs), 1)
+        self.assertEqual(self.runtime.list_all_agent_rows_call_count, 1)
+        self.assertEqual(self.runtime.registrant_notifications, [self._scoped_record_id("rec-1")])
+        self.assertIn((self._scoped_record_id("rec-1"), COMPLETED_PROGRESS_VALUE), self.runtime.progress_only_updates)
 
     def test_run_graph_processes_rows_from_all_tables(self) -> None:
         self.runtime.table_contexts = [
@@ -859,6 +1282,13 @@ class SupportIssueGraphTests(unittest.TestCase):
         self.assertEqual({item.source_table_name for item in run.row_results}, {"开通", "计量"})
         self.assertIn(self._scoped_record_id("rec-1", "table-id"), self.runtime.updated_rows)
         self.assertIn(self._scoped_record_id("rec-2", "table-2"), self.runtime.updated_rows)
+        self.assertEqual(
+            set(self.runtime.registrant_ai_notifications),
+            {
+                self._scoped_record_id("rec-1", "table-id"),
+                self._scoped_record_id("rec-2", "table-2"),
+            },
+        )
 
     def test_digest_graph_manual_and_scheduled_subjects(self) -> None:
         now = _utc_now()
@@ -934,8 +1364,205 @@ class SupportIssueStoreMigrationTests(unittest.TestCase):
                 digest_columns = {
                     row[1] for row in conn.execute("PRAGMA table_info(support_issue_digest_runs)").fetchall()
                 }
+                agent_columns = {row[1] for row in conn.execute("PRAGMA table_info(support_issue_agents)").fetchall()}
             self.assertIn("graph_trace_json", run_columns)
             self.assertIn("graph_trace_json", digest_columns)
+            self.assertIn("retrieval_mode", agent_columns)
+
+
+class SupportIssueStoreRetrievalModeTests(unittest.TestCase):
+    """验证支持问题 Agent 的检索模式能够正确落库和更新。"""
+
+    def test_store_persists_retrieval_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sqlite_path = Path(temp_dir) / "support_issue.sqlite"
+            store = SupportIssueStore(sqlite_path)
+            created = store.create_agent(
+                name="Mode Agent",
+                description="",
+                enabled=True,
+                poll_interval_minutes=30,
+                feishu_bitable_url="https://example.com/base/app-token?table=table-id",
+                feishu_app_token="app-token",
+                feishu_table_id="table-id",
+                model_config=ModelConfig(mode="learning", provider="mock", model="mock-model"),
+                knowledge_scope_type="global",
+                knowledge_scope_id=None,
+                retrieval_mode="retrieval",
+                question_field_name="问题",
+                answer_field_name="AI解决方案",
+                link_field_name="相关文档链接",
+                progress_field_name="回复进度",
+                status_field_name="处理状态",
+                module_field_name="负责模块",
+                support_staff_field_name="支持人员",
+                registrant_field_name="登记人",
+                feedback_result_field_name="人工处理结果",
+                feedback_final_answer_field_name="人工最终方案",
+                feedback_comment_field_name="反馈备注",
+                confidence_field_name="AI置信度",
+                hit_count_field_name="命中知识数",
+                support_owner_rules=[],
+                fallback_support_yht_user_id="",
+                digest_enabled=False,
+                digest_recipient_emails=[],
+                case_review_enabled=True,
+            )
+            updated = store.update_agent(created.id, retrieval_mode="rich")
+
+        self.assertEqual(created.retrieval_mode, "retrieval")
+        assert updated is not None
+        self.assertEqual(updated.retrieval_mode, "rich")
+
+
+class SupportIssueNotificationEventStoreTests(unittest.TestCase):
+    """验证通知事件查询能够按最新发送时间判断去重。"""
+
+    def test_latest_notification_event_for_recipient_returns_latest_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sqlite_path = Path(temp_dir) / "support_issue.sqlite"
+            store = SupportIssueStore(sqlite_path)
+            older = _utc_now() - timedelta(minutes=10)
+            newer = _utc_now()
+            store.record_notification_event(
+                SupportIssueNotificationEvent(
+                    id="event-old",
+                    agent_id="agent-1",
+                    record_id="record-1",
+                    event_type="registrant_ai_completed",
+                    recipient_user_id="user-1",
+                    status="sent",
+                    error_message=None,
+                    created_at=older,
+                )
+            )
+            store.record_notification_event(
+                SupportIssueNotificationEvent(
+                    id="event-new",
+                    agent_id="agent-1",
+                    record_id="record-1",
+                    event_type="registrant_ai_completed",
+                    recipient_user_id="user-1",
+                    status="sent",
+                    error_message=None,
+                    created_at=newer,
+                )
+            )
+
+            latest = store.latest_notification_event_for_recipient(
+                agent_id="agent-1",
+                record_id="record-1",
+                event_type="registrant_ai_completed",
+                recipient_user_id="user-1",
+                statuses=("sent",),
+            )
+
+        assert latest is not None
+        self.assertEqual(latest.id, "event-new")
+
+
+class SupportIssueCaseCandidateReviewTests(unittest.TestCase):
+    """验证案例候选撤回后会退出正式知识库和 RAG 召回。"""
+
+    def test_withdraw_approved_candidate_resets_status_and_deletes_document(self) -> None:
+        class FakeKnowledgeStore:
+            def __init__(self) -> None:
+                self.deleted_document_ids: list[str] = []
+
+            def delete_document(self, document_id: str) -> object:
+                self.deleted_document_ids.append(document_id)
+                return object()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sqlite_path = Path(temp_dir) / "support_issue.sqlite"
+            store = SupportIssueStore(sqlite_path)
+            agent = store.create_agent(
+                name="Withdraw Agent",
+                description="",
+                enabled=True,
+                poll_interval_minutes=30,
+                feishu_bitable_url="https://example.com/base/app-token?table=table-id",
+                feishu_app_token="app-token",
+                feishu_table_id="table-id",
+                model_config=ModelConfig(mode="learning", provider="mock", model="mock-model"),
+                knowledge_scope_type="global",
+                knowledge_scope_id=None,
+                retrieval_mode="retrieval",
+                question_field_name="问题",
+                answer_field_name="AI解决方案",
+                link_field_name="相关文档链接",
+                progress_field_name="回复进度",
+                status_field_name="处理状态",
+                module_field_name="负责模块",
+                support_staff_field_name="支持人员",
+                registrant_field_name="登记人",
+                feedback_result_field_name="人工处理结果",
+                feedback_final_answer_field_name="人工最终方案",
+                feedback_comment_field_name="反馈备注",
+                confidence_field_name="AI置信度",
+                hit_count_field_name="命中知识数",
+                support_owner_rules=[],
+                fallback_support_yht_user_id="",
+                digest_enabled=False,
+                digest_recipient_emails=[],
+                case_review_enabled=True,
+            )
+            now = _utc_now()
+            candidate = store.upsert_case_candidate(
+                SupportIssueCaseCandidate(
+                    id="candidate-1",
+                    agent_id=agent.id,
+                    record_id="table-id::record-1",
+                    status="pending_review",
+                    question="我的裤子不见了",
+                    ai_draft=NO_HIT_MESSAGE,
+                    feedback_result=FEEDBACK_ACCEPTED,
+                    final_solution="不支持找衣服",
+                    feedback_comment="",
+                    confidence_score=0.0,
+                    retrieval_hit_count=0,
+                    question_category="FAQ",
+                    related_links=[],
+                    source_bitable_url=agent.feishu_bitable_url,
+                    review_comment="",
+                    knowledge_document_id=None,
+                    approved_at=None,
+                    approved_by=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                reset_to_pending_review=False,
+            )
+            approved = store.update_case_candidate_review(
+                candidate_id=candidate.id,
+                status="approved",
+                review_comment="审核通过",
+                approved_by="平台管理员",
+                approved_at=now,
+                knowledge_document_id="doc-1",
+            )
+            assert approved is not None
+            knowledge_store = FakeKnowledgeStore()
+            service = object.__new__(SupportIssueService)
+            service.support_issue_store = store
+            service.knowledge_store = knowledge_store
+
+            withdrawn = service.review_case_candidate(
+                approved.id,
+                UpdateSupportIssueCaseCandidateRequest(
+                    action="withdraw",
+                    reviewer_name="平台管理员",
+                    review_comment="撤回重审",
+                ),
+            )
+
+            self.assertEqual(withdrawn.status, "pending_review")
+            self.assertIsNone(withdrawn.knowledge_document_id)
+            self.assertIsNone(withdrawn.approved_at)
+            self.assertIsNone(withdrawn.approved_by)
+            self.assertEqual(withdrawn.review_comment, "撤回重审")
+            self.assertEqual(knowledge_store.deleted_document_ids, ["doc-1"])
+            self.assertEqual(store.list_approved_case_candidates(agent.id), [])
 
 
 if __name__ == "__main__":

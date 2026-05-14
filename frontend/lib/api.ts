@@ -16,6 +16,13 @@ import type {
   FeishuSettings,
   GitLabImportSettings,
   GitLabTreeImportResponse,
+  JiraDuplicateAgentConfig,
+  JiraDuplicateCandidate,
+  JiraDuplicateFetchTestResponse,
+  JiraDuplicateIssueResult,
+  JiraDuplicateRun,
+  JiraSolutionDraftReplyResponse,
+  JiraSolutionSearchResponse,
   KnowledgeDeleteResponse,
   KnowledgeDocument,
   KnowledgeTreeNode,
@@ -36,6 +43,7 @@ import type {
   SupportIssueFeedbackSyncResponse,
   SupportIssueInsights,
   SupportIssueOwnerRule,
+  SupportIssueRetrievalMode,
   SupportIssueRun,
   SseEvent,
   ThreadState,
@@ -651,6 +659,150 @@ export async function listWatcherRuns(watcherId: string): Promise<WatcherRun[]> 
 }
 
 // -----------------------------
+// Jira 重复工单审核 Agent
+// -----------------------------
+export async function listJiraDuplicateAgents(): Promise<JiraDuplicateAgentConfig[]> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents", { cache: "no-store" });
+  return parseJson<JiraDuplicateAgentConfig[]>(response);
+}
+
+export async function getJiraDuplicateAgent(agentId: string): Promise<JiraDuplicateAgentConfig> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId, { cache: "no-store" });
+  return parseJson<JiraDuplicateAgentConfig>(response);
+}
+
+export async function createJiraDuplicateAgent(input: {
+  name: string;
+  description: string;
+  source_db_path: string;
+  dashboard_url: string;
+  request_method: "GET" | "POST";
+  request_headers: Record<string, string>;
+  request_body_json?: Record<string, unknown> | null;
+  request_body_text?: string | null;
+  detail_url_template?: string | null;
+  detail_request_method: "GET" | "POST";
+  detail_request_headers: Record<string, string>;
+  detail_request_body_text?: string | null;
+  poll_interval_minutes: number;
+  high_similarity_threshold: number;
+  medium_similarity_threshold: number;
+  model_review_enabled: boolean;
+  model_config: ModelConfig;
+  enabled: boolean;
+}): Promise<JiraDuplicateAgentConfig> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<JiraDuplicateAgentConfig>(response);
+}
+
+export async function updateJiraDuplicateAgent(
+  agentId: string,
+  input: Partial<{
+    name: string;
+    description: string;
+    source_db_path: string;
+    dashboard_url: string;
+    request_method: "GET" | "POST";
+    request_headers: Record<string, string>;
+    request_body_json?: Record<string, unknown> | null;
+    request_body_text?: string | null;
+    detail_url_template?: string | null;
+    detail_request_method: "GET" | "POST";
+    detail_request_headers: Record<string, string>;
+    detail_request_body_text?: string | null;
+    poll_interval_minutes: number;
+    high_similarity_threshold: number;
+    medium_similarity_threshold: number;
+    model_review_enabled: boolean;
+    model_config: ModelConfig;
+    enabled: boolean;
+  }>
+): Promise<JiraDuplicateAgentConfig> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<JiraDuplicateAgentConfig>(response);
+}
+
+export async function testJiraDuplicateFetch(agentId: string): Promise<JiraDuplicateFetchTestResponse> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId + "/test-fetch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  return parseJson<JiraDuplicateFetchTestResponse>(response);
+}
+
+export async function runJiraDuplicateAgent(agentId: string): Promise<JiraDuplicateRun> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId + "/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  return parseJson<JiraDuplicateRun>(response);
+}
+
+export async function listJiraDuplicateRuns(agentId: string): Promise<JiraDuplicateRun[]> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId + "/runs", { cache: "no-store" });
+  return parseJson<JiraDuplicateRun[]>(response);
+}
+
+export async function reindexJiraDuplicateAgent(agentId: string): Promise<{
+  agent_id: string;
+  indexed_count: number;
+  embedding_backend: string;
+}> {
+  const response = await fetch(API_BASE + "/api/jira-duplicate-agents/" + agentId + "/reindex", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  return parseJson<{ agent_id: string; indexed_count: number; embedding_backend: string }>(response);
+}
+
+export async function searchJiraSolution(input: {
+  description: string;
+  issue_key?: string;
+  title?: string;
+  source_db_path: string;
+  domain?: string;
+  module?: string;
+  category?: string;
+  status?: string;
+  high_similarity_threshold: number;
+  medium_similarity_threshold: number;
+  model_review_enabled: boolean;
+  model_config: ModelConfig;
+}): Promise<JiraSolutionSearchResponse> {
+  const response = await fetch(API_BASE + "/api/jira-solution-search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<JiraSolutionSearchResponse>(response);
+}
+
+export async function draftJiraSolutionReply(input: {
+  description: string;
+  result: JiraDuplicateIssueResult;
+  candidates: JiraDuplicateCandidate[];
+  model_config: ModelConfig;
+}): Promise<JiraSolutionDraftReplyResponse> {
+  const response = await fetch(API_BASE + "/api/jira-solution-search/draft-reply", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<JiraSolutionDraftReplyResponse>(response);
+}
+
+// -----------------------------
 // 支持问题 Agent
 // -----------------------------
 export async function listSupportAgents(): Promise<SupportIssueAgentConfig[]> {
@@ -672,12 +824,14 @@ export async function createSupportAgent(input: {
   model_config: ModelConfig;
   knowledge_scope_type: ScopeType;
   knowledge_scope_id?: string | null;
+  retrieval_mode: SupportIssueRetrievalMode;
   question_field_name: string;
   answer_field_name: string;
   link_field_name: string;
   progress_field_name: string;
   status_field_name: string;
   module_field_name: string;
+  support_staff_field_name: string;
   registrant_field_name: string;
   feedback_result_field_name: string;
   feedback_final_answer_field_name: string;
@@ -709,12 +863,14 @@ export async function updateSupportAgent(
     model_config: ModelConfig;
     knowledge_scope_type: ScopeType;
     knowledge_scope_id?: string | null;
+    retrieval_mode: SupportIssueRetrievalMode;
     question_field_name: string;
     answer_field_name: string;
     link_field_name: string;
     progress_field_name: string;
     status_field_name: string;
     module_field_name: string;
+    support_staff_field_name: string;
     registrant_field_name: string;
     feedback_result_field_name: string;
     feedback_final_answer_field_name: string;
@@ -792,7 +948,7 @@ export async function listSupportAgentCaseCandidates(
 export async function reviewSupportCaseCandidate(
   candidateId: string,
   input: {
-    action: "save_edit" | "approve_and_publish";
+    action: "save_edit" | "approve_and_publish" | "withdraw";
     reviewer_name: string;
     review_comment?: string;
     final_solution?: string;
