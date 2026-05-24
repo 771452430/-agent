@@ -146,6 +146,17 @@ npm run dev
 - 前端：[http://localhost:3000](http://localhost:3000)
 - 后端接口：[http://127.0.0.1:8000](http://127.0.0.1:8000)
 
+### Coolify 部署
+
+如果你准备部署到 Coolify，推荐拆成两个 Service：
+
+- `backend` -> `backend/Dockerfile`
+- `frontend` -> `frontend/Dockerfile`
+
+并把 `backend/data` 统一挂到容器内的 `/app/data`，这样应用 SQLite、Chroma、Jira 历史库和上传文件都会一起持久化。
+
+详细步骤见：[docs/coolify-deploy.md](/Users/wangyahui/yonyou/AI工具/agentDemo/docs/coolify-deploy.md)
+
 ### 巡检 Agent 相关环境变量（可选）
 
 如果你要真正打通“自动分配 + 邮件通知”，还需要补这些环境变量：

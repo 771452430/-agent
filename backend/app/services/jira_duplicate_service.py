@@ -793,8 +793,33 @@ class JiraDuplicateService:
                     return left.strip(), right.strip()
         return normalized, ""
 
+    def _resolve_source_db_path(self, source_db_path: str) -> Path:
+        raw = (source_db_path or "").strip()
+        if raw == "":
+            return Path(self.settings.jira_support_db_path).expanduser()
+
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute():
+            return candidate
+
+        workspace_candidate = (self.settings.root_dir / candidate).resolve()
+        if workspace_candidate.exists():
+            return workspace_candidate
+
+        legacy_relative_forms = {
+            "backend/data/jira/jira_support.db",
+            "./backend/data/jira/jira_support.db",
+            "data/jira/jira_support.db",
+            "./data/jira/jira_support.db",
+        }
+        normalized = raw.replace("\\", "/").lstrip("./")
+        if normalized in {item.lstrip("./") for item in legacy_relative_forms}:
+            return Path(self.settings.jira_support_db_path).expanduser()
+
+        return candidate
+
     def _load_completed_cases(self, source_db_path: str) -> list[dict[str, str]]:
-        path = Path(source_db_path).expanduser()
+        path = self._resolve_source_db_path(source_db_path)
         if not path.exists():
             raise RuntimeError(f"Jira 源数据库不存在：{path}")
         uri = f"file:{path}?mode=ro"

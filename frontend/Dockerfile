@@ -4,6 +4,12 @@ WORKDIR /app
 
 RUN apk add --no-cache wget
 
+ARG INTERNAL_API_BASE=http://backend:8000
+ARG NEXT_PUBLIC_API_BASE=
+
+ENV INTERNAL_API_BASE=$INTERNAL_API_BASE
+ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE
+
 COPY frontend/package.json frontend/package-lock.json ./
 
 RUN npm ci

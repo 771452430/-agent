@@ -558,6 +558,77 @@ class JiraDuplicateAgentTests(unittest.TestCase):
         self.assertEqual(with_prefix.result.candidates[0].issue_key, "YYZJ-138327")
         self.assertEqual(without_prefix.result.candidates[0].issue_key, "YYZJ-138327")
 
+    def test_manual_solution_search_accepts_legacy_relative_source_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp_dir = Path(raw_temp)
+            root_dir = temp_dir / "workspace"
+            data_dir = root_dir / "backend" / "data"
+            source_db = data_dir / "jira" / "jira_support.db"
+            source_db.parent.mkdir(parents=True, exist_ok=True)
+            _create_source_db(source_db)
+            settings = AppSettings(
+                root_dir=root_dir,
+                backend_dir=root_dir / "backend",
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "learning_demo.sqlite3",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=source_db,
+            )
+            settings.ensure_directories()
+            store = JiraDuplicateStore(settings.sqlite_path)
+            provider_store = ProviderStore(settings.sqlite_path)
+            service = JiraDuplicateService(
+                store=store,
+                llm_service=LLMService(provider_store=provider_store),
+                settings=settings,
+                provider_store=provider_store,
+            )
+
+            response = service.search_solution(
+                JiraSolutionSearchRequest(
+                    description="【DSP支持问题】打了330补丁合集之后，ca用户登不上了，驱动加载正常，一点登陆页面就会刷新。",
+                    source_db_path="backend/data/jira/jira_support.db",
+                    domain="工作台",
+                    module="工作台",
+                )
+            )
+
+        self.assertEqual(response.result.match_level, "high")
+        self.assertEqual(response.result.candidates[0].issue_key, "YYZJ-138327")
+
+    def test_load_completed_cases_falls_back_to_default_jira_db_for_blank_path(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_temp:
+            temp_dir = Path(raw_temp)
+            root_dir = temp_dir / "workspace"
+            data_dir = root_dir / "backend" / "data"
+            source_db = data_dir / "jira" / "jira_support.db"
+            source_db.parent.mkdir(parents=True, exist_ok=True)
+            _create_source_db(source_db)
+            settings = AppSettings(
+                root_dir=root_dir,
+                backend_dir=root_dir / "backend",
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "learning_demo.sqlite3",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=source_db,
+            )
+            settings.ensure_directories()
+            store = JiraDuplicateStore(settings.sqlite_path)
+            provider_store = ProviderStore(settings.sqlite_path)
+            service = JiraDuplicateService(
+                store=store,
+                llm_service=LLMService(provider_store=provider_store),
+                settings=settings,
+                provider_store=provider_store,
+            )
+
+            cases = service._load_completed_cases("")
+
+        self.assertGreater(len(cases), 0)
+        self.assertEqual(cases[0]["issue_key"], "EXPS-195190")
+
     def test_draft_solution_reply_learning_mode_returns_template(self) -> None:
         with tempfile.TemporaryDirectory() as raw_temp:
             temp_dir = Path(raw_temp)
