@@ -29,7 +29,7 @@ import type {
 import { ModelSelector } from "./model-selector";
 import { useModelSettings } from "./model-settings-provider";
 
-const DEFAULT_SOURCE_DB_PATH = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db";
+const DEFAULT_SOURCE_DB_PATH = "backend/data/jira/jira_support.db";
 
 const DEFAULT_MODEL: ModelConfig = {
   mode: "learning",

@@ -120,6 +120,57 @@ export type UpdateWorkNotifySettingsRequest = Partial<{
   contacts_cookie: string;
 }>;
 
+export type JiraDataSyncRunStatus = "running" | "success" | "failed";
+
+export type JiraDataSourceSettings = {
+  enabled: boolean;
+  db_path: string;
+  app_key: string;
+  has_app_secret: boolean;
+  app_secret_masked?: string | null;
+  credential_source: string;
+  sync_keyword: string;
+  sync_date_range: string;
+  sync_interval_minutes: number;
+  last_sync_status?: JiraDataSyncRunStatus | null;
+  last_sync_at?: string | null;
+  last_error_message?: string | null;
+};
+
+export type UpdateJiraDataSourceSettingsRequest = Partial<{
+  enabled: boolean;
+  db_path: string;
+  app_key: string;
+  app_secret: string;
+  sync_keyword: string;
+  sync_date_range: string;
+  sync_interval_minutes: number;
+}>;
+
+export type JiraDataSourceTestResponse = {
+  ok: boolean;
+  message: string;
+  matched_count: number;
+  matched_preview: string[];
+};
+
+export type JiraDataSyncRun = {
+  id: string;
+  status: JiraDataSyncRunStatus;
+  started_at: string;
+  ended_at?: string | null;
+  keyword: string;
+  date_range: string;
+  db_path: string;
+  matched_count: number;
+  fetched_count: number;
+  inserted_count: number;
+  deleted_count: number;
+  reindexed_count: number;
+  summary: string;
+  error_message?: string | null;
+};
+
 export type RagEmbeddingSettings = {
   configured: boolean;
   config_source: "environment" | "database" | "fallback";

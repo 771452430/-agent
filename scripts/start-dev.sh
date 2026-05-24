@@ -53,19 +53,19 @@ kill_listener "$BACKEND_PORT"
 kill_listener "$FRONTEND_PORT"
 
 echo "启动后端..."
-PYTHONPATH="$BACKEND_DIR" \
+nohup env PYTHONPATH="$BACKEND_DIR" \
   "$BACKEND_DIR/.venv/bin/uvicorn" app.main:app \
   --app-dir "$BACKEND_DIR" \
   --host "$BACKEND_HOST" \
   --port "$BACKEND_PORT" \
-  >"$BACKEND_LOG" 2>&1 &
+  >"$BACKEND_LOG" 2>&1 </dev/null &
 echo $! >"$BACKEND_PID_FILE"
 
 echo "启动前端..."
-(
+nohup bash -lc "
   cd "$FRONTEND_DIR"
   npm run dev -- --hostname "$FRONTEND_HOST" --port "$FRONTEND_PORT"
-) >"$FRONTEND_LOG" 2>&1 &
+" >"$FRONTEND_LOG" 2>&1 </dev/null &
 echo $! >"$FRONTEND_PID_FILE"
 
 wait_for_url "http://$BACKEND_HOST:$BACKEND_PORT/health" "后端"

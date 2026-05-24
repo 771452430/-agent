@@ -12,7 +12,7 @@ import type {
 } from "../lib/types";
 import { ModelSelector } from "./model-selector";
 
-const DEFAULT_SOURCE_DB_PATH = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db";
+const DEFAULT_SOURCE_DB_PATH = "backend/data/jira/jira_support.db";
 const CONFIG_STORAGE_KEY = "jira-solution-search-config-v1";
 
 const DEFAULT_MODEL: ModelConfig = {

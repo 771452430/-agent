@@ -36,6 +36,16 @@ def _env_optional_str(name: str, default: str | None = None) -> str | None:
     return value or None
 
 
+def _env_optional_path(name: str, default: str | None = None) -> Path | None:
+    value = _env_optional_str(name, default)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"none", "false", "off", "0"}:
+        return None
+    return Path(value)
+
+
 DEFAULT_CORS_ORIGINS = ("http://localhost:3000", "http://127.0.0.1:3000")
 DEFAULT_CORS_ORIGIN_REGEX = r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$"
 
@@ -51,6 +61,12 @@ class AppSettings:
     uploads_dir: Path = Path(__file__).resolve().parents[1] / "data" / "uploads"
     sqlite_path: Path = Path(__file__).resolve().parents[1] / "data" / "learning_demo.sqlite3"
     chroma_dir: Path = Path(__file__).resolve().parents[1] / "data" / "chroma"
+    jira_support_db_path: Path = Path(
+        os.getenv(
+            "JIRA_SUPPORT_DB_PATH",
+            str(Path(__file__).resolve().parents[1] / "data" / "jira" / "jira_support.db"),
+        )
+    )
     allow_mock_model: bool = True
     default_provider: str = "mock"
     default_model: str = "learning-mode"
@@ -79,6 +95,13 @@ class AppSettings:
     watcher_smtp_use_ssl: bool = _env_bool("WATCHER_SMTP_USE_SSL", False)
     gitlab_import_token: str | None = os.getenv("GITLAB_IMPORT_TOKEN")
     gitlab_import_allowed_hosts: tuple[str, ...] = _env_csv("GITLAB_IMPORT_ALLOWED_HOSTS", ("git.yyrd.com",))
+    jira_app_key: str | None = os.getenv("JIRA_APP_KEY")
+    jira_app_secret: str | None = os.getenv("JIRA_APP_SECRET")
+    jira_legacy_skill_dir: Path | None = _env_optional_path(
+        "JIRA_LEGACY_SKILL_DIR",
+        "/Users/wangyahui/yonyou/AI工具/jira-data-query",
+    )
+    jira_data_sync_interval_seconds: int = int(os.getenv("JIRA_DATA_SYNC_INTERVAL_SECONDS", "60"))
 
     def ensure_directories(self) -> None:
         """启动时准备本地数据目录。"""
@@ -86,6 +109,7 @@ class AppSettings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
+        self.jira_support_db_path.parent.mkdir(parents=True, exist_ok=True)
 
 
 def load_settings() -> AppSettings:

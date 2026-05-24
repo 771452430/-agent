@@ -62,6 +62,9 @@ from .schemas import (
     JiraDuplicateAgentConfig,
     JiraDuplicateFetchTestResponse,
     JiraDuplicateRun,
+    JiraDataSourceSettings,
+    JiraDataSourceTestResponse,
+    JiraDataSyncRun,
     JiraSolutionDraftReplyRequest,
     JiraSolutionDraftReplyResponse,
     JiraSolutionSearchRequest,
@@ -70,6 +73,7 @@ from .schemas import (
     ThreadSummary,
     UpdateSupportIssueCaseCandidateRequest,
     UpdateJiraDuplicateAgentRequest,
+    UpdateJiraDataSourceSettingsRequest,
     UpdateFeishuSettingsRequest,
     UpdateKnowledgeDocumentRequest,
     UpdateMailSettingsRequest,
@@ -93,6 +97,9 @@ from .services.feishu_settings_store import FeishuSettingsStore
 from .services.gitlab_import_service import GitLabImportService
 from .services.gitlab_settings_service import GitLabSettingsService
 from .services.gitlab_settings_store import GitLabSettingsStore
+from .services.jira_data_source_scheduler import JiraDataSourceScheduler
+from .services.jira_data_source_service import JiraDataSourceService
+from .services.jira_data_source_store import JiraDataSourceStore
 from .services.jira_duplicate_scheduler import JiraDuplicateScheduler
 from .services.jira_duplicate_service import JiraDuplicateService
 from .services.jira_duplicate_store import JiraDuplicateStore
@@ -137,6 +144,7 @@ knowledge_store = KnowledgeStore(
 watcher_store = WatcherStore(settings.sqlite_path)
 support_issue_store = SupportIssueStore(settings.sqlite_path)
 jira_duplicate_store = JiraDuplicateStore(settings.sqlite_path)
+jira_data_source_store = JiraDataSourceStore(settings.sqlite_path)
 work_notify_settings_store = WorkNotifySettingsStore(settings.sqlite_path)
 llm_service = LLMService(provider_store=provider_store, allow_mock_model=settings.allow_mock_model)
 gitlab_settings_service = GitLabSettingsService(gitlab_settings_store, settings)
@@ -148,7 +156,8 @@ yonyou_work_notify_service = YonyouWorkNotifyService(work_notify_settings_servic
 yonyou_contacts_search_service = YonyouContactsSearchService(
     work_notify_settings_service=yonyou_work_notify_settings_service
 )
-skill_registry = build_skill_registry(knowledge_store, yonyou_work_notify_service)
+jira_data_source_service = JiraDataSourceService(jira_data_source_store, settings)
+skill_registry = build_skill_registry(knowledge_store, yonyou_work_notify_service, jira_data_source_service)
 chat_service = ChatService(
     thread_store,
     knowledge_store,
@@ -184,6 +193,11 @@ jira_duplicate_scheduler = JiraDuplicateScheduler(
     jira_duplicate_service,
     settings.support_issue_scheduler_interval_seconds,
 )
+jira_data_source_scheduler = JiraDataSourceScheduler(
+    jira_data_source_service,
+    interval_seconds=settings.jira_data_sync_interval_seconds,
+    reindex_callback=jira_duplicate_service.reindex_source_db,
+)
 
 # 这一段是后端“对象装配区”：
 # 先把 Store / Service / Scheduler 串好，再把它们暴露成 HTTP 路由。
@@ -204,6 +218,7 @@ async def on_startup() -> None:
     await watcher_scheduler.start()
     await support_issue_scheduler.start()
     await jira_duplicate_scheduler.start()
+    await jira_data_source_scheduler.start()
 
 
 @app.on_event("shutdown")
@@ -211,6 +226,7 @@ async def on_shutdown() -> None:
     await watcher_scheduler.stop()
     await support_issue_scheduler.stop()
     await jira_duplicate_scheduler.stop()
+    await jira_data_source_scheduler.stop()
 
 
 @app.get("/health")
@@ -299,6 +315,31 @@ def get_work_notify_settings() -> WorkNotifySettings:
 @app.patch("/api/settings/work-notify", response_model=WorkNotifySettings)
 def update_work_notify_settings(request: UpdateWorkNotifySettingsRequest) -> WorkNotifySettings:
     return yonyou_work_notify_settings_service.update_work_notify_settings(request)
+
+
+@app.get("/api/settings/jira-data-source", response_model=JiraDataSourceSettings)
+def get_jira_data_source_settings() -> JiraDataSourceSettings:
+    return jira_data_source_service.get_public_settings()
+
+
+@app.patch("/api/settings/jira-data-source", response_model=JiraDataSourceSettings)
+def update_jira_data_source_settings(request: UpdateJiraDataSourceSettingsRequest) -> JiraDataSourceSettings:
+    return jira_data_source_service.update_settings(request)
+
+
+@app.post("/api/settings/jira-data-source/test", response_model=JiraDataSourceTestResponse)
+def test_jira_data_source_settings() -> JiraDataSourceTestResponse:
+    return jira_data_source_service.test_settings()
+
+
+@app.post("/api/settings/jira-data-source/sync", response_model=JiraDataSyncRun)
+def sync_jira_data_source() -> JiraDataSyncRun:
+    return jira_data_source_service.sync_now(reindex_callback=jira_duplicate_service.reindex_source_db)
+
+
+@app.get("/api/settings/jira-data-source/runs", response_model=list[JiraDataSyncRun])
+def list_jira_data_source_runs() -> list[JiraDataSyncRun]:
+    return jira_data_source_service.list_runs()
 
 
 @app.get("/api/settings/rag-embedding", response_model=RAGEmbeddingSettings)

@@ -231,12 +231,15 @@ class JiraDuplicateService:
 
     def reindex(self, agent_id: str) -> dict[str, Any]:
         agent = self.get_agent(agent_id)
-        result = self._reindex_cases_for_agent(agent)
+        result = self.reindex_source_db(agent.source_db_path, agent_id=agent.id)
         return {
             "agent_id": agent.id,
             "indexed_count": result["indexed_count"],
             "embedding_backend": result["embedding_backend"],
         }
+
+    def reindex_source_db(self, source_db_path: str, agent_id: str = "jira-data-source") -> dict[str, Any]:
+        return self._reindex_cases(source_db_path=source_db_path, agent_id=agent_id)
 
     def search_solution(self, search_request: JiraSolutionSearchRequest) -> JiraSolutionSearchResponse:
         model_config = self.llm_service.resolve_model_config(search_request.model_settings)
@@ -330,7 +333,10 @@ class JiraDuplicateService:
         )
 
     def _reindex_cases_for_agent(self, agent: JiraDuplicateAgentConfig) -> dict[str, Any]:
-        cases = self._load_completed_cases(agent.source_db_path)
+        return self._reindex_cases(source_db_path=agent.source_db_path, agent_id=agent.id)
+
+    def _reindex_cases(self, *, source_db_path: str, agent_id: str) -> dict[str, Any]:
+        cases = self._load_completed_cases(source_db_path)
         self._reset_vector_collection()
         documents = [case["search_text"] for case in cases]
         batch_size = 128
@@ -360,10 +366,10 @@ class JiraDuplicateService:
             cases,
             embedding_backend=embedding_backend,
             normalizer_version=MATCH_TEXT_NORMALIZER_VERSION,
-            source_db_path=str(Path(agent.source_db_path).expanduser()),
+            source_db_path=str(Path(source_db_path).expanduser()),
         )
         return {
-            "agent_id": agent.id,
+            "agent_id": agent_id,
             "indexed_count": len(cases),
             "embedding_backend": embedding_backend,
         }

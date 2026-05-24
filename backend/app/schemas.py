@@ -178,6 +178,80 @@ class UpdateWorkNotifySettingsRequest(BaseModel):
     contacts_cookie: str | None = None
 
 
+JiraDataSyncRunStatus = Literal["running", "success", "failed"]
+
+
+class JiraDataSourceSettings(BaseModel):
+    """Jira 历史数据同步配置。"""
+
+    enabled: bool = False
+    db_path: str = ""
+    app_key: str = ""
+    has_app_secret: bool = False
+    app_secret_masked: str | None = None
+    credential_source: str = "none"
+    sync_keyword: str = "工作台"
+    sync_date_range: str = "本年"
+    sync_interval_minutes: int = 1440
+    last_sync_status: JiraDataSyncRunStatus | None = None
+    last_sync_at: datetime | None = None
+    last_error_message: str | None = None
+
+
+class JiraDataSourceRuntimeSettings(BaseModel):
+    """服务端运行时使用的 Jira 数据同步配置。"""
+
+    enabled: bool = False
+    db_path: str = ""
+    app_key: str | None = None
+    app_secret: str | None = None
+    sync_keyword: str = "工作台"
+    sync_date_range: str = "本年"
+    sync_interval_minutes: int = 1440
+    created_at: datetime
+    updated_at: datetime
+
+
+class UpdateJiraDataSourceSettingsRequest(BaseModel):
+    """更新 Jira 历史数据同步配置。"""
+
+    enabled: bool | None = None
+    db_path: str | None = None
+    app_key: str | None = None
+    app_secret: str | None = None
+    sync_keyword: str | None = None
+    sync_date_range: str | None = None
+    sync_interval_minutes: int | None = Field(default=None, ge=1, le=24 * 60)
+
+
+class JiraDataSourceTestResponse(BaseModel):
+    """Jira 数据源配置测试结果。"""
+
+    ok: bool
+    message: str
+    matched_count: int = 0
+    matched_preview: list[str] = Field(default_factory=list)
+
+
+class JiraDataSyncRun(BaseModel):
+    """一次 Jira 数据同步运行记录。"""
+
+    id: str
+    status: JiraDataSyncRunStatus
+    started_at: datetime
+    ended_at: datetime | None = None
+    keyword: str
+    date_range: str
+    db_path: str
+    matched_count: int = 0
+    fetched_count: int = 0
+    inserted_count: int = 0
+    deleted_count: int = 0
+    reindexed_count: int = 0
+    summary: str = ""
+    error_message: str | None = None
+
+
 class RAGEmbeddingSettings(BaseModel):
     """返回给前端的 RAG embedding 设置。
 
@@ -1094,7 +1168,7 @@ class JiraDuplicateAgentConfig(BaseModel):
     id: str
     name: str
     description: str = ""
-    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    source_db_path: str = "backend/data/jira/jira_support.db"
     dashboard_url: str = Field(min_length=1)
     request_method: WatcherRequestMethod = "GET"
     request_headers: dict[str, str] = Field(default_factory=dict)
@@ -1125,7 +1199,7 @@ class CreateJiraDuplicateAgentRequest(BaseModel):
 
     name: str = Field(min_length=1)
     description: str = ""
-    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    source_db_path: str = "backend/data/jira/jira_support.db"
     dashboard_url: str = Field(min_length=1)
     request_method: WatcherRequestMethod = "GET"
     request_headers: dict[str, str] = Field(default_factory=dict)
@@ -1182,7 +1256,7 @@ class JiraSolutionSearchRequest(BaseModel):
     description: str = Field(min_length=1)
     issue_key: str = "MANUAL-QUERY"
     title: str = ""
-    source_db_path: str = "/Users/wangyahui/yonyou/AI工具/jira-data-query/jiradata/jira_support.db"
+    source_db_path: str = "backend/data/jira/jira_support.db"
     domain: str = ""
     module: str = ""
     category: str = ""

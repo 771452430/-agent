@@ -41,6 +41,11 @@ class SearchKnowledgeInput(BaseModel):
     query: str = Field(description="要在知识库里检索的问题")
 
 
+class SyncJiraDataInput(BaseModel):
+    keyword: str | None = Field(default=None, description="同步关键字，留空时使用 Jira 数据源设置")
+    date_range: str | None = Field(default=None, description="时间范围，留空时使用 Jira 数据源设置")
+
+
 class SendYonyouWorkNotifyInput(BaseModel):
     openapi_base_url: str = Field(description="租户 OpenAPI 基础域名，例如 https://xxx.diwork.com")
     src_msg_id: str = Field(description="消息唯一标识，用于幂等")
@@ -78,6 +83,7 @@ class SendYonyouWorkNotifyInput(BaseModel):
 def build_skill_registry(
     knowledge_store: KnowledgeStore,
     yonyou_notify_service: YonyouWorkNotifyService | None = None,
+    jira_data_source_service: Any | None = None,
 ) -> SkillRegistry:
     registry = SkillRegistry()
     yonyou_notify_service = yonyou_notify_service or YonyouWorkNotifyService()
@@ -117,6 +123,32 @@ def build_skill_registry(
         if not citations:
             return "未在知识库中找到命中内容。"
         return "\n".join(f"- {citation.document_name}: {citation.snippet}" for citation in citations)
+
+    @tool("sync_jira_support_data", args_schema=SyncJiraDataInput)
+    def sync_jira_support_data(keyword: str | None = None, date_range: str | None = None) -> dict[str, Any]:
+        """按 Jira 数据源设置同步支持问题历史库。"""
+
+        if jira_data_source_service is None:
+            return {"ok": False, "message": "Jira 数据源同步服务未启用。"}
+        if keyword is not None or date_range is not None:
+            current = jira_data_source_service.get_runtime_settings()
+            jira_data_source_service.update_settings(
+                type(
+                    "UpdateRequest",
+                    (),
+                    {
+                        "enabled": current.enabled,
+                        "db_path": current.db_path,
+                        "app_key": current.app_key,
+                        "app_secret": current.app_secret,
+                        "sync_keyword": keyword if keyword is not None else current.sync_keyword,
+                        "sync_date_range": date_range if date_range is not None else current.sync_date_range,
+                        "sync_interval_minutes": current.sync_interval_minutes,
+                    },
+                )()
+            )
+        run = jira_data_source_service.sync_now()
+        return run.model_dump(mode="json")
 
     @tool("send_yonyou_work_notify", args_schema=SendYonyouWorkNotifyInput)
     def send_yonyou_work_notify(
@@ -202,6 +234,19 @@ def build_skill_registry(
             learning_focus=["RAG", "Retriever", "Citation"],
         ),
         tools=[search_knowledge_base],
+    )
+    registry.register_skill(
+        SkillDescriptor(
+            id="jira_data_sync",
+            name="Jira Data Sync",
+            description="同步 Jira 支持问题历史库，用于重复工单识别和方案检索。",
+            category="integration",
+            tools=["sync_jira_support_data"],
+            enabled_by_default=False,
+            requires_rag=False,
+            learning_focus=["API integration", "SQLite", "Scheduled sync"],
+        ),
+        tools=[sync_jira_support_data],
     )
     registry.register_skill(
         SkillDescriptor(

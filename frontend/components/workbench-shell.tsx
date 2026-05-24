@@ -12,6 +12,7 @@ import type { ReactNode } from "react";
 
 import { FeishuSettingsPanel } from "./feishu-settings-panel";
 import { GitLabImportSettingsPanel } from "./gitlab-import-settings-panel";
+import { JiraDataSourceSettingsPanel } from "./jira-data-source-settings-panel";
 import { MailSettingsPanel } from "./mail-settings-panel";
 import { ModelSettingsPanel } from "./model-settings-panel";
 import { useModelSettings } from "./model-settings-provider";
@@ -34,6 +35,7 @@ export function WorkbenchShell(props: { children: ReactNode }) {
   const {
     openFeishuSettings,
     openGitLabImportSettings,
+    openJiraDataSourceSettings,
     openMailSettings,
     openModelSettings,
     openRagEmbeddingSettings,
@@ -160,6 +162,16 @@ export function WorkbenchShell(props: { children: ReactNode }) {
                   <div className="font-medium text-white">GitLab 导入设置</div>
                   <div className="mt-1 text-xs leading-5 text-slate-400">统一管理检索模式导入 GitLab 文档树使用的 Token 和域名白名单</div>
               </button>
+              <button
+                  className="apple-button-ghost mt-2 w-full rounded-[20px] px-3.5 py-3.5 text-left text-sm"
+                onClick={() => {
+                  openJiraDataSourceSettings();
+                  setIsUtilityMenuOpen(false);
+                }}
+              >
+                  <div className="font-medium text-white">Jira 数据源设置</div>
+                  <div className="mt-1 text-xs leading-5 text-slate-400">同步 Jira 历史工单库，供重复识别和方案检索复用</div>
+              </button>
             </div>
           )}
 
@@ -184,6 +196,7 @@ export function WorkbenchShell(props: { children: ReactNode }) {
       <WorkNotifySettingsPanel />
       <RagEmbeddingSettingsPanel />
       <GitLabImportSettingsPanel />
+      <JiraDataSourceSettingsPanel />
     </div>
   );
 }

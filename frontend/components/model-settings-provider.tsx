@@ -12,14 +12,19 @@ import type { ReactNode } from "react";
 import {
   getFeishuSettings,
   getGitLabImportSettings,
+  getJiraDataSourceSettings,
   getMailSettings,
   getRagEmbeddingSettings,
   getWorkNotifySettings,
+  listJiraDataSourceRuns,
   listProviders,
   testMailSettings,
+  testJiraDataSourceSettings,
   testProvider,
+  syncJiraDataSource,
   updateFeishuSettings,
   updateGitLabImportSettings,
+  updateJiraDataSourceSettings,
   updateMailSettings,
   updateRagEmbeddingSettings,
   updateWorkNotifySettings,
@@ -28,6 +33,9 @@ import {
 import type {
   FeishuSettings,
   GitLabImportSettings,
+  JiraDataSourceSettings,
+  JiraDataSourceTestResponse,
+  JiraDataSyncRun,
   MailSettings,
   MailTestRequest,
   MailTestResponse,
@@ -38,6 +46,7 @@ import type {
   RagEmbeddingSettings,
   UpdateMailSettingsRequest,
   UpdateProviderRequest,
+  UpdateJiraDataSourceSettingsRequest,
   UpdateRagEmbeddingSettingsRequest,
   UpdateWorkNotifySettingsRequest,
   WorkNotifySettings
@@ -69,12 +78,17 @@ type ModelSettingsContextValue = {
   gitlabImportSettings: GitLabImportSettings | null;
   isGitLabImportSettingsLoading: boolean;
   gitlabImportError: string;
+  jiraDataSourceSettings: JiraDataSourceSettings | null;
+  jiraDataSourceRuns: JiraDataSyncRun[];
+  isJiraDataSourceSettingsLoading: boolean;
+  jiraDataSourceError: string;
   isModelSettingsOpen: boolean;
   isMailSettingsOpen: boolean;
   isFeishuSettingsOpen: boolean;
   isWorkNotifySettingsOpen: boolean;
   isRagEmbeddingSettingsOpen: boolean;
   isGitLabImportSettingsOpen: boolean;
+  isJiraDataSourceSettingsOpen: boolean;
   selectedProviderId: string;
   refreshProviders: () => Promise<void>;
   refreshMailSettings: () => Promise<void>;
@@ -82,18 +96,21 @@ type ModelSettingsContextValue = {
   refreshWorkNotifySettings: () => Promise<void>;
   refreshRagEmbeddingSettings: () => Promise<void>;
   refreshGitLabImportSettings: () => Promise<void>;
+  refreshJiraDataSourceSettings: () => Promise<void>;
   openModelSettings: (providerId?: string) => void;
   openMailSettings: () => void;
   openFeishuSettings: () => void;
   openWorkNotifySettings: () => void;
   openRagEmbeddingSettings: () => void;
   openGitLabImportSettings: () => void;
+  openJiraDataSourceSettings: () => void;
   closeModelSettings: () => void;
   closeMailSettings: () => void;
   closeFeishuSettings: () => void;
   closeWorkNotifySettings: () => void;
   closeRagEmbeddingSettings: () => void;
   closeGitLabImportSettings: () => void;
+  closeJiraDataSourceSettings: () => void;
   setSelectedProviderId: (providerId: string) => void;
   saveProvider: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderConfig>;
   runProviderTest: (providerId: string, input: UpdateProviderRequest) => Promise<ProviderTestResponse>;
@@ -107,6 +124,9 @@ type ModelSettingsContextValue = {
     clear_token?: boolean;
     allowed_hosts?: string[];
   }) => Promise<GitLabImportSettings>;
+  saveJiraDataSourceSettings: (input: UpdateJiraDataSourceSettingsRequest) => Promise<JiraDataSourceSettings>;
+  runJiraDataSourceTest: () => Promise<JiraDataSourceTestResponse>;
+  runJiraDataSourceSync: () => Promise<JiraDataSyncRun>;
   validateModelConfig: (config: ModelConfig) => ModelConfigValidation;
   getProvider: (providerId: string) => ProviderConfig | undefined;
   getEnabledProviders: () => ProviderConfig[];
@@ -141,12 +161,17 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
   const [gitlabImportSettings, setGitlabImportSettings] = useState<GitLabImportSettings | null>(null);
   const [isGitLabImportSettingsLoading, setIsGitLabImportSettingsLoading] = useState(true);
   const [gitlabImportError, setGitlabImportError] = useState("");
+  const [jiraDataSourceSettings, setJiraDataSourceSettings] = useState<JiraDataSourceSettings | null>(null);
+  const [jiraDataSourceRuns, setJiraDataSourceRuns] = useState<JiraDataSyncRun[]>([]);
+  const [isJiraDataSourceSettingsLoading, setIsJiraDataSourceSettingsLoading] = useState(true);
+  const [jiraDataSourceError, setJiraDataSourceError] = useState("");
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isMailSettingsOpen, setIsMailSettingsOpen] = useState(false);
   const [isFeishuSettingsOpen, setIsFeishuSettingsOpen] = useState(false);
   const [isWorkNotifySettingsOpen, setIsWorkNotifySettingsOpen] = useState(false);
   const [isRagEmbeddingSettingsOpen, setIsRagEmbeddingSettingsOpen] = useState(false);
   const [isGitLabImportSettingsOpen, setIsGitLabImportSettingsOpen] = useState(false);
+  const [isJiraDataSourceSettingsOpen, setIsJiraDataSourceSettingsOpen] = useState(false);
   const [selectedProviderId, setSelectedProviderId] = useState("");
 
   async function refreshProviders() {
@@ -188,6 +213,13 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setGitlabImportSettings(await getGitLabImportSettings());
   }
 
+  async function refreshJiraDataSourceSettings() {
+    setJiraDataSourceError("");
+    const [settings, runs] = await Promise.all([getJiraDataSourceSettings(), listJiraDataSourceRuns()]);
+    setJiraDataSourceSettings(settings);
+    setJiraDataSourceRuns(runs);
+  }
+
   useEffect(() => {
     // 首次挂载时并行拉取三类全局配置：
     // provider、邮箱、飞书。这样设置面板一打开就有完整上下文。
@@ -209,6 +241,9 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     refreshGitLabImportSettings()
       .catch((cause) => setGitlabImportError(String(cause)))
       .finally(() => setIsGitLabImportSettingsLoading(false));
+    refreshJiraDataSourceSettings()
+      .catch((cause) => setJiraDataSourceError(String(cause)))
+      .finally(() => setIsJiraDataSourceSettingsLoading(false));
   }, []);
 
   const providersById = useMemo(() => {
@@ -227,6 +262,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsWorkNotifySettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(false);
     if (providerId != null && providerId !== "") {
       setSelectedProviderId(providerId);
     } else if (selectedProviderId === "" && providers.length > 0) {
@@ -241,6 +277,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsWorkNotifySettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(false);
     setIsMailSettingsOpen(true);
   }
 
@@ -250,6 +287,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsWorkNotifySettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(false);
     setIsFeishuSettingsOpen(true);
   }
 
@@ -259,6 +297,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsFeishuSettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(false);
     setIsWorkNotifySettingsOpen(true);
   }
 
@@ -268,6 +307,7 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsFeishuSettingsOpen(false);
     setIsWorkNotifySettingsOpen(false);
     setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(true);
   }
 
@@ -278,6 +318,16 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     setIsWorkNotifySettingsOpen(false);
     setIsRagEmbeddingSettingsOpen(false);
     setIsGitLabImportSettingsOpen(true);
+  }
+
+  function openJiraDataSourceSettings() {
+    setIsModelSettingsOpen(false);
+    setIsMailSettingsOpen(false);
+    setIsFeishuSettingsOpen(false);
+    setIsWorkNotifySettingsOpen(false);
+    setIsRagEmbeddingSettingsOpen(false);
+    setIsGitLabImportSettingsOpen(false);
+    setIsJiraDataSourceSettingsOpen(true);
   }
 
   function closeModelSettings() {
@@ -302,6 +352,10 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
 
   function closeGitLabImportSettings() {
     setIsGitLabImportSettingsOpen(false);
+  }
+
+  function closeJiraDataSourceSettings() {
+    setIsJiraDataSourceSettingsOpen(false);
   }
 
   async function saveProvider(providerId: string, input: UpdateProviderRequest) {
@@ -352,6 +406,22 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
     const saved = await updateGitLabImportSettings(input);
     setGitlabImportSettings(saved);
     return saved;
+  }
+
+  async function saveJiraDataSourceSettings(input: UpdateJiraDataSourceSettingsRequest) {
+    const saved = await updateJiraDataSourceSettings(input);
+    setJiraDataSourceSettings(saved);
+    return saved;
+  }
+
+  async function runJiraDataSourceTest() {
+    return testJiraDataSourceSettings();
+  }
+
+  async function runJiraDataSourceSync() {
+    const run = await syncJiraDataSource();
+    await refreshJiraDataSourceSettings();
+    return run;
   }
 
   function getProvider(providerId: string) {
@@ -426,12 +496,17 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
       gitlabImportSettings,
       isGitLabImportSettingsLoading,
       gitlabImportError,
+      jiraDataSourceSettings,
+      jiraDataSourceRuns,
+      isJiraDataSourceSettingsLoading,
+      jiraDataSourceError,
       isModelSettingsOpen,
       isMailSettingsOpen,
       isFeishuSettingsOpen,
       isWorkNotifySettingsOpen,
       isRagEmbeddingSettingsOpen,
       isGitLabImportSettingsOpen,
+      isJiraDataSourceSettingsOpen,
         selectedProviderId,
         refreshProviders,
         refreshMailSettings,
@@ -439,18 +514,21 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
       refreshWorkNotifySettings,
       refreshRagEmbeddingSettings,
       refreshGitLabImportSettings,
+      refreshJiraDataSourceSettings,
       openModelSettings,
       openMailSettings,
       openFeishuSettings,
       openWorkNotifySettings,
       openRagEmbeddingSettings,
       openGitLabImportSettings,
+      openJiraDataSourceSettings,
       closeModelSettings,
       closeMailSettings,
       closeFeishuSettings,
       closeWorkNotifySettings,
       closeRagEmbeddingSettings,
       closeGitLabImportSettings,
+      closeJiraDataSourceSettings,
         setSelectedProviderId,
         saveProvider,
         runProviderTest,
@@ -460,6 +538,9 @@ export function ModelSettingsProvider(props: { children: ReactNode }) {
       saveWorkNotifySettings,
       saveRagEmbeddingSettings,
       saveGitLabImportSettings,
+      saveJiraDataSourceSettings,
+      runJiraDataSourceTest,
+      runJiraDataSourceSync,
         validateModelConfig,
         getProvider,
         getEnabledProviders

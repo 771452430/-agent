@@ -21,6 +21,9 @@ import type {
   JiraDuplicateFetchTestResponse,
   JiraDuplicateIssueResult,
   JiraDuplicateRun,
+  JiraDataSourceSettings,
+  JiraDataSourceTestResponse,
+  JiraDataSyncRun,
   JiraSolutionDraftReplyResponse,
   JiraSolutionSearchResponse,
   KnowledgeDeleteResponse,
@@ -50,6 +53,7 @@ import type {
   ThreadSummary,
   UpdateMailSettingsRequest,
   UpdateProviderRequest,
+  UpdateJiraDataSourceSettingsRequest,
   UpdateRagEmbeddingSettingsRequest,
   UpdateWorkNotifySettingsRequest,
   WatcherAgentConfig,
@@ -180,6 +184,43 @@ export async function updateWorkNotifySettings(input: UpdateWorkNotifySettingsRe
     body: JSON.stringify(input)
   });
   return parseJson<WorkNotifySettings>(response);
+}
+
+export async function getJiraDataSourceSettings(): Promise<JiraDataSourceSettings> {
+  const response = await fetch(API_BASE + "/api/settings/jira-data-source", { cache: "no-store" });
+  return parseJson<JiraDataSourceSettings>(response);
+}
+
+export async function updateJiraDataSourceSettings(
+  input: UpdateJiraDataSourceSettingsRequest
+): Promise<JiraDataSourceSettings> {
+  const response = await fetch(API_BASE + "/api/settings/jira-data-source", {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(input)
+  });
+  return parseJson<JiraDataSourceSettings>(response);
+}
+
+export async function testJiraDataSourceSettings(): Promise<JiraDataSourceTestResponse> {
+  const response = await fetch(API_BASE + "/api/settings/jira-data-source/test", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  });
+  return parseJson<JiraDataSourceTestResponse>(response);
+}
+
+export async function syncJiraDataSource(): Promise<JiraDataSyncRun> {
+  const response = await fetch(API_BASE + "/api/settings/jira-data-source/sync", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" }
+  });
+  return parseJson<JiraDataSyncRun>(response);
+}
+
+export async function listJiraDataSourceRuns(): Promise<JiraDataSyncRun[]> {
+  const response = await fetch(API_BASE + "/api/settings/jira-data-source/runs", { cache: "no-store" });
+  return parseJson<JiraDataSyncRun[]>(response);
 }
 
 export async function getRagEmbeddingSettings(): Promise<RagEmbeddingSettings> {

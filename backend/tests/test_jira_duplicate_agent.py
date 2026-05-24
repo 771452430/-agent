@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import base64
 import sqlite3
 import tempfile
 import unittest
@@ -19,13 +20,27 @@ from app.schemas import (
     JiraSolutionDraftReplyRequest,
     JiraSolutionSearchRequest,
     ModelConfig,
+    UpdateJiraDataSourceSettingsRequest,
     ParsedBug,
 )
+from app.services.jira_data_source_service import JiraDataSourceService
+from app.services.jira_data_source_store import JiraDataSourceStore
 from app.services.jira_duplicate_service import MATCH_TEXT_NORMALIZER_VERSION, JiraDuplicateService
 from app.services.jira_duplicate_store import JiraDuplicateStore
 from app.services.llm_service import LLMService
 from app.services.provider_store import ProviderStore
 from app.settings import AppSettings
+
+
+LEGACY_CONFIG_KEY = b"jira_skill_shared_key_v2024_secure"
+
+
+def _write_legacy_jira_config(path: Path, *, app_key: str, app_secret: str) -> None:
+    payload = json.dumps({"JIRA_APP_KEY": app_key, "JIRA_APP_SECRET": app_secret}, ensure_ascii=False).encode("utf-8")
+    encrypted = bytearray()
+    for index, byte in enumerate(payload):
+        encrypted.append(byte ^ LEGACY_CONFIG_KEY[index % len(LEGACY_CONFIG_KEY)])
+    path.write_bytes(base64.b64encode(bytes(encrypted)))
 
 
 def _create_source_db(path: Path) -> None:
@@ -143,6 +158,188 @@ def _create_source_db(path: Path) -> None:
                 ),
             ],
         )
+
+
+class JiraDataSourceServiceTests(unittest.TestCase):
+    """Jira 历史库同步服务测试。"""
+
+    def test_update_masks_secret_and_uses_server_db_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            settings = AppSettings(
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "app.sqlite",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=data_dir / "jira" / "jira_support.db",
+                jira_legacy_skill_dir=None,
+            )
+            settings.ensure_directories()
+            service = JiraDataSourceService(JiraDataSourceStore(settings.sqlite_path), settings)
+
+            saved = service.update_settings(
+                UpdateJiraDataSourceSettingsRequest(
+                    app_key="app-key",
+                    app_secret="super-secret-value",
+                    sync_keyword="工作台",
+                    sync_date_range="本年",
+                )
+            )
+
+            self.assertEqual(saved.db_path, str(settings.jira_support_db_path))
+            self.assertTrue(saved.has_app_secret)
+            self.assertNotEqual(saved.app_secret_masked, "super-secret-value")
+            self.assertEqual(saved.credential_source, "settings")
+
+    def test_legacy_skill_config_is_used_when_no_secret_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            legacy_dir = Path(temp_dir) / "legacy-skill"
+            legacy_dir.mkdir()
+            _write_legacy_jira_config(legacy_dir / "jira_config.enc", app_key="legacy-key", app_secret="legacy-secret")
+            settings = AppSettings(
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "app.sqlite",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=data_dir / "jira" / "jira_support.db",
+                jira_app_key=None,
+                jira_app_secret=None,
+                jira_legacy_skill_dir=legacy_dir,
+            )
+            settings.ensure_directories()
+            service = JiraDataSourceService(JiraDataSourceStore(settings.sqlite_path), settings)
+
+            public = service.get_public_settings()
+            runtime = service.get_runtime_settings()
+            effective_runtime, source = service._resolve_runtime_credentials(runtime)
+
+            self.assertTrue(public.has_app_secret)
+            self.assertEqual(public.credential_source, "legacy_skill")
+            self.assertEqual(source, "legacy_skill")
+            self.assertEqual(effective_runtime.app_key, "legacy-key")
+            self.assertEqual(effective_runtime.app_secret, "legacy-secret")
+
+    def test_saved_secret_takes_priority_over_legacy_skill_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            legacy_dir = Path(temp_dir) / "legacy-skill"
+            legacy_dir.mkdir()
+            _write_legacy_jira_config(legacy_dir / "jira_config.enc", app_key="legacy-key", app_secret="legacy-secret")
+            settings = AppSettings(
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "app.sqlite",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=data_dir / "jira" / "jira_support.db",
+                jira_app_key=None,
+                jira_app_secret=None,
+                jira_legacy_skill_dir=legacy_dir,
+            )
+            settings.ensure_directories()
+            service = JiraDataSourceService(JiraDataSourceStore(settings.sqlite_path), settings)
+            service.update_settings(
+                UpdateJiraDataSourceSettingsRequest(app_key="saved-key", app_secret="saved-secret")
+            )
+
+            public = service.get_public_settings()
+            runtime = service.get_runtime_settings()
+            effective_runtime, source = service._resolve_runtime_credentials(runtime)
+
+            self.assertEqual(public.credential_source, "settings")
+            self.assertEqual(source, "settings")
+            self.assertEqual(effective_runtime.app_key, "saved-key")
+            self.assertEqual(effective_runtime.app_secret, "saved-secret")
+
+    def test_missing_secret_still_reports_clear_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            settings = AppSettings(
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "app.sqlite",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=data_dir / "jira" / "jira_support.db",
+                jira_app_key=None,
+                jira_app_secret=None,
+                jira_legacy_skill_dir=None,
+            )
+            settings.ensure_directories()
+            service = JiraDataSourceService(JiraDataSourceStore(settings.sqlite_path), settings)
+
+            result = service.test_settings()
+
+            self.assertFalse(result.ok)
+            self.assertIn("缺少 JIRA_APP_SECRET", result.message)
+
+    def test_sync_saves_records_and_triggers_reindex_callback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir) / "data"
+            settings = AppSettings(
+                data_dir=data_dir,
+                uploads_dir=data_dir / "uploads",
+                sqlite_path=data_dir / "app.sqlite",
+                chroma_dir=data_dir / "chroma",
+                jira_support_db_path=data_dir / "jira" / "jira_support.db",
+                jira_legacy_skill_dir=None,
+            )
+            settings.ensure_directories()
+            service = JiraDataSourceService(JiraDataSourceStore(settings.sqlite_path), settings)
+            service._init_data = {  # type: ignore[attr-defined]
+                "jira_projects": [],
+                "jira_domain_modules": [
+                    {
+                        "project_id": "101",
+                        "pkey": "YYZJ",
+                        "project_name": "云平台-工作台",
+                        "domain_name": "工作台",
+                        "domain_module": "登录入口与配置",
+                    }
+                ],
+            }
+            service.update_settings(
+                UpdateJiraDataSourceSettingsRequest(
+                    app_key="app-key",
+                    app_secret="super-secret-value",
+                    sync_keyword="工作台",
+                    sync_date_range="本年",
+                )
+            )
+
+            def fake_query(**_: object) -> list[dict[str, object]]:
+                return [
+                    {
+                        "id": "1",
+                        "issueKey": "YYZJ-1",
+                        "summary": "CA 登录异常",
+                        "status": "支持确认完成",
+                        "domain": "工作台",
+                        "module": "登录入口与配置",
+                        "solution": "安装对应修复补丁。",
+                        "description": "打补丁后 CA 弹框加载不出来。",
+                        "project": {"projectKey": "YYZJ", "projectName": "云平台-工作台"},
+                        "assignee": {},
+                        "reporter": {},
+                    }
+                ]
+
+            service.query_jira_data_all = fake_query  # type: ignore[method-assign]
+            reindexed_paths: list[str] = []
+
+            def fake_reindex(path: str) -> dict[str, int]:
+                reindexed_paths.append(path)
+                return {"indexed_count": 1}
+
+            run = service.sync_now(reindex_callback=fake_reindex)
+
+            self.assertEqual(run.status, "success")
+            self.assertEqual(run.fetched_count, 1)
+            self.assertEqual(run.inserted_count, 1)
+            self.assertEqual(run.reindexed_count, 1)
+            self.assertEqual(reindexed_paths, [str(settings.jira_support_db_path)])
+            with sqlite3.connect(settings.jira_support_db_path) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM jira_support_issues").fetchone()[0]
+            self.assertEqual(count, 1)
 
 
 class JiraDuplicateAgentTests(unittest.TestCase):
